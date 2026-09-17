@@ -30,7 +30,7 @@ class Harness:
     """A serve process plus the environment its fakes read."""
 
     def __init__(self, tmp: Path, real_gpg: str | None = None, extra_env: dict | None = None,
-                 serve_extra: str = ''):
+                 serve_extra: str = '', git_signingkey: str = ''):
         self.tmp = tmp
         self.port = free_port()
         self.serve_dir = tmp / 'serve-config'
@@ -63,7 +63,12 @@ class Harness:
                     'FAKE_TOUCH_FILE': str(tmp / 'touch'),
                     'FAKE_GPG_STDOUT': 'signature:remote',
                     'TMPDIR': str(tmp / 'temp'),
+                    # The service falls back to Git's global user.signingkey, so
+                    # the developer's own configuration must not reach it.
+                    'GIT_CONFIG_GLOBAL': str(tmp / 'gitconfig'),
+                    'GIT_CONFIG_NOSYSTEM': '1',
                     **(extra_env or {})}
+        (tmp / 'gitconfig').write_text(f'[user]\n\tsigningkey = {git_signingkey}\n' if git_signingkey else '')
         (tmp / 'temp').mkdir(exist_ok=True)
         ready = tmp / 'ready'
         self.proc = subprocess.Popen([sys.executable, str(MODULE), 'serve', '--config-dir', str(self.serve_dir),
@@ -72,7 +77,9 @@ class Harness:
         deadline = time.monotonic() + 10
         while not ready.exists():
             if self.proc.poll() is not None or time.monotonic() > deadline:
-                raise RuntimeError('serve did not start: ' + self.proc.stderr.read().decode())
+                self.proc.kill()
+                _, stderr = self.proc.communicate()
+                raise RuntimeError('serve did not start: ' + stderr.decode())
             time.sleep(0.05)
 
     def stop(self):
@@ -314,6 +321,148 @@ class RemoteSigningTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(MODULE), 'resolve', '--server', 'operator-mac.example.com'],
                                 env=self.h.env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 70)
+
+
+PRIMARY_A = 'AAAA' * 9 + '0000000A'
+PRIMARY_B = 'BBBB' * 9 + '0000000B'
+SUBKEY_B = 'CCCC' * 9 + '0000000C'
+TWO_KEYS = f'{PRIMARY_A},{PRIMARY_B}/{SUBKEY_B}'
+
+
+class SigningKeyTests(unittest.TestCase):
+    """Which key the service signs with is never left to gpg's listing order."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.tmp = Path(self.tmpdir.name)
+
+    def resolve(self, keys='', git_signingkey='', configured='', flag=''):
+        config = self.tmp / 'config'
+        config.mkdir(exist_ok=True)
+        (config / 'config').write_text(f'real_gpg={HELPERS}/fake-gpg.py\nui_helper={MODULE}\n')
+        (config / 'serve').write_text(f'signing_key={configured}\n')
+        (self.tmp / 'gitconfig').write_text(f'[user]\n\tsigningkey = {git_signingkey}\n' if git_signingkey else '')
+        env = {**os.environ, 'FAKE_GPG_CALL_DIR': str(self.tmp / 'calls'), 'GIT_CONFIG_GLOBAL': str(self.tmp / 'gitconfig'),
+               'GIT_CONFIG_NOSYSTEM': '1', **({'FAKE_GPG_SECRET_KEYS': keys} if keys else {})}
+        return subprocess.run([sys.executable, str(MODULE), 'resolve-key', '--config-dir', str(config),
+                               *(['--signing-key', flag] if flag else [])], env=env, capture_output=True, text=True)
+
+    def test_the_only_secret_key_needs_no_configuration(self):
+        result = self.resolve()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), '041CE6A7BED57FE579D43B6C3DB3F5612E33B6BC')
+        self.assertIn('the only secret key', result.stderr)
+
+    def test_several_keys_and_nothing_naming_one_is_refused(self):
+        result = self.resolve(keys=TWO_KEYS)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '', 'no fingerprint is offered, first-listed or otherwise')
+        self.assertIn('2 secret keys', result.stderr)
+        self.assertIn(PRIMARY_A, result.stderr)
+        self.assertIn(PRIMARY_B, result.stderr)
+
+    def test_gits_signing_key_decides_between_several(self):
+        # The key gpg lists first is not the one the operator commits with.
+        for selector in (f'{SUBKEY_B}!', SUBKEY_B[-16:], f'0x{SUBKEY_B[-16:].lower()}'):
+            with self.subTest(selector=selector):
+                result = self.resolve(keys=TWO_KEYS, git_signingkey=selector)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), SUBKEY_B, 'the full fingerprint of the subkey that was named, without the !')
+                self.assertIn("Git's global user.signingkey", result.stderr)
+
+    def test_configuration_and_the_flag_outrank_git(self):
+        configured = self.resolve(keys=TWO_KEYS, git_signingkey=SUBKEY_B, configured=PRIMARY_A)
+        self.assertEqual(configured.stdout.strip(), PRIMARY_A)
+        flagged = self.resolve(keys=TWO_KEYS, git_signingkey=SUBKEY_B, configured=PRIMARY_A, flag=PRIMARY_B)
+        self.assertEqual(flagged.stdout.strip(), PRIMARY_B)
+
+    def test_a_key_that_is_not_here_is_refused_rather_than_replaced(self):
+        for kwargs in ({'configured': 'DDDD' * 10}, {'git_signingkey': 'DDDD' * 10}):
+            with self.subTest(**kwargs):
+                result = self.resolve(keys=TWO_KEYS, **kwargs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+                self.assertIn('names no secret key', result.stderr)
+
+    def test_serve_refuses_to_start_when_the_key_is_ambiguous(self):
+        with self.assertRaises(RuntimeError) as raised:
+            Harness(self.tmp / 'ambiguous', extra_env={'FAKE_GPG_SECRET_KEYS': TWO_KEYS})
+        self.assertIn('2 secret keys', str(raised.exception))
+
+    def test_serve_signs_with_gits_key_and_says_where_it_came_from(self):
+        h = Harness(self.tmp / 'git-key', extra_env={'FAKE_GPG_SECRET_KEYS': TWO_KEYS}, git_signingkey=f'{SUBKEY_B}!')
+        self.addCleanup(h.stop)
+        with urllib.request.urlopen(f'http://127.0.0.1:{h.port}/identity', timeout=10) as response:
+            self.assertEqual(json.loads(response.read())['fingerprint'], SUBKEY_B)
+        repo, _, payload = fixture_repo(self.tmp)
+        result = h.client(['--status-fd=2', '-bsau', f'{SUBKEY_B}!'], payload, repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(h.gpg_calls()[-1][0][-2:], [b'--local-user', SUBKEY_B.encode()])
+
+
+class ServeInstallTests(unittest.TestCase):
+    """serve-install.sh against a scratch HOME, with launchctl and uname faked."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.tmp = Path(self.tmpdir.name)
+        self.home = self.tmp / 'home'
+        self.config = self.home / '.config' / 'git-gpg-preview'
+        self.config.mkdir(parents=True)
+        (self.config / 'config').write_text(f'real_gpg={HELPERS}/fake-gpg.py\nui_helper={MODULE}\n')
+        bin_dir = self.tmp / 'bin'
+        bin_dir.mkdir()
+        self.launchctl_log = self.tmp / 'launchctl.log'
+        for name, body in (('launchctl', f'echo "$*" >> "{self.launchctl_log}"'), ('uname', 'echo Darwin')):
+            (bin_dir / name).write_text(f'#!/bin/sh\n{body}\n')
+            (bin_dir / name).chmod(0o755)
+        (self.tmp / 'gitconfig').write_text('')
+        self.env = {**os.environ, 'HOME': str(self.home), 'XDG_CONFIG_HOME': str(self.home / '.config'),
+                    'PATH': f'{bin_dir}:{os.environ["PATH"]}', 'FAKE_GPG_CALL_DIR': str(self.tmp / 'calls'),
+                    'GIT_CONFIG_GLOBAL': str(self.tmp / 'gitconfig'), 'GIT_CONFIG_NOSYSTEM': '1'}
+
+    def install(self, *args, **env):
+        return subprocess.run(['bash', str(ROOT / 'serve-install.sh'), 'install', *args],
+                              env={**self.env, **env}, capture_output=True, text=True)
+
+    def serve_config(self):
+        return dict(line.split('=', 1) for line in (self.config / 'serve').read_text().splitlines())
+
+    def test_installs_with_the_resolved_key_and_an_audit_log(self):
+        (self.tmp / 'gitconfig').write_text(f'[user]\n\tsigningkey = {SUBKEY_B}!\n')
+        result = self.install(FAKE_GPG_SECRET_KEYS=TWO_KEYS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.serve_config()
+        self.assertEqual(config['signing_key'], SUBKEY_B)
+        self.assertEqual(config['audit_log'], str(self.home / 'Library/Logs/git-gpg-preview/audit.log'))
+        self.assertIn('bootstrap', self.launchctl_log.read_text())
+        # Again: the stored key stands without Git, and nothing is duplicated.
+        (self.tmp / 'gitconfig').write_text('')
+        again = self.install(FAKE_GPG_SECRET_KEYS=TWO_KEYS)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(self.serve_config(), config)
+        self.assertEqual((self.config / 'serve').read_text().count('audit_log='), 1)
+
+    def test_an_ambiguous_key_installs_nothing(self):
+        result = self.install(FAKE_GPG_SECRET_KEYS=TWO_KEYS)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('2 secret keys', result.stderr)
+        self.assertFalse((self.config / 'serve').exists(), 'no half-written configuration')
+        self.assertFalse((self.home / 'Library/LaunchAgents/dev.git-gpg-preview.serve.plist').exists())
+        self.assertFalse(self.launchctl_log.exists(), 'launchd was never touched')
+
+    def test_an_audit_setting_the_operator_made_is_kept(self):
+        for existing in ('audit_log=', f'audit_log={self.tmp}/elsewhere.log'):
+            with self.subTest(existing=existing):
+                (self.config / 'serve').write_text(f'{existing}\nsign_timeout_seconds=45\n')
+                result = self.install()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                text = (self.config / 'serve').read_text()
+                self.assertIn(f'{existing}\n', text)
+                self.assertEqual(text.count('audit_log='), 1)
+                self.assertIn('sign_timeout_seconds=45', text, 'unknown keys survive')
 
 
 class DialogLockTests(unittest.TestCase):

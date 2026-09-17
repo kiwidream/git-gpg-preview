@@ -27,6 +27,13 @@ install   copies the service next to the wrapper's helpers, writes $SERVE_CONFIG
           listens on this machine's Tailscale address. Nodes named minidev* and
           your own tailnet devices may request signatures; every one still needs
           your touch. Idempotent.
+
+          The signing key is --signing-key, else the one already configured, else
+          Git's global user.signingkey, else this GnuPG home's only secret key;
+          with several keys and none named, nothing is installed. Every request
+          and its decision is recorded in $LOG_DIR/audit.log
+          (metadata only). An empty audit_log= in the serve config defers to the
+          wrapper's setting instead, which is off unless you set it.
 USAGE
 }
 
@@ -87,17 +94,23 @@ install_service() {
     fi
     python=$(python_for_launchd) || { printf 'no python3 >= 3.9 found for launchd\n' >&2; exit 1; }
 
+    # Settle the signing key before anything is written: the fingerprint is
+    # stored, so the service signs with the key shown here, not whichever gpg
+    # happens to list first. Its message says why when it refuses.
+    local resolved_key
+    resolved_key=$("$python" "$SCRIPT_DIR/git_gpg_preview_remote.py" resolve-key --config-dir "$CONFIG_DIR" \
+        --signing-key "${key:-$(config_value "$SERVE_CONFIG" signing_key || true)}") || exit 1
+
     mkdir -p "$INSTALL_LIB_DIR" "$LOG_DIR" "$HOME/Library/LaunchAgents"
     chmod 700 "$INSTALL_LIB_DIR" "$LOG_DIR"
     /usr/bin/install -m 600 "$SCRIPT_DIR/git_gpg_preview_remote.py" "$INSTALL_MODULE"
 
     # Merge flags into the existing serve config; unknown keys are preserved,
     # and allow lists are unioned so adding one node never drops another.
-    local existing_port existing_nodes existing_prefixes existing_key
+    local existing_port existing_nodes existing_prefixes
     existing_port=$(config_value "$SERVE_CONFIG" port || true)
     existing_nodes=$(config_value "$SERVE_CONFIG" allow_nodes || true)
     existing_prefixes=$(config_value "$SERVE_CONFIG" allow_node_prefixes || true)
-    existing_key=$(config_value "$SERVE_CONFIG" signing_key || true)
     local node_list prefix_list
     node_list=$(merge_csv "$existing_nodes" "${nodes[@]:-}")
     prefix_list=$(merge_csv "${existing_prefixes:-minidev}" "${prefixes[@]:-}")
@@ -108,7 +121,14 @@ install_service() {
         printf 'port=%s\n' "${port:-${existing_port:-24824}}"
         printf 'allow_nodes=%s\n' "$node_list"
         printf 'allow_node_prefixes=%s\n' "$prefix_list"
-        printf 'signing_key=%s\n' "${key:-$existing_key}"
+        printf 'signing_key=%s\n' "$resolved_key"
+        # A service other machines can reach keeps a record of who asked for
+        # what. Only a config that has never said anything about audit_log
+        # gets the default: an explicit value, empty included, is the
+        # operator's choice.
+        if ! grep -q '^audit_log=' "$SERVE_CONFIG" 2>/dev/null; then
+            printf 'audit_log=%s\n' "$LOG_DIR/audit.log"
+        fi
     } > "$tmp"
     chmod 600 "$tmp"
     mv -f "$tmp" "$SERVE_CONFIG"
@@ -154,6 +174,8 @@ status_service() {
         printf '  port=%s allow_nodes=%s allow_node_prefixes=%s\n' \
             "$(config_value "$SERVE_CONFIG" port)" "$(config_value "$SERVE_CONFIG" allow_nodes)" \
             "$(config_value "$SERVE_CONFIG" allow_node_prefixes)"
+        printf '  signing_key=%s\n  audit_log=%s\n' \
+            "$(config_value "$SERVE_CONFIG" signing_key)" "$(config_value "$SERVE_CONFIG" audit_log)"
     fi
     if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
         printf 'launchd:        loaded (%s)\n' "$LABEL"

@@ -16,8 +16,18 @@ with (call_dir / 'calls').open('a') as f:
     f.write(ident + '\n')
 
 if '--list-secret-keys' in args:
-    print('sec:u:255:22:3DB3F5612E33B6BC:1789650000:::u:::scESC:::+:::ed25519:::0:')
-    print('fpr:::::::::041CE6A7BED57FE579D43B6C3DB3F5612E33B6BC:')
+    # FAKE_GPG_SECRET_KEYS: comma-separated keys, each `PRIMARY[/SUBKEY...]`
+    # fingerprints. A selector after the option lists only the key it names,
+    # by any of its fingerprints' suffix, as gpg does.
+    keys = [k.split('/') for k in os.environ.get('FAKE_GPG_SECRET_KEYS', '041CE6A7BED57FE579D43B6C3DB3F5612E33B6BC').split(',') if k]
+    rest = args[args.index('--list-secret-keys') + 1:]
+    selector = rest[0].upper().removeprefix('0X') if rest else ''
+    for fingerprints in keys:
+        if selector and not any(fpr.endswith(selector) for fpr in fingerprints):
+            continue
+        for index, fpr in enumerate(fingerprints):
+            print(f"{'sec' if index == 0 else 'ssb'}:u:255:22:{fpr[-16:]}:1789650000:::u:::{'scESC' if index == 0 else 's'}:::+:::ed25519:::0:")
+            print(f'fpr:::::::::{fpr}:')
     sys.exit(0)
 if '--list-keys' in args:
     print('pub:u:255:22:3DB3F5612E33B6BC:1789650000:::u:::scESC:::+:::ed25519:::0:')

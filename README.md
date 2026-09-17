@@ -149,12 +149,27 @@ pid-file protocol as `shlock`, so a local `git commit` and a remote request
 are never both waiting on one touch; the touch always answers the request whose
 window is on screen.
 
+The service signs with exactly one key and stores its fingerprint as
+`signing_key`. `serve-install.sh install` takes it from `--signing-key`, else
+the value already stored, else Git's global `user.signingkey` (the key your own
+commits carry), else the GnuPG home's only secret key. With several secret keys
+and nothing naming one, it installs nothing and lists the candidates: the order
+gpg lists keys in says nothing about which one you sign with. A trailing `!` is
+dropped, and `remote/git_gpg_preview_remote.py resolve-key` prints the choice
+without changing anything.
+
+Because other machines can reach the service, `install` also turns its audit
+log on: `audit_log=~/Library/Logs/git-gpg-preview/audit.log` is written to the
+serve config unless that file already has an `audit_log` line. Lines from
+remote requests carry `peer=<node> (<login>)` and `caller=remote`. An empty
+`audit_log=` defers to the wrapper's setting, which is off unless you set it.
+
 Config keys: `~/.config/git-gpg-preview/serve` takes `port`, `allow_nodes`,
-`allow_node_prefixes`, `signing_key`, `sign_timeout_seconds`, `bind` and
-`dialog_runner` (tests); `real_gpg`, `ui_helper`, `lock_root` and `audit_log`
-come from the wrapper's `config`. `~/.config/git-gpg-preview/client` takes
-`server`, `port`, `real_gpg` and `timeout_seconds`. Audit-log lines from remote
-requests carry `peer=<node> (<login>)` and `caller=remote`.
+`allow_node_prefixes`, `signing_key`, `audit_log`, `sign_timeout_seconds`,
+`bind` and `dialog_runner` (tests); `real_gpg`, `ui_helper` and `lock_root`
+come from the wrapper's `config`, as does `audit_log` when the serve config
+leaves it empty. `~/.config/git-gpg-preview/client` takes `server`, `port`,
+`real_gpg` and `timeout_seconds`.
 
 Tests: `python3 -m unittest discover -s remote/tests` runs the service behind
 fake `tailscale`, `gpg` and dialog helpers on any platform, plus one real

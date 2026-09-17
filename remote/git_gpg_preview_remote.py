@@ -315,6 +315,62 @@ def whois(ip: str) -> dict:
 
 # --- serve ------------------------------------------------------------------
 
+def secret_key_blocks(real_gpg: str, selector: str = '') -> list[list[str]]:
+    """Fingerprints of each secret key gpg lists: the primary, then its subkeys."""
+    listing = subprocess.run([real_gpg, '--batch', '--with-colons', '--list-secret-keys', *([selector] if selector else [])],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    blocks: list[list[str]] = []
+    for line in listing.stdout.splitlines():
+        fields = line.split(':')
+        if fields[0] == 'sec':
+            blocks.append([])
+        elif fields[0] == 'fpr' and blocks and len(fields) > 9:
+            blocks[-1].append(fields[9].upper())
+    return [block for block in blocks if block]
+
+
+def resolve_signing_key(real_gpg: str, configured: str = '') -> tuple[str, str]:
+    """The fingerprint of the one key the service signs with, and what named it.
+
+    A configured selector wins, then Git's global ``user.signingkey`` (the key
+    the operator's own commits carry), then a GnuPG home's only secret key.
+    Several secret keys with nothing naming one is refused: the order gpg
+    lists them in says nothing about which one the operator signs with.
+    A trailing ``!`` is dropped; hosts are handed a plain fingerprint.
+    """
+    selector, source = configured.strip(), 'signing_key'
+    if not selector:
+        try:
+            git_key = subprocess.run(['git', 'config', '--global', '--get', 'user.signingkey'],
+                                     stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+            selector = git_key.stdout.strip() if git_key.returncode == 0 else ''
+        except (OSError, subprocess.TimeoutExpired):
+            selector = ''
+        source = "Git's global user.signingkey"
+    if selector:
+        wanted = selector.rstrip('!')
+        blocks = secret_key_blocks(real_gpg, wanted)
+        if len(blocks) != 1:
+            found = 'no' if not blocks else 'more than one'
+            raise RemoteError(f'{source} {selector!r} names {found} secret key in this GnuPG home; '
+                              'set signing_key in the serve config to a full fingerprint (serve-install --signing-key FPR)')
+        hexed = wanted.upper().removeprefix('0X')
+        if re.fullmatch(r'[0-9A-F]{8,}', hexed):
+            # A subkey named by id or fingerprint stays that subkey.
+            exact = [fpr for fpr in blocks[0] if fpr.endswith(hexed)]
+            if exact:
+                return exact[0], source
+        return blocks[0][0], source
+    blocks = secret_key_blocks(real_gpg)
+    if not blocks:
+        raise RemoteError('no secret key to sign with; add one to this GnuPG home')
+    if len(blocks) > 1:
+        raise RemoteError(f'{len(blocks)} secret keys in this GnuPG home and nothing says which one signs '
+                          f'({", ".join(block[0] for block in blocks)}); set signing_key in the serve config '
+                          "(serve-install --signing-key FPR) or Git's global user.signingkey")
+    return blocks[0][0], 'the only secret key'
+
+
 class ServeConfig:
     def __init__(self, base: Path) -> None:
         wrapper = read_kv(base / 'config')
@@ -438,6 +494,7 @@ class Service:
         self.lock = threading.Lock()
         self.allowed_logins = {me['login']} if me.get('login') else set()
         self._fingerprint = ''
+        self.key_source = ''
 
     # -- authorization
     def authorize(self, peer_ip: str) -> dict:
@@ -454,18 +511,10 @@ class Service:
 
     # -- identity
     def service_fingerprint(self) -> str:
-        """The one key this service signs with: `signing_key` from the serve
-        config, else the first secret key, resolved once and cached. Requests
-        may not choose another."""
-        if self._fingerprint:
-            return self._fingerprint
-        if self.config.signing_key:
-            self._fingerprint = self.config.signing_key.upper()
-            return self._fingerprint
-        listing = subprocess.run([self.config.real_gpg, '--batch', '--with-colons', '--list-secret-keys'],
-                                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
-        self._fingerprint = next((line.split(':')[9].upper() for line in listing.stdout.splitlines()
-                                  if line.startswith('fpr:')), '')
+        """The one key this service signs with (see resolve_signing_key),
+        resolved once and cached. Requests may not choose another."""
+        if not self._fingerprint:
+            self._fingerprint, self.key_source = resolve_signing_key(self.config.real_gpg, self.config.signing_key)
         return self._fingerprint
 
     def identity(self) -> dict:
@@ -735,6 +784,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {'error': f'bad request: {exc}'})
 
 
+def cmd_resolve_key(args) -> int:
+    config = ServeConfig(Path(args.config_dir) if args.config_dir else config_home())
+    fingerprint, source = resolve_signing_key(config.real_gpg, args.signing_key or config.signing_key)
+    error(f'signing key {fingerprint} (from {source})')
+    print(fingerprint)
+    return 0
+
+
 def cmd_serve(args) -> int:
     config = ServeConfig(Path(args.config_dir) if args.config_dir else config_home())
     me = self_identity()
@@ -743,14 +800,12 @@ def cmd_serve(args) -> int:
         raise RemoteError('this machine has no Tailscale address to bind to')
     service = Service(config, me)
     key = service.service_fingerprint()
-    if not key:
-        raise RemoteError('no secret key to sign with; set signing_key in the serve config or add one to this GnuPG home')
     handler = type('BoundHandler', (Handler,), {'service': service})
     server = ThreadingHTTPServer((bind, config.port), handler)
     server.daemon_threads = True
     allowed = ', '.join(sorted(config.allow_nodes)) or '(none)'
     prefixes = ', '.join(f'{p}*' for p in config.allow_node_prefixes) or '(none)'
-    sys.stderr.write(f'{PROGRAM}: serving on {bind}:{config.port} as {me["node"]} ({me["login"]}); signing key {key}; '
+    sys.stderr.write(f'{PROGRAM}: serving on {bind}:{config.port} as {me["node"]} ({me["login"]}); signing key {key} (from {service.key_source}); '
                      f'allowed nodes: {allowed}; allowed prefixes: {prefixes}; '
                      f'other nodes of the same login are allowed\n')
     sys.stderr.flush()
@@ -945,6 +1000,10 @@ def main(argv: list[str] | None = None) -> int:
     resolve.add_argument('--server', required=True)
     resolve.add_argument('--port', type=int, default=DEFAULT_PORT)
     resolve.set_defaults(func=cmd_resolve)
+    resolve_key = sub.add_parser('resolve-key', help='print the fingerprint serve would sign with')
+    resolve_key.add_argument('--config-dir')
+    resolve_key.add_argument('--signing-key', help='key id, fingerprint or user id; default: the serve config, then Git')
+    resolve_key.set_defaults(func=cmd_resolve_key)
     sub.add_parser('client', help='gpg.openpgp.program entry point; pass gpg arguments after it')
     args = parser.parse_args(argv)
     try:
