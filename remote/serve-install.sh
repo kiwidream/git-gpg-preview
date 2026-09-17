@@ -76,6 +76,25 @@ python_for_launchd() {
     return 1
 }
 
+# `launchctl bootout` returns before launchd has let go of the job, and a
+# bootstrap that arrives first fails with "5: Input/output error", which on a
+# re-install left the service stopped. Wait for the label to disappear, then
+# allow launchd a few more tries before reporting its message.
+reload_service() {
+    local domain attempt
+    domain="gui/$(id -u)"
+    launchctl bootout "$domain/$LABEL" >/dev/null 2>&1 || true
+    for attempt in $(seq 1 50); do
+        launchctl print "$domain/$LABEL" >/dev/null 2>&1 || break
+        sleep 0.2
+    done
+    for attempt in 1 2 3 4; do
+        launchctl bootstrap "$domain" "$PLIST" 2>/dev/null && return 0
+        sleep 1
+    done
+    launchctl bootstrap "$domain" "$PLIST"
+}
+
 install_service() {
     local port="" key="" nodes=() prefixes=() python
     while [[ "$#" -gt 0 ]]; do
@@ -160,8 +179,7 @@ install_service() {
 </plist>
 PLIST
     chmod 600 "$PLIST"
-    launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
-    launchctl bootstrap "gui/$(id -u)" "$PLIST"
+    reload_service
     printf 'Installed %s (launchd %s)\n' "$INSTALL_MODULE" "$LABEL"
     printf 'Config: %s\n' "$SERVE_CONFIG"
     printf 'Log:    %s/serve.log\n' "$LOG_DIR"

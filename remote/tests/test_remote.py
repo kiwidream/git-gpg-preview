@@ -415,7 +415,17 @@ class ServeInstallTests(unittest.TestCase):
         bin_dir = self.tmp / 'bin'
         bin_dir.mkdir()
         self.launchctl_log = self.tmp / 'launchctl.log'
-        for name, body in (('launchctl', f'echo "$*" >> "{self.launchctl_log}"'), ('uname', 'echo Darwin')):
+        # launchd as it behaves: after `bootout` the job stays visible to
+        # `print` for a while, and a `bootstrap` in that window fails with 5.
+        self.lingering = self.tmp / 'lingering'
+        launchctl = (f'echo "$*" >> "{self.launchctl_log}"\n'
+                     f'left=$(cat "{self.lingering}" 2>/dev/null || echo 0)\n'
+                     'case "$1" in\n'
+                     f'  bootout) echo "${{FAKE_LAUNCHD_LINGER:-0}}" > "{self.lingering}" ;;\n'
+                     f'  print) [ "$left" -gt 0 ] || exit 113; echo $((left - 1)) > "{self.lingering}" ;;\n'
+                     '  bootstrap) [ "$left" -eq 0 ] || { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; } ;;\n'
+                     'esac')
+        for name, body in (('launchctl', launchctl), ('uname', 'echo Darwin')):
             (bin_dir / name).write_text(f'#!/bin/sh\n{body}\n')
             (bin_dir / name).chmod(0o755)
         (self.tmp / 'gitconfig').write_text('')
@@ -444,6 +454,13 @@ class ServeInstallTests(unittest.TestCase):
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertEqual(self.serve_config(), config)
         self.assertEqual((self.config / 'serve').read_text().count('audit_log='), 1)
+
+    def test_reinstall_waits_for_launchd_to_release_the_job(self):
+        result = self.install(FAKE_LAUNCHD_LINGER='3')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [line.split()[0] for line in self.launchctl_log.read_text().splitlines()]
+        self.assertEqual(calls, ['bootout', 'print', 'print', 'print', 'print', 'bootstrap'],
+                         'bootstrap is not attempted while the old job is still there')
 
     def test_an_ambiguous_key_installs_nothing(self):
         result = self.install(FAKE_GPG_SECRET_KEYS=TWO_KEYS)
