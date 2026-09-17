@@ -16,6 +16,11 @@ case "$choice" in
         printf 'sign' > "$decision"
         ;;
     approve-no-touch) printf 'sign' > "$decision" ;;   # approved, but the key never confirms
+    touch-then-cancel)                                  # the key confirms, the operator cancels in the same instant
+        sha=$(sed -n 's/^SHA-256: //p' "$summary" | head -n 1)
+        : > "${FAKE_TOUCH_FILE:?}.$sha"
+        printf 'cancel' > "$decision"
+        ;;
     cancel) printf 'cancel' > "$decision" ;;
     hang) sleep 30 ;;
     *) printf 'garbage' > "$decision" ;;

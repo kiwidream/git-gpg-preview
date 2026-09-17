@@ -182,6 +182,14 @@ class RemoteSigningTests(unittest.TestCase):
         self.assertIn('decision=cancel', self.h.audit.read_text())
         self.assertEqual(self.h.gpg_calls(), [], 'GPG was killed before it recorded a signature')
 
+    def test_cancel_wins_even_when_gpg_finishes_first(self):
+        self.h.decision.write_text('touch-then-cancel')
+        result = self.h.client(self.sign_args(), self.second, self.repo)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, b'', 'no signature leaves the service after a cancel')
+        self.assertIn(b'cancelled by operator', result.stderr)
+        self.assertIn('decision=cancel', self.h.audit.read_text())
+
     def test_no_touch_within_the_deadline_refuses(self):
         self.h.decision.write_text('hang')
         result = self.h.client(self.sign_args(), self.second, self.repo)

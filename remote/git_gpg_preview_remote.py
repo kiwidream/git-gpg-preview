@@ -719,6 +719,17 @@ class Service:
 
         stdout, stderr = gpg.communicate(timeout=30)
         stop(dialog)
+        # gpg finishing first does not override the operator: a Cancel pressed
+        # in the same instant as the touch (or a key that needs no touch) must
+        # still yield no signature. The decision file is the last word.
+        try:
+            decision = paths['decision'].read_text().strip()
+        except OSError:
+            decision = ''
+        if decision == 'cancel':
+            self.audit('cancel', repo, info['type'], digest, peer)
+            return {'status': EX_CANCELLED, 'decision': 'cancel', 'stdout': '',
+                    'stderr': 'git-gpg-preview: signing cancelled by operator\n'}
         status = gpg.returncode
         self.audit('sign' if status == 0 else 'gpg-error', repo, info['type'], digest, peer)
         return {'status': status, 'decision': 'sign' if status == 0 else 'gpg-error',
