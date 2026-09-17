@@ -6,6 +6,7 @@ umask 077
 SCRIPT_DIR=$(cd -P -- "$(dirname -- "$0")" && pwd)
 INSTALL_BIN="$HOME/.local/bin/git-gpg-preview"
 INSTALL_LIB="$HOME/.local/libexec/git-gpg-preview/dialog.jxa"
+INSTALL_TOUCH="$HOME/.local/libexec/git-gpg-preview/touch-prompt.jxa"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/git-gpg-preview"
 CONFIG_FILE="$CONFIG_DIR/config"
 STATE_DIR="$HOME/.local/state/git-gpg-preview"
@@ -94,12 +95,14 @@ fi
 
 /usr/bin/install -m 700 "$SCRIPT_DIR/git-gpg-preview" "$INSTALL_BIN"
 /usr/bin/install -m 600 "$SCRIPT_DIR/dialog.jxa" "$INSTALL_LIB"
+/usr/bin/install -m 600 "$SCRIPT_DIR/touch-prompt.jxa" "$INSTALL_TOUCH"
 
 CONFIG_TEMP=$(mktemp "$CONFIG_DIR/config.XXXXXX")
 trap 'rm -f "$CONFIG_TEMP"' EXIT
 {
     printf 'real_gpg=%s\n' "$REAL_GPG"
     printf 'ui_helper=%s\n' "$INSTALL_LIB"
+    printf 'touch_helper=%s\n' "$INSTALL_TOUCH"
     printf 'lock_root=%s\n' "$LOCK_ROOT"
     printf 'audit_log=%s\n' "$AUDIT_LOG"
 } > "$CONFIG_TEMP"
@@ -111,6 +114,7 @@ git config --global --unset-all gpg.openpgp.program >/dev/null 2>&1 || true
 git config --global --add gpg.openpgp.program "$INSTALL_BIN"
 
 printf 'Installed %s\n' "$INSTALL_BIN"
+printf 'Touch prompt: %s\n' "$INSTALL_TOUCH"
 printf 'Real GPG: %s\n' "$REAL_GPG"
 printf 'Global gpg.openpgp.program: %s\n' "$(git config --global --get gpg.openpgp.program)"
 if [[ -n "$AUDIT_LOG" ]]; then

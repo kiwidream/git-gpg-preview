@@ -8,6 +8,9 @@ umask 077
 export LC_ALL=C
 
 PROGRAM_NAME="git-gpg-preview"
+# Single source of truth for rejected fixture-style commit subjects
+# (lowercase, space-separated). Tests read this line; keep the format.
+FIXTURE_SUBJECTS="base fixture init initial main production"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 CONFIG_FILE="$CONFIG_HOME/git-gpg-preview/config"
 REAL_GPG=""
@@ -121,6 +124,28 @@ sanitize_one_line() {
 
 valid_object_id() {
     [[ "$1" =~ ^[0-9A-Fa-f]{40}$ || "$1" =~ ^[0-9A-Fa-f]{64}$ ]]
+}
+
+fixture_style_commit_subject() {
+    local message_file="$1"
+    /usr/bin/awk -v subjects=" $FIXTURE_SUBJECTS " '
+        {
+            subject = $0
+            sub(/\r$/, "", subject)
+            sub(/^[ \t]+/, "", subject)
+            sub(/[ \t]+$/, "", subject)
+            if (subject == "") {
+                next
+            }
+            subject = tolower(subject)
+            if (index(subjects, " " subject " ") > 0) {
+                print subject
+                matched = 1
+            }
+            exit
+        }
+        END { exit matched ? 0 : 1 }
+    ' "$message_file"
 }
 
 append_limited_sanitized() {
@@ -284,6 +309,20 @@ fi
 : > "$FULL_DIFF"
 
 if [[ "$REQUEST_TYPE" == "commit" ]]; then
+    if REJECTED_SUBJECT=$(fixture_style_commit_subject "$MESSAGE"); then
+        if [[ "${GIT_GPG_PREVIEW_ALLOW_SUBJECT:-}" == "1" ]]; then
+            # Deliberate one-shot override for a legitimate commit that
+            # happens to use a blocked subject. Loud and audited.
+            audit_decision "policy-override" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+            error "note: signing blocked subject '$REJECTED_SUBJECT' because GIT_GPG_PREVIEW_ALLOW_SUBJECT=1 (recorded in audit log)"
+        else
+            audit_decision "policy-reject" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+            error "refusing to sign fixture-style commit subject '$REJECTED_SUBJECT'"
+            error "if this is a test or fixture repository: disable signing there (run the test with GIT_CONFIG_GLOBAL=/dev/null, or set commit.gpgSign=false only in that repository)"
+            error "if this is a real commit: reword the subject to something descriptive (e.g. 'Initial commit: <what this is>'), or re-run once with GIT_GPG_PREVIEW_ALLOW_SUBJECT=1 to sign it anyway (the override is recorded in the audit log)"
+            exit 65
+        fi
+    fi
     if ! valid_object_id "$TREE_HASH" || ! git --no-pager cat-file -e "${TREE_HASH}^{tree}" 2>/dev/null; then
         error "commit payload has an invalid or unavailable tree; refusing to sign"
         exit 65

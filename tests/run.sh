@@ -110,6 +110,29 @@ git -C "$FIXTURE" tag -a preview-tag -m $'Annotated tag Ω\n\n$(touch bad)'
 TAG_OBJECT=$(git -C "$FIXTURE" rev-parse preview-tag)
 git -C "$FIXTURE" cat-file tag "$TAG_OBJECT" > "$TMP/tag.payload"
 
+printf 'near miss\n' > "$FIXTURE/policy.txt"
+git -C "$FIXTURE" add -- policy.txt
+git -C "$FIXTURE" commit -m 'production release' >/dev/null
+NEAR_MISS=$(git -C "$FIXTURE" rev-parse HEAD)
+git -C "$FIXTURE" cat-file commit "$NEAR_MISS" > "$TMP/policy-near-miss.payload"
+
+# The blocklist's single source of truth is the FIXTURE_SUBJECTS line in
+# the wrapper itself; "Production" is added as a case-insensitivity probe.
+REJECTED_SUBJECTS="$(sed -n 's/^FIXTURE_SUBJECTS="\(.*\)"$/\1/p' "$ROOT/git-gpg-preview") Production"
+[[ "$REJECTED_SUBJECTS" != " Production" ]] || fail 'could not read FIXTURE_SUBJECTS from wrapper'
+
+for rejected_subject in $REJECTED_SUBJECTS; do
+    printf '%s\n' "$rejected_subject" > "$FIXTURE/policy.txt"
+    git -C "$FIXTURE" add -- policy.txt
+    git -C "$FIXTURE" commit -m "$rejected_subject" >/dev/null
+    REJECTED_COMMIT=$(git -C "$FIXTURE" rev-parse HEAD)
+    git -C "$FIXTURE" cat-file commit "$REJECTED_COMMIT" > "$TMP/policy-$rejected_subject.payload"
+done
+
+git -C "$FIXTURE" tag -a policy-tag -m 'production'
+POLICY_TAG_OBJECT=$(git -C "$FIXTURE" rev-parse policy-tag)
+git -C "$FIXTURE" cat-file tag "$POLICY_TAG_OBJECT" > "$TMP/policy-tag.payload"
+
 cd "$FIXTURE"
 
 run_preview 'initial commit' "$TMP/initial.payload" commit
@@ -151,6 +174,37 @@ details=$(details_of "$summary")
 grep -F 'Annotated tag Ω' "$summary" >/dev/null || fail 'tag message missing'
 grep -F 'Target object:' "$details" >/dev/null || fail 'tag target missing'
 pass 'annotated tag payload'
+
+before_calls=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
+before_dialogs=$(wc -l < "$FAKE_DIALOG_LOG")
+for rejected_subject in $REJECTED_SUBJECTS; do
+    set +e
+    "$ROOT/git-gpg-preview" -bsau TEST < "$TMP/policy-$rejected_subject.payload" > "$TMP/policy-reject.stdout" 2> "$TMP/policy-reject.stderr"
+    rejected_status=$?
+    set -e
+    [[ "$rejected_status" -eq 65 ]] || fail "fixture-style subject $rejected_subject returned $rejected_status"
+    [[ ! -s "$TMP/policy-reject.stdout" ]] || fail "fixture-style subject $rejected_subject contaminated stdout"
+    grep -F "refusing to sign fixture-style commit subject '$(printf '%s' "$rejected_subject" | tr '[:upper:]' '[:lower:]')'" "$TMP/policy-reject.stderr" >/dev/null || fail "fixture-style subject $rejected_subject omitted the rejection reason"
+    grep -F 'if this is a test or fixture repository: disable signing there' "$TMP/policy-reject.stderr" >/dev/null || fail "fixture-style subject $rejected_subject omitted fixture remediation"
+    grep -F 'GIT_GPG_PREVIEW_ALLOW_SUBJECT=1' "$TMP/policy-reject.stderr" >/dev/null || fail "fixture-style subject $rejected_subject omitted the override hint"
+done
+after_calls=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
+after_dialogs=$(wc -l < "$FAKE_DIALOG_LOG")
+[[ "$before_calls" -eq "$after_calls" ]] || fail 'fixture-style rejection contacted GPG'
+[[ "$before_dialogs" -eq "$after_dialogs" ]] || fail 'fixture-style rejection opened a dialog'
+grep -F 'decision=policy-reject' "$TMP/audit.log" >/dev/null || fail 'fixture-style rejection was not recorded in the audit log'
+pass 'fixture-style commit subjects fail before the dialog and GPG with clear remediation'
+
+# The audited override signs a blocked subject and records the decision.
+export GIT_GPG_PREVIEW_ALLOW_SUBJECT=1
+run_preview 'override init' "$TMP/policy-init.payload" commit
+unset GIT_GPG_PREVIEW_ALLOW_SUBJECT
+grep -F 'decision=policy-override' "$TMP/audit.log" >/dev/null || fail 'subject override was not recorded in the audit log'
+pass 'GIT_GPG_PREVIEW_ALLOW_SUBJECT=1 signs a blocked subject and audits the override'
+
+run_preview 'fixture policy near-miss' "$TMP/policy-near-miss.payload" commit
+run_preview 'fixture policy tag' "$TMP/policy-tag.payload" tag
+pass 'longer commit subjects and matching tag messages are not rejected'
 
 {
     printf 'unknown signing format\nUnicode Ω\n'
@@ -267,14 +321,51 @@ mkdir -p "$INSTALL_TEST"
     [[ $(git config --global --get gpg.openpgp.program) == "$HOME/.local/bin/git-gpg-preview" ]]
     [[ $(stat -f '%Lp' "$HOME/.local/bin/git-gpg-preview") == 700 ]]
     [[ $(stat -f '%Lp' "$XDG_CONFIG_HOME/git-gpg-preview/config") == 600 ]]
+    [[ $(stat -f '%Lp' "$HOME/.local/libexec/git-gpg-preview/touch-prompt.jxa") == 600 ]]
+    grep -qxF "touch_helper=$HOME/.local/libexec/git-gpg-preview/touch-prompt.jxa" \
+        "$XDG_CONFIG_HOME/git-gpg-preview/config"
     [[ $(<"$HOME/.local/state/git-gpg-preview/previous-program-state") == absent ]]
     "$ROOT/install.sh" --real-gpg "$ROOT/tests/helpers/fake-gpg" >/dev/null
     [[ $(<"$HOME/.local/state/git-gpg-preview/previous-program-state") == absent ]]
     "$ROOT/uninstall.sh" >/dev/null
     ! git config --global --get gpg.openpgp.program >/dev/null 2>&1
     [[ ! -e "$HOME/.local/bin/git-gpg-preview" ]]
+    [[ ! -e "$HOME/.local/libexec/git-gpg-preview" ]]
 ) || fail 'idempotent install or absent-value recovery'
 pass 'idempotent installation and restoration of an absent previous value'
+
+UPGRADE_TEST="$TMP/upgrade-home"
+mkdir -p "$UPGRADE_TEST"
+(
+    export HOME="$UPGRADE_TEST"
+    export XDG_CONFIG_HOME="$HOME/.config"
+    config="$XDG_CONFIG_HOME/git-gpg-preview/config"
+    state="$HOME/.local/state/git-gpg-preview"
+    installed="$HOME/.local/bin/git-gpg-preview"
+    libexec="$HOME/.local/libexec/git-gpg-preview"
+    "$ROOT/install.sh" --real-gpg "$ROOT/tests/helpers/fake-gpg" \
+        --audit-log "$HOME/audit.log" >/dev/null
+    cp "$config" "$TMP/upgrade-config.before"
+    cp "$state/previous-program-state" "$TMP/upgrade-state.before"
+    cp "$state/previous-program-values" "$TMP/upgrade-values.before"
+    git config --global --null --get-all gpg.openpgp.program \
+        > "$TMP/upgrade-program.before"
+    printf 'stale wrapper\n' > "$installed"
+    printf 'stale dialog\n' > "$libexec/dialog.jxa"
+    printf 'stale touch prompt\n' > "$libexec/touch-prompt.jxa"
+    "$ROOT/scripts/git-gpg-preview-setup" upgrade >/dev/null
+    cmp -s "$ROOT/git-gpg-preview" "$installed"
+    cmp -s "$ROOT/dialog.jxa" "$libexec/dialog.jxa"
+    cmp -s "$ROOT/touch-prompt.jxa" "$libexec/touch-prompt.jxa"
+    cmp -s "$config" "$TMP/upgrade-config.before"
+    cmp -s "$state/previous-program-state" "$TMP/upgrade-state.before"
+    cmp -s "$state/previous-program-values" "$TMP/upgrade-values.before"
+    git config --global --null --get-all gpg.openpgp.program \
+        > "$TMP/upgrade-program.after"
+    cmp -s "$TMP/upgrade-program.before" "$TMP/upgrade-program.after"
+    "$ROOT/uninstall.sh" >/dev/null
+) || fail 'configuration-preserving upgrade'
+pass 'upgrade refreshes installed files without changing configuration or Git state'
 
 RESTORE_TEST="$TMP/restore-home"
 mkdir -p "$RESTORE_TEST"
@@ -287,6 +378,29 @@ mkdir -p "$RESTORE_TEST"
     [[ $(git config --global --get-all gpg.openpgp.program) == '/previous/path with spaces/gpg' ]]
 ) || fail 'exact previous-value restoration'
 pass 'uninstaller restores the exact previous program value'
+
+# The launcher is installed as a symlink on PATH, which is how everyone
+# actually runs it, so exercise it that way rather than from the checkout.
+SYMLINK_TEST="$TMP/symlink-home"
+mkdir -p "$SYMLINK_TEST" "$TMP/fake-bin"
+ln -s "$ROOT/scripts/git-gpg-preview-setup" "$TMP/fake-bin/git-gpg-preview-setup"
+# Every step needs its own `|| exit`: errexit does not apply inside a subshell
+# whose status is being tested by `||`, so without them only the last command
+# would decide the result — and "not installed" would read as success.
+(
+    export HOME="$SYMLINK_TEST"
+    export XDG_CONFIG_HOME="$HOME/.config"
+    "$TMP/fake-bin/git-gpg-preview-setup" install --real-gpg "$ROOT/tests/helpers/fake-gpg" >/dev/null || exit 1
+    [[ -x "$HOME/.local/bin/git-gpg-preview" ]] || exit 1
+    [[ -f "$HOME/.local/libexec/git-gpg-preview/touch-prompt.jxa" ]] || exit 1
+    printf 'stale wrapper\n' > "$HOME/.local/bin/git-gpg-preview"
+    "$TMP/fake-bin/git-gpg-preview-setup" upgrade >/dev/null || exit 1
+    cmp -s "$ROOT/git-gpg-preview" "$HOME/.local/bin/git-gpg-preview" || exit 1
+    "$TMP/fake-bin/git-gpg-preview-setup" status >/dev/null || exit 1
+    "$TMP/fake-bin/git-gpg-preview-setup" uninstall >/dev/null || exit 1
+    [[ ! -e "$HOME/.local/bin/git-gpg-preview" ]] || exit 1
+) || fail 'launcher invoked through an installed symlink'
+pass 'launcher resolves its own symlink when run from PATH'
 
 [[ ! -e "$ORIGINAL_HOME/git-gpg-preview-tests-touched" ]] || fail 'unexpected file outside test area'
 printf '1..%d\n' "$pass_count"

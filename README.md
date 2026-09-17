@@ -6,6 +6,8 @@ Because GnuPG is engaged during the preview, your key blocks on its normal confi
 
 Verification and other non-signing GPG operations pass directly to the configured absolute GPG executable without a dialog.
 
+Commit signing requests whose first non-empty subject line is exactly `base`, `fixture`, `init`, `initial`, `main`, or `production` (case-insensitive, ignoring surrounding horizontal whitespace) are rejected before the dialog and before GPG starts. These generic subjects commonly come from temporary test repositories that accidentally inherit global `commit.gpgSign=true`. The error directs the caller to disable signing only for that test process or fixture repository, or — for a legitimate commit that genuinely uses such a subject — to reword it or re-run once with `GIT_GPG_PREVIEW_ALLOW_SUBJECT=1`, which signs it and records a `policy-override` entry in the audit log. Longer subjects such as `production release` are not rejected. The authoritative subject list is the `FIXTURE_SUBJECTS` line in the wrapper script; the tests read it from there.
+
 ## Requirements
 
 - macOS, including `/usr/bin/osascript`, AppKit, `shlock`, and standard command-line tools
@@ -28,6 +30,7 @@ The installer:
 
 - installs the executable as `~/.local/bin/git-gpg-preview`;
 - installs the static JXA/AppKit dialog helper under `~/.local/libexec/git-gpg-preview/`;
+- installs the standalone touch prompt (see [Reusable touch prompt](#reusable-touch-prompt)) beside it;
 - writes a mode-0600 configuration containing the absolute real-GPG path;
 - records the exact previous global `gpg.openpgp.program` state once; and
 - sets global `gpg.openpgp.program` to the wrapper.
@@ -68,6 +71,95 @@ The dialog deliberately labels two different things:
 
 Diffs are generated with `git --no-pager`, `--no-ext-diff`, and `--no-textconv`; repository content is never interpolated into AppleScript, JXA, or shell source. Dialog data travels only through mode-0600 files and argument values. Summary control characters are sanitized.
 
+## Reusable touch prompt
+
+A hardware key that is waiting for a touch gives no indication beyond its own LED. That is fine when you just typed `git commit`, and useless when the request came from somewhere you were not looking — an agent on another machine signing through a forwarded `ssh-agent`, for example.
+
+`touch-prompt.jxa` is the same on-screen idea as the signing preview, factored out so anything holding a pending hardware confirmation can use it:
+
+```sh
+/usr/bin/osascript -l JavaScript \
+  "$(sed -n 's/^touch_helper=//p' ~/.config/git-gpg-preview/config)" \
+  /path/to/context.txt /path/to/decision /path/to/ready &
+```
+
+The contract matches the signing preview's:
+
+- `context.txt` — mode-0600 text shown verbatim in a selectable, scrollable field. Sanitize it; the helper renders whatever it is given.
+- `decision` — the helper writes `deny` if the user presses **Deny**. Nothing is written when the window is terminated instead.
+- `ready` — created as the window is about to appear. Wait for it before engaging the hardware, so the prompt is up before the key starts blinking.
+
+There is no approve button, for the same reason the signing preview has none: the touch itself is the approval. The caller terminates the helper once the signature (or a failure) comes back, which dismisses the window.
+
+Installation records the helper's absolute path in the configuration as `touch_helper=`, so other tools can find it without hardcoding a path or depending on this repository's layout.
+
+Because the touch is the authorization gate, a caller that cannot present the prompt should still forward the request rather than fail: a missing window makes the touch invisible, not unauthorized.
+
+## Remote signing for hosts without a key
+
+A Linux dev VM that runs agents cannot hold your hardware key, and forwarding
+an agent socket to it loses the preview. `remote/` turns this machine into a
+signing service instead, and gives the VM a client that Git calls as its
+`gpg.openpgp.program`:
+
+```
+VM: git commit ─▶ git-gpg-preview-client ─▶ HTTP over Tailscale ─▶ serve (this Mac)
+                  captures payload, derives                       whois-checks the peer,
+                  diff from local objects,                        shows the same preview,
+                  runs --verify locally                           waits for your touch,
+                                                                  returns the signature
+```
+
+Install on the Mac after the wrapper (idempotent; safe to re-run):
+
+```bash
+remote/serve-install.sh install            # launchd agent on this machine's Tailscale address
+remote/serve-install.sh status
+```
+
+`serve` accepts requests only from tailnet nodes the local `tailscale whois`
+attributes to your own login, to names listed in `allow_nodes`, or to names
+starting with an `allow_node_prefixes` entry (default `minidev`). Every request
+still ends in your touch: the review window shows the exact payload bytes and
+hex view built on this machine from what arrived, and labels the diff as
+derived on the requesting host. Fixture-style subjects are refused here as
+well, whatever the client sent. Cancel, a missed touch (`sign_timeout_seconds`,
+default 120), an offline Mac and an unknown peer all fail the remote commit;
+nothing unsigned is ever written.
+
+On the host, point Git at the client and install the public key once:
+
+```bash
+python3 remote/git_gpg_preview_remote.py identity --server your-mac.tailnet.ts.net   # fingerprint + public key
+git config --global gpg.openpgp.program /path/to/remote/git-gpg-preview-client
+git config --global user.signingkey <fingerprint>
+git config --global commit.gpgsign true
+printf 'server=your-mac.tailnet.ts.net\n' > ~/.config/git-gpg-preview/client
+```
+
+The client resolves the Mac through the local Tailscale daemon's authenticated
+netmap, never ordinary DNS, and refuses to sign if the Mac is offline. Only the
+argument shapes Git uses to sign are forwarded (`--status-fd`, `-bsau <key>`
+and friends); anything else is refused by both sides. `--verify` and key
+listing run against the host's own `gpg`, so `git log --show-signature` works
+once the public key is imported.
+
+The service and the local wrapper share `dialog.lock` using the same
+pid-file protocol as `shlock`, so a local `git commit` and a remote request
+are never both waiting on one touch; the touch always answers the request whose
+window is on screen.
+
+Config keys: `~/.config/git-gpg-preview/serve` takes `port`, `allow_nodes`,
+`allow_node_prefixes`, `signing_key`, `sign_timeout_seconds`, `bind` and
+`dialog_runner` (tests); `real_gpg`, `ui_helper`, `lock_root` and `audit_log`
+come from the wrapper's `config`. `~/.config/git-gpg-preview/client` takes
+`server`, `port`, `real_gpg` and `timeout_seconds`. Audit-log lines from remote
+requests carry `peer=<node> (<login>)` and `caller=remote`.
+
+Tests: `python3 -m unittest discover -s remote/tests` runs the service behind
+fake `tailscale`, `gpg` and dialog helpers on any platform, plus one real
+GnuPG round trip with a disposable key when `gpg` is installed.
+
 ## Fail-closed cases
 
 A signing request is rejected before GPG runs when the real-GPG path or UI helper is missing, a recognized commit/tag payload cannot be safely parsed against available Git objects, or a secure temporary area cannot be created. Once the preview and GPG are engaged, a **Cancel** decision, a preview process that exits without approval, or any outcome other than a completed signature kills GPG before it produces a signature. Unknown signing formats still receive a clearly labeled exact-payload review.
@@ -86,6 +178,7 @@ Important limitations:
 - Binary and very large changes can make a full textual report unwieldy; the exact payload's hex view remains byte-preserving.
 - Git object formats that do not resemble standard commit, annotated-tag, or push-certificate payloads appear as `unknown`.
 - The wrapper is intentionally for Git's GPG interface, not a general-purpose replacement for every GPG client.
+- Remote signing trusts the local Tailscale daemon's identity answers and the requesting host's rendering of the diff. The payload bytes shown and signed are what arrived; a compromised host can ask you to sign a commit it describes misleadingly, which is why the exact payload and hex view are rendered here and the diff is labelled as derived remotely.
 - The absolute real-GPG path must remain executable. If a package-manager upgrade removes it, reinstall with the new path.
 
 ## Troubleshooting and recovery
@@ -115,7 +208,7 @@ The uninstaller restores all previously recorded `gpg.openpgp.program` values, o
 
 ## Tests
 
-`./tests/run.sh` uses a fake GPG and a noninteractive fake dialog in an isolated home directory. It covers normal and initial commits, merge commits, annotated tags, push certificates, unknown/binary payloads, hostile Unicode content, cancellation, verification pass-through, GPG failure status, stdout purity, exact stdin/argument forwarding, concurrent queueing, stale lock recovery, safe diff options, and audit logging.
+`./tests/run.sh` uses a fake GPG and a noninteractive fake dialog in an isolated home directory. It covers normal and initial commits, merge commits, annotated tags, push certificates, unknown/binary payloads, hostile Unicode content, fixture-style subject rejection and near-misses, cancellation, verification pass-through, GPG failure status, stdout purity, exact stdin/argument forwarding, concurrent queueing, stale lock recovery, safe diff options, and audit logging.
 
 ## License
 
