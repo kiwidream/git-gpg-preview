@@ -248,6 +248,22 @@ class RemoteSigningTests(unittest.TestCase):
         result = h.client(self.sign_args(), self.second, self.repo)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_environment_proxies_never_carry_the_signing_request(self):
+        # An agent runtime routes its own traffic through an egress proxy and
+        # exempts only localhost; the service is a tailnet peer, reached directly.
+        dead = f'http://127.0.0.1:{free_port()}/'
+        proxied = {name: dead for name in ('http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY')}
+        proxied.update({'no_proxy': 'localhost', 'NO_PROXY': 'localhost'})
+        h = Harness(self.tmp / 'proxied', extra_env=proxied)
+        self.addCleanup(h.stop)
+        result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.second, self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b'signature:remote')
+        result = subprocess.run([sys.executable, str(MODULE), 'identity', '--config-dir', str(h.client_dir),
+                                 '--address', f'127.0.0.1:{h.port}'], env={**h.env}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('fingerprint', json.loads(result.stdout))
+
     def test_verify_and_other_operations_stay_local(self):
         result = self.h.client(['--keyid-format=long', '--status-fd=1', '--verify', 'sig', '-'], self.second, self.repo)
         self.assertEqual(result.returncode, 0, result.stderr)

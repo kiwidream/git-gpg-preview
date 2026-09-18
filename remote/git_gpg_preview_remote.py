@@ -37,7 +37,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 PROGRAM = 'git-gpg-preview-remote'
 PROTOCOL_VERSION = 1
@@ -903,11 +903,23 @@ def server_url(config: ClientConfig) -> str:
     return f'http://{ip}:{port}'
 
 
+# The service is a tailnet peer, reached directly by design. urllib would
+# otherwise honour http_proxy/https_proxy from the environment, and an agent
+# runtime that routes its own traffic through an egress proxy (NO_PROXY set to
+# localhost only) then sends the signing request to a proxy that cannot reach
+# the operator's machine: "signing service refused (502): Upstream unreachable".
+DIRECT = build_opener(ProxyHandler({}))
+
+
+def open_direct(request: Request, timeout: float):
+    return DIRECT.open(request, timeout=timeout)
+
+
 def post_json(url: str, body: dict, timeout: float) -> dict:
     data = json.dumps(body).encode()
     request = Request(url, data=data, headers={'Content-Type': 'application/json'}, method='POST')
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with open_direct(request, timeout) as response:
             return json.loads(response.read())
     except HTTPError as exc:
         try:
@@ -924,7 +936,7 @@ def post_json(url: str, body: dict, timeout: float) -> dict:
 
 def get_json(url: str, timeout: float) -> dict:
     try:
-        with urlopen(Request(url), timeout=timeout) as response:
+        with open_direct(Request(url), timeout) as response:
             return json.loads(response.read())
     except HTTPError as exc:
         raise RemoteError(f'signing service refused ({exc.code})', EX_POLICY if exc.code == 403 else EX_SOFTWARE) from exc
