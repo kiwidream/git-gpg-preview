@@ -33,6 +33,13 @@ cd ~/git-gpg-preview
 ./install.sh --real-gpg /absolute/path/to/gpg
 ```
 
+The bundled `scripts/git-gpg-preview-setup` launcher also provides `install`,
+`upgrade`, `status`, `uninstall`, `test`, and `serve-*` commands from a checkout
+or through a symlink on `PATH`. Its `upgrade` command refreshes the installed
+wrapper and helpers while preserving configuration and Git settings. The
+launcher was contributed by SwapLabs and is maintained here alongside the
+tool; downstream bundles should vendor it with the other upstream files.
+
 The installer:
 
 - installs the executable as `~/.local/bin/git-gpg-preview`;
