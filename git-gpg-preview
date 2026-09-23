@@ -11,9 +11,9 @@ PROGRAM_NAME="git-gpg-preview"
 # Single source of truth for rejected fixture-style commit subjects
 # (lowercase, space-separated). Tests read this line; keep the format.
 FIXTURE_SUBJECTS="base fixture init initial main production seed work more msg message x"
-# Author/committer email domains reserved for documentation and testing
-# (RFC 2606, 6761, 6762). A match, or a subdomain of one, marks a commit made
-# by a test. Tests read this line; keep the format.
+# Blocked author/committer domains: documentation, testing, and local-use
+# names (RFC 2606, 6761, 6762), including subdomains. This fixture heuristic
+# also blocks legitimate .local identities. Tests read this line; keep the format.
 FIXTURE_EMAIL_DOMAINS="example.com example.net example.org example invalid localhost test local"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 CONFIG_FILE="$CONFIG_HOME/git-gpg-preview/config"
@@ -358,12 +358,12 @@ if [[ "$REQUEST_TYPE" == "commit" ]]; then
             # Deliberate one-shot override for a legitimate commit that
             # happens to match a fixture rule. Loud and audited.
             audit_decision "policy-override" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
-            error "note: signing fixture-style commit $FIXTURE_REASON because the override is set (recorded in audit log)"
+            error "note: local fixture policy overridden for commit $FIXTURE_REASON (recorded in audit log); remote signing policy still applies"
         else
             audit_decision "policy-reject" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
             error "refusing to sign fixture-style commit $FIXTURE_REASON"
             error "if this is a test or fixture repository: disable signing there (run the test with GIT_CONFIG_GLOBAL=/dev/null, or set commit.gpgSign=false only in that repository)"
-            error "if this is a real commit: give it a descriptive subject (e.g. 'Initial commit: <what this is>') and your real identity, or re-run once with GIT_GPG_PREVIEW_ALLOW_FIXTURE=1 to sign it anyway (the override is recorded in the audit log)"
+            error "if this is a real commit: give it a descriptive subject (e.g. 'Initial commit: <what this is>') and an identity outside the blocked domains; for local GnuPG only, re-run once with GIT_GPG_PREVIEW_ALLOW_FIXTURE=1 (audited override; remote signing has no fixture override)"
             exit 65
         fi
     fi

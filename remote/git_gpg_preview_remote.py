@@ -45,9 +45,9 @@ DEFAULT_PORT = 24824
 # Single source of truth for rejected fixture-style commits; both must match
 # FIXTURE_SUBJECTS and FIXTURE_EMAIL_DOMAINS in the git-gpg-preview wrapper.
 FIXTURE_SUBJECTS = frozenset('base fixture init initial main production seed work more msg message x'.split())
-# Reserved for documentation and testing (RFC 2606, RFC 6761, RFC 6762): a
-# commit whose author or committer email is at one of these domains, or under
-# one, was made by a test and never by a person.
+# Blocked documentation, testing, and local-use domains (RFC 2606, 6761, 6762).
+# This fixture heuristic deliberately includes .local, even though legitimate
+# identities can use it. A listed domain or any subdomain matches.
 FIXTURE_EMAIL_DOMAINS = ('example.com', 'example.net', 'example.org', 'example', 'invalid', 'localhost', 'test', 'local')
 TAILNET_V4 = ipaddress.ip_network('100.64.0.0/10')
 TAILNET_V6 = ipaddress.ip_network('fd7a:115c:a1e0::/48')

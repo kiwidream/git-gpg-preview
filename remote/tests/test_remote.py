@@ -294,6 +294,29 @@ class RemoteSigningTests(unittest.TestCase):
         self.assertEqual(frozenset(subjects), remote.FIXTURE_SUBJECTS)
         self.assertEqual(tuple(domains), remote.FIXTURE_EMAIL_DOMAINS)
 
+    def test_remote_fixture_policy_cannot_be_overridden_by_requester(self):
+        header = self.initial.partition(b'\n\n')[0]
+        payloads = [header + b'\n\nseed\n',
+                    self.initial.replace(b'preview@preview-tester.dev', b'tester@example.com', 1),
+                    self.initial.replace(b'preview@preview-tester.dev', b'user@MacBook.local')]
+        for payload in payloads:
+            for override in ('GIT_GPG_PREVIEW_ALLOW_FIXTURE', 'GIT_GPG_PREVIEW_ALLOW_SUBJECT'):
+                with self.subTest(payload=payload, override=override):
+                    result = self.h.client(self.sign_args(), payload, self.repo, env={override: '1'})
+                    self.assertEqual(result.returncode, 65)
+                    self.assertEqual(result.stdout, b'')
+                    self.assertIn(b'refusing to sign fixture-style commit', result.stderr)
+            for flag in (True, 1, '1'):
+                with self.subTest(payload=payload, flag=flag):
+                    code, body = self.h.post({'version': 1, 'args': self.sign_args(),
+                                              'payload': base64.b64encode(payload).decode(),
+                                              'fixture_override': flag, 'context': {'fixture_override': flag}})
+                    self.assertEqual((code, body['status'], body['decision']), (200, 65, 'policy-reject'))
+                    self.assertEqual(body['stdout'], '')
+        self.assertEqual(self.h.gpg_calls(), [])
+        self.assertEqual(list(self.h.captures.iterdir()), [])
+        self.assertNotIn('decision=policy-override', self.h.audit.read_text())
+
     def test_test_identities_are_refused_on_both_sides(self):
         g = lambda *a, env=None: subprocess.run(['git', '-C', str(self.repo), *a], check=True, capture_output=True,
                                                 env={**os.environ, **(env or {})}).stdout

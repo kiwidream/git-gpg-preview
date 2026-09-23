@@ -210,6 +210,7 @@ for rejected_subject in $REJECTED_SUBJECTS; do
     grep -F "refusing to sign fixture-style commit subject '$(printf '%s' "$rejected_subject" | tr '[:upper:]' '[:lower:]')'" "$TMP/policy-reject.stderr" >/dev/null || fail "fixture-style subject $rejected_subject omitted the rejection reason"
     grep -F 'if this is a test or fixture repository: disable signing there' "$TMP/policy-reject.stderr" >/dev/null || fail "fixture-style subject $rejected_subject omitted fixture remediation"
     grep -F 'GIT_GPG_PREVIEW_ALLOW_FIXTURE=1' "$TMP/policy-reject.stderr" >/dev/null || fail "fixture-style subject $rejected_subject omitted the override hint"
+    grep -F 'remote signing has no fixture override' "$TMP/policy-reject.stderr" >/dev/null || fail "fixture-style subject $rejected_subject omitted the remote policy limit"
 done
 for rejected_email in $REJECTED_EMAILS; do
     for role in author committer; do
