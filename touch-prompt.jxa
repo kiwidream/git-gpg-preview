@@ -1,0 +1,110 @@
+ObjC.import('Cocoa');
+
+// Standalone hardware-confirmation prompt.
+//
+// Unlike dialog.jxa, this helper reviews nothing: it makes an already-pending
+// hardware touch visible while some other process waits for the signature.
+// The caller writes a context file, launches this helper, forwards the signing
+// request, and terminates this process once the signature (or a failure)
+// comes back. A "Deny" press writes a decision the caller reads to abort.
+//
+// Arguments: <context-file> <decision-file> [ready-file]
+//
+// It is deliberately self-contained rather than sharing code with dialog.jxa,
+// so a change to one prompt cannot alter the other.
+
+function unwrap(value) {
+    return ObjC.unwrap(value);
+}
+
+function readText(path) {
+    const data = $.NSData.dataWithContentsOfFile(path);
+    if (!data) {
+        throw new Error('Unable to read prompt context.');
+    }
+    let text = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding);
+    if (!text) {
+        text = $.NSString.alloc.initWithDataEncoding(data, $.NSISOLatin1StringEncoding);
+    }
+    if (!text) {
+        throw new Error('Unable to decode prompt context.');
+    }
+    return unwrap(text);
+}
+
+function writeDecision(path, decision) {
+    const handle = $.NSFileHandle.fileHandleForWritingAtPath(path);
+    if (!handle) {
+        throw new Error('Unable to open the decision file.');
+    }
+    handle.truncateFileAtOffset(0);
+    const data = $.NSString.stringWithString(decision).dataUsingEncoding($.NSUTF8StringEncoding);
+    handle.writeData(data);
+    handle.synchronizeFile;
+    handle.closeFile;
+}
+
+function markReady(path) {
+    if (!path) return;
+    $.NSData.data.writeToFileAtomically(path, true);
+}
+
+function scrollableText(text, width, height) {
+    const frame = $.NSMakeRect(0, 0, width, height);
+    const scroll = $.NSScrollView.alloc.initWithFrame(frame);
+    scroll.hasVerticalScroller = true;
+    scroll.hasHorizontalScroller = true;
+    scroll.autohidesScrollers = true;
+    scroll.borderType = $.NSBezelBorder;
+
+    const contentSize = scroll.contentSize;
+    const textView = $.NSTextView.alloc.initWithFrame($.NSMakeRect(0, 0, contentSize.width, contentSize.height));
+    textView.minSize = $.NSMakeSize(0, contentSize.height);
+    textView.maxSize = $.NSMakeSize(10000000, 10000000);
+    textView.verticallyResizable = true;
+    textView.horizontallyResizable = true;
+    textView.autoresizingMask = $.NSViewWidthSizable;
+    textView.textContainer.containerSize = $.NSMakeSize(10000000, 10000000);
+    textView.textContainer.widthTracksTextView = false;
+    textView.editable = false;
+    textView.selectable = true;
+    textView.richText = false;
+    textView.font = $.NSFont.monospacedSystemFontOfSizeWeight(12, $.NSFontWeightRegular);
+    textView.string = text;
+    scroll.documentView = textView;
+    return scroll;
+}
+
+function run(argv) {
+    if (argv.length < 2) {
+        throw new Error('Expected context and decision paths.');
+    }
+    const context = readText(argv[0]);
+    const decisionPath = argv[1];
+    const readyPath = argv.length > 2 ? argv[2] : '';
+
+    const app = $.NSApplication.sharedApplication;
+    app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
+    app.activateIgnoringOtherApps(true);
+
+    const alert = $.NSAlert.alloc.init;
+    // Critical style: the hardware confirmation window is short, so the prompt
+    // has to be noticeable the moment it appears.
+    alert.alertStyle = $.NSAlertStyleCritical;
+    alert.messageText = 'Touch your security key';
+    alert.informativeText = 'A signature was requested from your security key. '
+        + 'Touch it to approve; this window closes by itself once the signature completes. '
+        + 'Deny refuses the request.';
+    alert.accessoryView = scrollableText(context, 460, 130);
+    alert.addButtonWithTitle('Deny');
+
+    // Report readiness as the window is about to show, so the caller only
+    // forwards the request once the prompt is on screen.
+    markReady(readyPath);
+
+    alert.runModal;
+    // The only button is Deny; reaching here means the user refused. When the
+    // signature completes instead, the caller terminates this process and this
+    // line is never reached.
+    writeDecision(decisionPath, 'deny');
+}

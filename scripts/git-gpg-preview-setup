@@ -1,0 +1,141 @@
+#!/bin/bash
+
+# Front door for the vendored git-gpg-preview installer.
+#
+# The tool's own install.sh deliberately copies the wrapper into ~/.local/bin
+# rather than symlinking it, and rewrites a global Git setting, so the skills
+# installer does not run it for you. This is the one command that does.
+
+set -euo pipefail
+
+# This script is installed as a symlink on PATH, so $0 is usually the link and
+# not the file. `cd -P` resolves symlinks among a path's *components*, but
+# dirname has already discarded the link itself by then — resolve it first, or
+# ROOT lands in ~/.local instead of the checkout.
+resolve_self() {
+    local target=$1 directory
+    while [[ -L "$target" ]]; do
+        directory=$(cd -P -- "$(dirname -- "$target")" && pwd) || return 1
+        target=$(readlink -- "$target") || return 1
+        [[ "$target" == /* ]] || target="$directory/$target"
+    done
+    directory=$(cd -P -- "$(dirname -- "$target")" && pwd) || return 1
+    printf '%s/%s\n' "$directory" "$(basename -- "$target")"
+}
+
+SELF=$(resolve_self "$0") || { printf 'cannot resolve %s\n' "$0" >&2; exit 70; }
+ROOT=$(cd -P -- "$(dirname -- "$SELF")/.." && pwd)
+PROGRAM=$(basename -- "$0")
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+CONFIG_FILE="$CONFIG_HOME/git-gpg-preview/config"
+INSTALL_BIN="$HOME/.local/bin/git-gpg-preview"
+INSTALL_LIB_DIR="$HOME/.local/libexec/git-gpg-preview"
+INSTALL_DIALOG="$INSTALL_LIB_DIR/dialog.jxa"
+INSTALL_TOUCH="$INSTALL_LIB_DIR/touch-prompt.jxa"
+
+usage() {
+    cat >&2 <<EOF
+Usage: $PROGRAM <command> [options]
+
+  install [--real-gpg PATH] [--audit-log PATH]
+        Install the wrapper and point Git's gpg.openpgp.program at it.
+        Without --real-gpg the first gpg on PATH is used.
+
+  upgrade
+        Refresh the installed wrapper and helpers without changing config,
+        recovery state, or Git settings.
+
+  status
+        Report what is installed and whether the touch prompt is wired up.
+
+  test
+        Run the tool's own test suite against a fake GPG and a fake dialog
+        (macOS), then the remote signing suite (any platform).
+
+  serve-install [--port N] [--allow-node NAME]... [--allow-prefix PREFIX]...
+        Run the remote signing service on this Mac (launchd) so keyless
+        tailnet hosts can request signatures that still need your touch.
+  serve-status / serve-uninstall
+
+  uninstall
+        Restore the previous gpg.openpgp.program and remove installed files.
+EOF
+}
+
+config_value() {
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    sed -n "s/^$1=//p" "$CONFIG_FILE" | tail -n 1
+}
+
+upgrade() {
+    local configured
+    [[ "$#" -eq 0 ]] || { usage; return 64; }
+    configured=$(git config --global --get gpg.openpgp.program 2>/dev/null || true)
+    if [[ ! -f "$CONFIG_FILE" || ! -e "$INSTALL_BIN" || "$configured" != "$INSTALL_BIN" ]]; then
+        printf '%s is not an active installation; run "%s install" first.\n' \
+            "$INSTALL_BIN" "$PROGRAM" >&2
+        return 1
+    fi
+    mkdir -p "$HOME/.local/bin" "$INSTALL_LIB_DIR"
+    chmod 700 "$HOME/.local/bin" "$INSTALL_LIB_DIR"
+    /usr/bin/install -m 700 "$ROOT/git-gpg-preview" "$INSTALL_BIN"
+    /usr/bin/install -m 600 "$ROOT/dialog.jxa" "$INSTALL_DIALOG"
+    /usr/bin/install -m 600 "$ROOT/touch-prompt.jxa" "$INSTALL_TOUCH"
+    printf 'Updated %s and bundled helpers.\n' "$INSTALL_BIN"
+    printf 'Configuration, recovery state, and Git settings were preserved.\n'
+}
+
+status() {
+    local configured helper real
+    configured=$(git config --global --get gpg.openpgp.program 2>/dev/null || true)
+    printf 'gpg.openpgp.program: %s\n' "${configured:-(unset)}"
+    printf 'wrapper:             %s\n' \
+        "$([[ -x "$INSTALL_BIN" ]] && printf '%s' "$INSTALL_BIN" || printf 'not installed')"
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        printf 'config:              not installed (%s)\n' "$CONFIG_FILE"
+        printf '\nRun "%s install" to set it up.\n' "$PROGRAM"
+        return 1
+    fi
+    printf 'config:              %s\n' "$CONFIG_FILE"
+
+    real=$(config_value real_gpg || true)
+    printf 'real gpg:            %s%s\n' "${real:-(unset)}" \
+        "$([[ -n "$real" && ! -x "$real" ]] && printf ' [MISSING]' || true)"
+
+    helper=$(config_value touch_helper || true)
+    if [[ -n "$helper" && -f "$helper" ]]; then
+        printf 'touch prompt:        %s\n' "$helper"
+    else
+        printf 'touch prompt:        not installed — re-run "%s install"\n' "$PROGRAM"
+        return 1
+    fi
+
+    if [[ "$configured" != "$INSTALL_BIN" ]]; then
+        printf '\nGit is not routed through the wrapper; run "%s install".\n' "$PROGRAM"
+        return 1
+    fi
+    printf '\nSigning previews are active, and the touch prompt is available to\n'
+    printf 'other tools as touch_helper in %s\n' "$CONFIG_FILE"
+}
+
+command=${1:-}
+[[ "$#" -gt 0 ]] && shift || true
+
+case "$command" in
+    install) exec "$ROOT/install.sh" "$@" ;;
+    upgrade) upgrade "$@" ;;
+    uninstall) exec "$ROOT/uninstall.sh" "$@" ;;
+    test)
+        # A failing macOS suite must not be hidden by the remote suite's result.
+        if [[ "$(uname -s)" == "Darwin" ]]; then "$ROOT/tests/run.sh" "$@" || exit $?; fi
+        exec python3 -m unittest discover -s "$ROOT/remote/tests"
+        ;;
+    serve-install) exec "$ROOT/remote/serve-install.sh" install "$@" ;;
+    serve-status) exec "$ROOT/remote/serve-install.sh" status ;;
+    serve-uninstall) exec "$ROOT/remote/serve-install.sh" uninstall ;;
+    status) status ;;
+    -h|--help|help) usage ;;
+    *) usage; exit 64 ;;
+esac
