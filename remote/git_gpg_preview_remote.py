@@ -42,9 +42,13 @@ from urllib.request import ProxyHandler, Request, build_opener
 PROGRAM = 'git-gpg-preview-remote'
 PROTOCOL_VERSION = 1
 DEFAULT_PORT = 24824
-# Single source of truth for rejected fixture-style commit subjects; must
-# match FIXTURE_SUBJECTS in the git-gpg-preview wrapper.
-FIXTURE_SUBJECTS = frozenset('base fixture init initial main production'.split())
+# Single source of truth for rejected fixture-style commits; both must match
+# FIXTURE_SUBJECTS and FIXTURE_EMAIL_DOMAINS in the git-gpg-preview wrapper.
+FIXTURE_SUBJECTS = frozenset('base fixture init initial main production seed work more msg message x'.split())
+# Reserved for documentation and testing (RFC 2606, RFC 6761, RFC 6762): a
+# commit whose author or committer email is at one of these domains, or under
+# one, was made by a test and never by a person.
+FIXTURE_EMAIL_DOMAINS = ('example.com', 'example.net', 'example.org', 'example', 'invalid', 'localhost', 'test', 'local')
 TAILNET_V4 = ipaddress.ip_network('100.64.0.0/10')
 TAILNET_V6 = ipaddress.ip_network('fd7a:115c:a1e0::/48')
 EX_CANCELLED = 1
@@ -214,7 +218,7 @@ def parse_payload(payload: bytes) -> dict:
     text = payload.decode('utf-8', 'replace')
     header, _, message = text.partition('\n\n')
     first = header.split('\n', 1)[0]
-    info = {'type': 'unknown', 'tree': '', 'parents': [], 'object': '', 'message': message}
+    info = {'type': 'unknown', 'tree': '', 'parents': [], 'object': '', 'header': header, 'message': message}
     fields = [line.split(' ', 1) for line in header.split('\n') if ' ' in line]
     if first.startswith('tree '):
         info['type'] = 'commit'
@@ -235,6 +239,35 @@ def fixture_subject(message: str) -> str | None:
             continue
         return subject if subject in FIXTURE_SUBJECTS else None
     return None
+
+
+def fixture_identity(header: str) -> str | None:
+    """Match the wrapper's LC_ALL=C awk parser, including malformed identities."""
+    for line in header.split('\n'):
+        if not line:
+            break
+        if not re.match(r'^[ \t]*(author|committer)(?:[ \t]|$)', line) or '<' not in line:
+            continue
+        email, close, _ = line.rpartition('<')[2].partition('>')
+        if not close:
+            continue
+        email = email.strip(' \t').translate(str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'))
+        domain = email.rpartition('@')[2].removesuffix('.')
+        if any(domain == d or (len(domain) > len(d) + 1 and domain.endswith('.' + d))
+               for d in FIXTURE_EMAIL_DOMAINS):
+            return email
+    return None
+
+
+def fixture_reason(info: dict) -> str | None:
+    """Why a commit payload looks like it came from a test repository."""
+    if info['type'] != 'commit':
+        return None
+    subject = fixture_subject(info['message'])
+    if subject:
+        return f"subject '{subject}'"
+    email = fixture_identity(info['header'])
+    return f"identity '{email}'" if email else None
 
 
 def valid_oid(value: str) -> bool:
@@ -579,11 +612,11 @@ class Service:
         digest = hashlib.sha256(payload).hexdigest()
         repo = context.get('repository', '(unknown repository)')
         peer = f"{who['node'] or '?'} ({who['login'] or 'no login'})"
-        rejected = fixture_subject(info['message']) if info['type'] == 'commit' else None
+        rejected = fixture_reason(info)
         if rejected:
             self.audit('policy-reject', repo, info['type'], digest, peer)
             return {'status': EX_POLICY, 'decision': 'policy-reject', 'stdout': '',
-                    'stderr': f"git-gpg-preview: refusing to sign fixture-style commit subject '{rejected}'\n"}
+                    'stderr': f"git-gpg-preview: refusing to sign fixture-style commit {one_line(rejected)}\n"}
 
         summary = self._summary(info, args, payload, digest, context, peer)
         details = self._details(info, args, payload, digest, context, peer)
@@ -955,10 +988,9 @@ def cmd_client(gpg_args: list[str], config_dir: str | None) -> int:
     if not payload:
         raise RemoteError('could not capture signing payload')
     info = parse_payload(payload)
-    if info['type'] == 'commit':
-        rejected = fixture_subject(info['message'])
-        if rejected:
-            raise RemoteError(f"refusing to sign fixture-style commit subject '{rejected}'", EX_POLICY)
+    rejected = fixture_reason(info)
+    if rejected:
+        raise RemoteError(f'refusing to sign fixture-style commit {one_line(rejected)}', EX_POLICY)
     context = describe_locally(info)
     context['host'] = os.uname().nodename
     url = server_url(config)

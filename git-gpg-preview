@@ -10,7 +10,11 @@ export LC_ALL=C
 PROGRAM_NAME="git-gpg-preview"
 # Single source of truth for rejected fixture-style commit subjects
 # (lowercase, space-separated). Tests read this line; keep the format.
-FIXTURE_SUBJECTS="base fixture init initial main production"
+FIXTURE_SUBJECTS="base fixture init initial main production seed work more msg message x"
+# Author/committer email domains reserved for documentation and testing
+# (RFC 2606, 6761, 6762). A match, or a subdomain of one, marks a commit made
+# by a test. Tests read this line; keep the format.
+FIXTURE_EMAIL_DOMAINS="example.com example.net example.org example invalid localhost test local"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 CONFIG_FILE="$CONFIG_HOME/git-gpg-preview/config"
 REAL_GPG=""
@@ -146,6 +150,39 @@ fixture_style_commit_subject() {
         }
         END { exit matched ? 0 : 1 }
     ' "$message_file"
+}
+
+fixture_style_commit_identity() {
+    local payload_file="$1"
+    /usr/bin/awk -v domains=" $FIXTURE_EMAIL_DOMAINS " '
+        $0 == "" { exit }
+        $1 == "author" || $1 == "committer" {
+            line = $0
+            open = 0
+            for (i = length(line); i > 0; i--) {
+                if (substr(line, i, 1) == "<") { open = i; break }
+            }
+            if (open == 0) { next }
+            email = substr(line, open + 1)
+            close_at = index(email, ">")
+            if (close_at == 0) { next }
+            email = tolower(substr(email, 1, close_at - 1))
+            gsub(/^[ \t]+|[ \t]+$/, "", email)
+            domain = email
+            sub(/^.*@/, "", domain)
+            sub(/\.$/, "", domain)
+            count = split(substr(domains, 2, length(domains) - 2), list, " ")
+            for (i = 1; i <= count; i++) {
+                suffix = "." list[i]
+                if (domain == list[i] || (length(domain) > length(suffix) && substr(domain, length(domain) - length(suffix) + 1) == suffix)) {
+                    print email
+                    matched = 1
+                    exit
+                }
+            }
+        }
+        END { exit matched ? 0 : 1 }
+    ' "$payload_file"
 }
 
 append_limited_sanitized() {
@@ -309,17 +346,24 @@ fi
 : > "$FULL_DIFF"
 
 if [[ "$REQUEST_TYPE" == "commit" ]]; then
-    if REJECTED_SUBJECT=$(fixture_style_commit_subject "$MESSAGE"); then
-        if [[ "${GIT_GPG_PREVIEW_ALLOW_SUBJECT:-}" == "1" ]]; then
+    FIXTURE_REASON=""
+    if rejected_value=$(fixture_style_commit_subject "$MESSAGE"); then
+        FIXTURE_REASON="subject '$rejected_value'"
+    elif rejected_value=$(fixture_style_commit_identity "$PAYLOAD"); then
+        FIXTURE_REASON="identity '$(printf '%s' "$rejected_value" | sanitize_one_line)'"
+    fi
+    if [[ -n "$FIXTURE_REASON" ]]; then
+        # GIT_GPG_PREVIEW_ALLOW_SUBJECT is the original name of the override.
+        if [[ "${GIT_GPG_PREVIEW_ALLOW_FIXTURE:-}" == "1" || "${GIT_GPG_PREVIEW_ALLOW_SUBJECT:-}" == "1" ]]; then
             # Deliberate one-shot override for a legitimate commit that
-            # happens to use a blocked subject. Loud and audited.
+            # happens to match a fixture rule. Loud and audited.
             audit_decision "policy-override" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
-            error "note: signing blocked subject '$REJECTED_SUBJECT' because GIT_GPG_PREVIEW_ALLOW_SUBJECT=1 (recorded in audit log)"
+            error "note: signing fixture-style commit $FIXTURE_REASON because the override is set (recorded in audit log)"
         else
             audit_decision "policy-reject" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
-            error "refusing to sign fixture-style commit subject '$REJECTED_SUBJECT'"
+            error "refusing to sign fixture-style commit $FIXTURE_REASON"
             error "if this is a test or fixture repository: disable signing there (run the test with GIT_CONFIG_GLOBAL=/dev/null, or set commit.gpgSign=false only in that repository)"
-            error "if this is a real commit: reword the subject to something descriptive (e.g. 'Initial commit: <what this is>'), or re-run once with GIT_GPG_PREVIEW_ALLOW_SUBJECT=1 to sign it anyway (the override is recorded in the audit log)"
+            error "if this is a real commit: give it a descriptive subject (e.g. 'Initial commit: <what this is>') and your real identity, or re-run once with GIT_GPG_PREVIEW_ALLOW_FIXTURE=1 to sign it anyway (the override is recorded in the audit log)"
             exit 65
         fi
     fi

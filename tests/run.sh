@@ -77,7 +77,9 @@ FIXTURE="$TMP/repository with spaces"
 mkdir -p "$FIXTURE"
 git -C "$FIXTURE" init -b main >/dev/null
 git -C "$FIXTURE" config user.name 'Preview Tester'
-git -C "$FIXTURE" config user.email 'preview@example.invalid'
+# Not a reserved test domain: fixtures that must reach the dialog cannot
+# trip the fixture-identity rule. The rule's own cases set it per commit.
+git -C "$FIXTURE" config user.email 'preview@preview-tester.dev'
 git -C "$FIXTURE" config commit.gpgSign false
 git -C "$FIXTURE" config tag.gpgSign false
 
@@ -128,6 +130,27 @@ for rejected_subject in $REJECTED_SUBJECTS; do
     REJECTED_COMMIT=$(git -C "$FIXTURE" rev-parse HEAD)
     git -C "$FIXTURE" cat-file commit "$REJECTED_COMMIT" > "$TMP/policy-$rejected_subject.payload"
 done
+
+# The identity rule reads author and committer emails from the payload
+# header; one reserved address in either role is enough.
+REJECTED_EMAILS=""
+for rejected_email in $(sed -n 's/^FIXTURE_EMAIL_DOMAINS="\(.*\)"$/\1/p' "$ROOT/git-gpg-preview"); do
+    REJECTED_EMAILS="$REJECTED_EMAILS tester@$rejected_email"
+done
+[[ -n "$REJECTED_EMAILS" ]] || fail 'could not read FIXTURE_EMAIL_DOMAINS from wrapper'
+REJECTED_EMAILS="$REJECTED_EMAILS ci@Sub.Example.COM"
+for rejected_email in $REJECTED_EMAILS; do
+    git -C "$FIXTURE" commit -q --allow-empty --author="Tester <$rejected_email>" -m 'Descriptive subject from a test' >/dev/null
+    git -C "$FIXTURE" cat-file commit HEAD > "$TMP/identity-author-$rejected_email.payload"
+    GIT_COMMITTER_EMAIL="$rejected_email" git -C "$FIXTURE" commit -q --allow-empty -m 'Descriptive subject from a test' >/dev/null
+    git -C "$FIXTURE" cat-file commit HEAD > "$TMP/identity-committer-$rejected_email.payload"
+done
+git -C "$FIXTURE" -c user.email='tester@notexample.com' commit -q --allow-empty -m 'Lookalike domain' >/dev/null
+git -C "$FIXTURE" cat-file commit HEAD > "$TMP/identity-near-miss.payload"
+printf 'body names <someone@example.com>\n' > "$FIXTURE/policy.txt"
+git -C "$FIXTURE" add -- policy.txt
+git -C "$FIXTURE" commit -q -m $'Reserved address only in the body\n\nCo-authored-by: Test <test@example.com>' >/dev/null
+git -C "$FIXTURE" cat-file commit HEAD > "$TMP/identity-body.payload"
 
 git -C "$FIXTURE" tag -a policy-tag -m 'production'
 POLICY_TAG_OBJECT=$(git -C "$FIXTURE" rev-parse policy-tag)
@@ -186,25 +209,43 @@ for rejected_subject in $REJECTED_SUBJECTS; do
     [[ ! -s "$TMP/policy-reject.stdout" ]] || fail "fixture-style subject $rejected_subject contaminated stdout"
     grep -F "refusing to sign fixture-style commit subject '$(printf '%s' "$rejected_subject" | tr '[:upper:]' '[:lower:]')'" "$TMP/policy-reject.stderr" >/dev/null || fail "fixture-style subject $rejected_subject omitted the rejection reason"
     grep -F 'if this is a test or fixture repository: disable signing there' "$TMP/policy-reject.stderr" >/dev/null || fail "fixture-style subject $rejected_subject omitted fixture remediation"
-    grep -F 'GIT_GPG_PREVIEW_ALLOW_SUBJECT=1' "$TMP/policy-reject.stderr" >/dev/null || fail "fixture-style subject $rejected_subject omitted the override hint"
+    grep -F 'GIT_GPG_PREVIEW_ALLOW_FIXTURE=1' "$TMP/policy-reject.stderr" >/dev/null || fail "fixture-style subject $rejected_subject omitted the override hint"
+done
+for rejected_email in $REJECTED_EMAILS; do
+    for role in author committer; do
+        set +e
+        "$ROOT/git-gpg-preview" -bsau TEST < "$TMP/identity-$role-$rejected_email.payload" > "$TMP/policy-reject.stdout" 2> "$TMP/policy-reject.stderr"
+        rejected_status=$?
+        set -e
+        [[ "$rejected_status" -eq 65 ]] || fail "fixture $role identity $rejected_email returned $rejected_status"
+        [[ ! -s "$TMP/policy-reject.stdout" ]] || fail "fixture $role identity $rejected_email contaminated stdout"
+        grep -F "refusing to sign fixture-style commit identity '$(printf '%s' "$rejected_email" | tr '[:upper:]' '[:lower:]')'" "$TMP/policy-reject.stderr" >/dev/null || fail "fixture $role identity $rejected_email omitted the rejection reason"
+    done
 done
 after_calls=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
 after_dialogs=$(wc -l < "$FAKE_DIALOG_LOG")
 [[ "$before_calls" -eq "$after_calls" ]] || fail 'fixture-style rejection contacted GPG'
 [[ "$before_dialogs" -eq "$after_dialogs" ]] || fail 'fixture-style rejection opened a dialog'
 grep -F 'decision=policy-reject' "$TMP/audit.log" >/dev/null || fail 'fixture-style rejection was not recorded in the audit log'
-pass 'fixture-style commit subjects fail before the dialog and GPG with clear remediation'
+pass 'fixture-style commit subjects and test identities fail before the dialog and GPG with clear remediation'
 
-# The audited override signs a blocked subject and records the decision.
-export GIT_GPG_PREVIEW_ALLOW_SUBJECT=1
+# The audited override signs a blocked commit and records the decision;
+# GIT_GPG_PREVIEW_ALLOW_SUBJECT is its original name and still works.
+export GIT_GPG_PREVIEW_ALLOW_FIXTURE=1
 run_preview 'override init' "$TMP/policy-init.payload" commit
+run_preview 'override identity' "$TMP/identity-author-tester@invalid.payload" commit
+unset GIT_GPG_PREVIEW_ALLOW_FIXTURE
+export GIT_GPG_PREVIEW_ALLOW_SUBJECT=1
+run_preview 'override seed' "$TMP/policy-seed.payload" commit
 unset GIT_GPG_PREVIEW_ALLOW_SUBJECT
-grep -F 'decision=policy-override' "$TMP/audit.log" >/dev/null || fail 'subject override was not recorded in the audit log'
-pass 'GIT_GPG_PREVIEW_ALLOW_SUBJECT=1 signs a blocked subject and audits the override'
+[[ $(grep -c 'decision=policy-override' "$TMP/audit.log") -eq 3 ]] || fail 'fixture override was not recorded in the audit log'
+pass 'GIT_GPG_PREVIEW_ALLOW_FIXTURE=1 (or the older ALLOW_SUBJECT) signs a blocked commit and audits the override'
 
 run_preview 'fixture policy near-miss' "$TMP/policy-near-miss.payload" commit
 run_preview 'fixture policy tag' "$TMP/policy-tag.payload" tag
-pass 'longer commit subjects and matching tag messages are not rejected'
+run_preview 'fixture identity near-miss' "$TMP/identity-near-miss.payload" commit
+run_preview 'fixture identity in body' "$TMP/identity-body.payload" commit
+pass 'longer subjects, lookalike domains, reserved addresses in the body, and tags are not rejected'
 
 {
     printf 'unknown signing format\nUnicode Ω\n'

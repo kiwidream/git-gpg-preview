@@ -6,7 +6,12 @@ Because GnuPG is engaged during the preview, your key blocks on its normal confi
 
 Verification and other non-signing GPG operations pass directly to the configured absolute GPG executable without a dialog.
 
-Commit signing requests whose first non-empty subject line is exactly `base`, `fixture`, `init`, `initial`, `main`, or `production` (case-insensitive, ignoring surrounding horizontal whitespace) are rejected before the dialog and before GPG starts. These generic subjects commonly come from temporary test repositories that accidentally inherit global `commit.gpgSign=true`. The error directs the caller to disable signing only for that test process or fixture repository, or — for a legitimate commit that genuinely uses such a subject — to reword it or re-run once with `GIT_GPG_PREVIEW_ALLOW_SUBJECT=1`, which signs it and records a `policy-override` entry in the audit log. Longer subjects such as `production release` are not rejected. The authoritative subject list is the `FIXTURE_SUBJECTS` line in the wrapper script; the tests read it from there.
+Commit signing requests that look like they came from a test repository are rejected before the dialog and before GPG starts. Test suites routinely create throwaway repositories that inherit a global `commit.gpgSign=true`, and each one would otherwise put a preview on screen and wait for a touch. Two rules, both read from the exact payload:
+
+- **Fixture subject:** the first non-empty subject line is exactly one of `base`, `fixture`, `init`, `initial`, `main`, `production`, `seed`, `work`, `more`, `msg`, `message`, or `x` (case-insensitive, ignoring surrounding horizontal whitespace). Longer subjects such as `production release` are not rejected.
+- **Fixture identity:** the author or committer email is at a domain reserved for documentation and testing, or a subdomain of one: `example.com`, `example.net`, `example.org`, and the top-level names `.example`, `.invalid`, `.localhost`, `.test` (RFC 2606, RFC 6761) and `.local` (RFC 6762). No person commits as `ci@example.com`; a test does. Only the `author` and `committer` header lines count, so a `Co-authored-by:` trailer in the message never triggers it.
+
+The error names the rule that matched and directs the caller to disable signing only for that test process or fixture repository, or — for a legitimate commit — to fix the subject or identity, or re-run once with `GIT_GPG_PREVIEW_ALLOW_FIXTURE=1` (the original name, `GIT_GPG_PREVIEW_ALLOW_SUBJECT=1`, also works), which signs it and records a `policy-override` entry in the audit log. The authoritative lists are the `FIXTURE_SUBJECTS` and `FIXTURE_EMAIL_DOMAINS` lines in the wrapper script; the tests, and the remote service's own copy, are checked against them.
 
 ## Requirements
 
@@ -122,8 +127,8 @@ attributes to your own login, to names listed in `allow_nodes`, or to names
 starting with an `allow_node_prefixes` entry (default `minidev`). Every request
 still ends in your touch: the review window shows the exact payload bytes and
 hex view built on this machine from what arrived, and labels the diff as
-derived on the requesting host. Fixture-style subjects are refused here as
-well, whatever the client sent. Cancel, a missed touch (`sign_timeout_seconds`,
+derived on the requesting host. Fixture-style subjects and identities are
+refused here as well, whatever the client sent. Cancel, a missed touch (`sign_timeout_seconds`,
 default 120), an offline Mac and an unknown peer all fail the remote commit;
 nothing unsigned is ever written.
 
@@ -223,7 +228,7 @@ The uninstaller restores all previously recorded `gpg.openpgp.program` values, o
 
 ## Tests
 
-`./tests/run.sh` uses a fake GPG and a noninteractive fake dialog in an isolated home directory. It covers normal and initial commits, merge commits, annotated tags, push certificates, unknown/binary payloads, hostile Unicode content, fixture-style subject rejection and near-misses, cancellation, verification pass-through, GPG failure status, stdout purity, exact stdin/argument forwarding, concurrent queueing, stale lock recovery, safe diff options, and audit logging.
+`./tests/run.sh` uses a fake GPG and a noninteractive fake dialog in an isolated home directory. It covers normal and initial commits, merge commits, annotated tags, push certificates, unknown/binary payloads, hostile Unicode content, fixture-style subject and identity rejection, near-misses, and the override, cancellation, verification pass-through, GPG failure status, stdout purity, exact stdin/argument forwarding, concurrent queueing, stale lock recovery, safe diff options, and audit logging.
 
 ## License
 

@@ -3,7 +3,9 @@ tailscale/gpg/dialog helpers, driven by the real client, plus one run
 against real GnuPG with a disposable key."""
 import base64
 import json
+import importlib.util
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -18,6 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 MODULE = ROOT / 'git_gpg_preview_remote.py'
 CLIENT = ROOT / 'git-gpg-preview-client'
 HELPERS = ROOT / 'tests' / 'helpers'
+_spec = importlib.util.spec_from_file_location('git_gpg_preview_remote', MODULE)
+remote = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(remote)
 
 
 def free_port() -> int:
@@ -117,7 +122,7 @@ def fixture_repo(tmp: Path) -> tuple[Path, bytes, bytes]:
     g = lambda *a: subprocess.run(['git', '-C', str(repo), *a], check=True, capture_output=True, text=True).stdout
     g('init', '-q', '-b', 'main')
     g('config', 'user.name', 'Preview Tester')
-    g('config', 'user.email', 'preview@example.invalid')
+    g('config', 'user.email', 'preview@preview-tester.dev')  # not a reserved test domain
     g('config', 'commit.gpgsign', 'false')
     (repo / 'initial.txt').write_text('initial\n')
     g('add', '.')
@@ -281,6 +286,70 @@ class RemoteSigningTests(unittest.TestCase):
                                   'context': {}})
         self.assertEqual((code, body['status'], body['decision']), (200, 65, 'policy-reject'))
         self.assertIn('decision=policy-reject', self.h.audit.read_text())
+
+    def test_fixture_subjects_match_the_wrapper(self):
+        wrapper = (ROOT.parent / 'git-gpg-preview').read_text()
+        subjects = re.search(r'^FIXTURE_SUBJECTS="(.*)"$', wrapper, re.M).group(1).split()
+        domains = re.search(r'^FIXTURE_EMAIL_DOMAINS="(.*)"$', wrapper, re.M).group(1).split()
+        self.assertEqual(frozenset(subjects), remote.FIXTURE_SUBJECTS)
+        self.assertEqual(tuple(domains), remote.FIXTURE_EMAIL_DOMAINS)
+
+    def test_test_identities_are_refused_on_both_sides(self):
+        g = lambda *a, env=None: subprocess.run(['git', '-C', str(self.repo), *a], check=True, capture_output=True,
+                                                env={**os.environ, **(env or {})}).stdout
+        cases = {'author': (['--author', 'Tester <fingerprint@example.invalid>'], {}),
+                 'committer': ([], {'GIT_COMMITTER_EMAIL': 'ci@Orca.TEST'})}
+        for role, (flags, env) in cases.items():
+            with self.subTest(role=role):
+                g('commit', '-q', '--allow-empty', *flags, '-m', 'Descriptive subject from a test', env=env)
+                payload = g('cat-file', 'commit', 'HEAD')
+                result = self.h.client(self.sign_args(), payload, self.repo)
+                self.assertEqual(result.returncode, 65)
+                self.assertIn(b"fixture-style commit identity '", result.stderr)
+                code, body = self.h.post({'version': 1, 'args': self.sign_args(),
+                                          'payload': base64.b64encode(payload).decode(), 'context': {}})
+                self.assertEqual((code, body['status'], body['decision']), (200, 65, 'policy-reject'))
+        self.assertEqual(self.h.gpg_calls(), [])
+
+    def test_fixture_identity_rule_edges(self):
+        def reason(author, committer='R <r@swaplabs.io>', message='Subject\n'):
+            payload = (f'tree {"0" * 40}\nauthor {author} 1 +0000\ncommitter {committer} 1 +0000\n\n{message}').encode()
+            return remote.fixture_reason(remote.parse_payload(payload))
+        self.assertEqual(reason('A <a@sub.example.com>'), "identity 'a@sub.example.com'")
+        self.assertEqual(reason('A <a@test.local>'), "identity 'a@test.local'")
+        self.assertEqual(reason('A <a@latest>'), None)
+        self.assertEqual(reason('A <a@notexample.com>'), None)
+        self.assertEqual(reason('A <a@swaplabs.io>', message='Subject\n\nCo-authored-by: T <t@example.com>\n'), None)
+        self.assertEqual(reason('A <a@example.com>', message='seed\n'), "subject 'seed'")
+        tag = f'object {"0" * 40}\ntype commit\ntag v1\ntagger T <t@example.com> 1 +0000\n\nseed\n'.encode()
+        self.assertIsNone(remote.fixture_reason(remote.parse_payload(tag)))
+
+    def test_fixture_identity_parser_matches_wrapper_awk(self):
+        wrapper = (ROOT.parent / 'git-gpg-preview').read_text()
+        domains = re.search(r'^FIXTURE_EMAIL_DOMAINS=.*$', wrapper, re.M).group()
+        parser = re.search(r'^fixture_style_commit_identity\(\) \{\n.*?^\}', wrapper, re.M | re.S).group()
+        script = domains + '\n' + parser + '\nfixture_style_commit_identity "$1"\n'
+        emails = [f'a@{domain}' for domain in remote.FIXTURE_EMAIL_DOMAINS]
+        emails += ['a@Sub.Example.COM', 'a@notexample.com', 'a@latest', 'a@example.com.',
+                   'a@example.com..', 'a@.test', 'example.com', ' a@example.com\t',
+                   'A\u00c4@example.com', 'a@example.com\u00a0', '', 'a@']
+        headers = [f'{role} Tester <{email}> 1 +0000' for role in ('author', 'committer') for email in emails]
+        headers += ['author Tester <a@example.com', 'author Tester a@example.com',
+                    'author Tester <ignored<a@example.com> 1 +0000',
+                    'author\tTester <a@example.com> 1 +0000',
+                    '\tcommitter Tester <a@example.com> 1 +0000',
+                    'tagger Tester <a@example.com> 1 +0000',
+                    'author Tester <a@preview-tester.dev> 1 +0000\n\ncommitter T <a@example.com> 1 +0000']
+        for header in headers:
+            with self.subTest(header=header):
+                payload = self.tmp / 'parser-parity.payload'
+                payload.write_text(header + '\n\nDescriptive subject\n')
+                result = subprocess.run(['/bin/bash', '-c', script, 'bash', str(payload)],
+                                        env={**os.environ, 'LC_ALL': 'C'}, capture_output=True, text=True)
+                self.assertIn(result.returncode, (0, 1), result.stderr)
+                self.assertEqual(result.stderr, '')
+                expected = result.stdout.rstrip('\n') if result.returncode == 0 else None
+                self.assertEqual(remote.fixture_identity(header), expected)
 
     def test_requester_cannot_choose_another_key(self):
         for selector in ('DEADBEEFDEADBEEF', 'someone@example.invalid', '0xFFFFFFFFFFFFFFFF!'):
@@ -576,7 +645,7 @@ class RealGnuPGTests(unittest.TestCase):
             genv = {**h.env, 'XDG_CONFIG_HOME': str(h.xdg), 'GNUPGHOME': str(home)}
             g = lambda *a: subprocess.run(['git', '-C', str(repo), *a], env=genv, capture_output=True, text=True)
             g('init', '-q', '-b', 'main')
-            for k, v in (('user.name', 'Remote Fixture'), ('user.email', 'fixture@example.invalid'), ('commit.gpgsign', 'true'),
+            for k, v in (('user.name', 'Remote Fixture'), ('user.email', 'fixture@preview-tester.dev'), ('commit.gpgsign', 'true'),
                          ('user.signingkey', fpr), ('gpg.openpgp.program', str(CLIENT))):
                 g('config', k, v)
             (repo / 'a.md').write_text('signed remotely\n')
