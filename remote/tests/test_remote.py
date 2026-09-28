@@ -327,6 +327,15 @@ class RemoteSigningTests(unittest.TestCase):
         self.assertEqual(result.stdout, b'')
         self.assertIn('decision=spam-mark', self.h.audit.read_text())
 
+    def test_a_decision_cut_off_before_it_lands_refuses_the_signature(self):
+        self.h.decision.write_text('touch-then-stall-spam')
+        result = self.h.client(self.sign_args(), self.second, self.repo)
+        self.assertEqual(result.returncode, 70, result.stderr)
+        self.assertEqual(result.stdout, b'', 'no signature leaves the service on an unreadable outcome')
+        self.assertIn(b'never completed', result.stderr)
+        self.assertIn('decision=pending-decision-lost', self.h.audit.read_text())
+        self.assertNotEqual(self.h.gpg_calls(), [], 'the signature existed and was withheld')
+
     def test_queued_spam_is_rechecked_before_dialog(self):
         self.h.decision.write_text('delayed-spam')
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:

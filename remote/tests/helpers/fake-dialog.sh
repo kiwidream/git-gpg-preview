@@ -24,14 +24,22 @@ case "$choice" in
     touch-then-cancel)                                  # the key confirms, the operator cancels in the same instant
         sha=$(sed -n 's/^SHA-256: //p' "$summary" | head -n 1)
         : > "${FAKE_TOUCH_FILE:?}.$sha"
+        : > "$decision.deciding"
         printf 'cancel' > "$decision"
         ;;
-    cancel) printf 'cancel' > "$decision" ;;
-    spam) printf 'spam' > "$decision" ;;
+    cancel) : > "$decision.deciding"; printf 'cancel' > "$decision" ;;
+    spam) : > "$decision.deciding"; printf 'spam' > "$decision" ;;
     touch-then-spam)
         sha=$(sed -n 's/^SHA-256: //p' "$summary" | head -n 1)
         : > "${FAKE_TOUCH_FILE:?}.$sha"
+        : > "$decision.deciding"
         printf 'spam' > "$decision"
+        ;;
+    touch-then-stall-spam)                              # answered, then cut off before the decision lands
+        sha=$(sed -n 's/^SHA-256: //p' "$summary" | head -n 1)
+        : > "${FAKE_TOUCH_FILE:?}.$sha"
+        : > "$decision.deciding"
+        sleep 30
         ;;
     hang) sleep 30 ;;
     *) printf 'garbage' > "$decision" ;;

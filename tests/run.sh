@@ -403,6 +403,22 @@ set -e
 rm "$SPAM_LIST"
 pass 'mark as spam wins over a simultaneous hardware touch'
 
+export FAKE_DIALOG_DECISION=touch-then-stall-spam
+rm -f "$FAKE_TOUCH_FILE".*
+before=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
+set +e
+"$ROOT/git-gpg-preview" -bsau TEST < "$TMP/spam.payload" > "$TMP/stall.stdout" 2> "$TMP/stall.stderr"
+stall_status=$?
+set -e
+[[ $(wc -l < "$FAKE_GPG_CALL_DIR/calls") -gt "$before" ]] || fail 'lost decision test never reached GPG'
+[[ "$stall_status" -eq 70 ]] || fail "a lost decision did not fail closed (status $stall_status)"
+[[ ! -s "$TMP/stall.stdout" ]] || fail 'a lost decision released a signature'
+grep -F 'began a decision that never completed' "$TMP/stall.stderr" >/dev/null || fail 'a lost decision was not reported'
+grep -F 'decision=pending-decision-lost' "$TMP/audit.log" >/dev/null || fail 'a lost decision was not audited'
+[[ ! -e "$SPAM_LIST" ]] || fail 'a lost decision saved a spam rule'
+export FAKE_DIALOG_DECISION=sign
+pass 'a rejection cut off before it lands refuses the signature instead of releasing it'
+
 export FAKE_DIALOG_DECISION=spam
 export FAKE_DIALOG_DELAY=1
 rm -f "$FAKE_TOUCH_FILE".*
