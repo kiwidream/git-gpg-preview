@@ -355,6 +355,94 @@ pass 'recognized payload parsing/object errors fail closed'
 grep -F 'decision=sign' "$TMP/audit.log" >/dev/null || fail 'audit decision missing'
 pass 'mode-0600 metadata-only audit log'
 
+# Use real payload headers with independent subjects so earlier checks remain
+# unaffected. No production Git settings or signing keys enter these tests.
+spam_payload() {
+    awk '{ print } $0 == "" { exit }' "$TMP/initial.payload" > "$2"
+    printf '%s\n' "$1" >> "$2"
+}
+SPAM_LIST="$XDG_CONFIG_HOME/git-gpg-preview/spam-subjects"
+spam_payload 'Noisy subject $(touch bad) [a-z].*' "$TMP/spam.payload"
+export FAKE_DIALOG_DECISION=spam
+rm -f "$FAKE_TOUCH_FILE".*
+set +e
+"$ROOT/git-gpg-preview" -bsau TEST < "$TMP/spam.payload" > "$TMP/spam.stdout" 2> "$TMP/spam.stderr"
+spam_status=$?
+set -e
+[[ "$spam_status" -eq 1 && ! -s "$TMP/spam.stdout" ]] || fail 'mark as spam did not cancel'
+[[ $(stat -f '%Lp' "$SPAM_LIST") == 600 ]] || fail 'spam list is not private'
+grep -Fx 'noisy subject $(touch bad) [a-z].*' "$SPAM_LIST" >/dev/null || fail 'spam rule was not stored literally'
+grep -F 'decision=spam-mark' "$TMP/audit.log" >/dev/null || fail 'spam mark was not audited'
+[[ ! -e "$FIXTURE/bad" ]] || fail 'spam subject executed as code'
+before_dialogs=$(wc -l < "$FAKE_DIALOG_LOG")
+before=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
+spam_payload $'\n  NOISY SUBJECT $(touch bad) [a-z].*\t\r\nnew body' "$TMP/spam-retry.payload"
+set +e
+GIT_GPG_PREVIEW_ALLOW_FIXTURE=1 "$ROOT/git-gpg-preview" -bsau TEST < "$TMP/spam-retry.payload" > "$TMP/spam.stdout" 2> "$TMP/spam.stderr"
+spam_status=$?
+set -e
+[[ "$spam_status" -eq 65 && ! -s "$TMP/spam.stdout" ]] || fail 'remembered spam was not rejected'
+[[ $(wc -l < "$FAKE_DIALOG_LOG") -eq "$before_dialogs" ]] || fail 'remembered spam opened a preview'
+[[ $(wc -l < "$FAKE_GPG_CALL_DIR/calls") -eq "$before" ]] || fail 'remembered spam signed'
+grep -F 'decision=spam-reject' "$TMP/audit.log" >/dev/null || fail 'spam rejection was not audited'
+export FAKE_DIALOG_DECISION=sign
+spam_payload 'Noisy subject $(touch bad) [a-z].* follow-up' "$TMP/spam-near.payload"
+run_preview 'spam near-match' "$TMP/spam-near.payload" commit
+rm "$SPAM_LIST"
+run_preview 'spam rule removed' "$TMP/spam.payload" commit
+pass 'mark as spam persists a private literal rule, rejects retries, and can be undone'
+
+export FAKE_DIALOG_DECISION=touch-then-spam
+rm -f "$FAKE_TOUCH_FILE".*
+set +e
+"$ROOT/git-gpg-preview" -bsau TEST < "$TMP/spam.payload" > "$TMP/spam.stdout" 2> "$TMP/spam.stderr"
+spam_status=$?
+set -e
+[[ "$spam_status" -eq 1 && ! -s "$TMP/spam.stdout" ]] || fail 'simultaneous touch and spam released a signature'
+[[ -s "$SPAM_LIST" ]] || fail 'simultaneous touch and spam lost the rule'
+rm "$SPAM_LIST"
+pass 'mark as spam wins over a simultaneous hardware touch'
+
+export FAKE_DIALOG_DECISION=spam
+export FAKE_DIALOG_DELAY=1
+rm -f "$FAKE_TOUCH_FILE".*
+before_dialogs=$(wc -l < "$FAKE_DIALOG_LOG")
+"$ROOT/git-gpg-preview" -bsau TEST < "$TMP/spam.payload" > "$TMP/spam.1" 2> "$TMP/spam.1.err" &
+p1=$!
+"$ROOT/git-gpg-preview" -bsau TEST < "$TMP/spam.payload" > "$TMP/spam.2" 2> "$TMP/spam.2.err" &
+p2=$!
+set +e
+wait "$p1"; s1=$?
+wait "$p2"; s2=$?
+set -e
+[[ ( "$s1" -eq 1 && "$s2" -eq 65 ) || ( "$s1" -eq 65 && "$s2" -eq 1 ) ]] || fail 'queued spam was not rechecked'
+[[ ! -s "$TMP/spam.1" && ! -s "$TMP/spam.2" ]] || fail 'queued spam released a signature'
+[[ $(wc -l < "$FAKE_DIALOG_LOG") -eq $((before_dialogs + 2)) ]] || fail 'queued spam opened a second preview'
+rm "$SPAM_LIST"
+pass 'queued requests recheck the saved spam list under the dialog lock'
+
+before_dialogs=$(wc -l < "$FAKE_DIALOG_LOG")
+"$ROOT/git-gpg-preview" -bsau TEST < "$TMP/spam.payload" > "$TMP/spam.stdout" 2> "$TMP/spam.stderr" &
+spam_pid=$!
+for attempt in {1..100}; do
+    [[ $(wc -l < "$FAKE_DIALOG_LOG") -gt "$before_dialogs" ]] && break
+    sleep 0.05
+done
+[[ $(wc -l < "$FAKE_DIALOG_LOG") -gt "$before_dialogs" ]] || fail 'spam failure test did not reach preview'
+mkdir "$SPAM_LIST"
+set +e
+wait "$spam_pid"; spam_status=$?
+set -e
+[[ "$spam_status" -eq 70 && ! -s "$TMP/spam.stdout" ]] || fail 'save failure did not cancel'
+grep -F 'could not save spam subject' "$TMP/spam.stderr" >/dev/null || fail 'save failure was not reported'
+rmdir "$SPAM_LIST"
+export FAKE_DIALOG_DELAY=0
+export FAKE_DIALOG_DECISION=sign
+pass 'spam persistence failure cancels signing and reports that the rule was not saved'
+
+/usr/bin/osascript -l JavaScript "$ROOT/tests/dialog.jxa" "$ROOT/dialog.jxa" "$TMP"
+pass 'AppKit main and detail dialogs dispatch spam/cancel and preserve legacy callers'
+
 INSTALL_TEST="$TMP/install-home"
 mkdir -p "$INSTALL_TEST"
 (
@@ -396,7 +484,9 @@ mkdir -p "$UPGRADE_TEST"
     printf 'stale wrapper\n' > "$installed"
     printf 'stale dialog\n' > "$libexec/dialog.jxa"
     printf 'stale touch prompt\n' > "$libexec/touch-prompt.jxa"
+    printf 'remember this subject\n' > "$XDG_CONFIG_HOME/git-gpg-preview/spam-subjects"
     "$ROOT/scripts/git-gpg-preview-setup" upgrade >/dev/null
+    [[ $(cat "$XDG_CONFIG_HOME/git-gpg-preview/spam-subjects") == 'remember this subject' ]]
     cmp -s "$ROOT/git-gpg-preview" "$installed"
     cmp -s "$ROOT/dialog.jxa" "$libexec/dialog.jxa"
     cmp -s "$ROOT/touch-prompt.jxa" "$libexec/touch-prompt.jxa"

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Git-specific OpenPGP preview wrapper for macOS.
-# Nothing except the real GPG process is allowed to write to stdout.
+# Only captured real GPG output is allowed to reach stdout.
 
 set -u
 umask 077
@@ -17,6 +17,8 @@ FIXTURE_SUBJECTS="base|fixture|init|initial|initial commit|main|production|seed|
 FIXTURE_EMAIL_DOMAINS="example.com example.net example.org example invalid localhost test local"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 CONFIG_FILE="$CONFIG_HOME/git-gpg-preview/config"
+SPAM_FILE="$CONFIG_HOME/git-gpg-preview/spam-subjects"
+SPAM_TEMP=""
 REAL_GPG=""
 UI_HELPER=""
 LOCK_ROOT=""
@@ -32,6 +34,7 @@ error() {
 }
 
 cleanup() {
+    [[ -z "$SPAM_TEMP" ]] || /bin/rm -f "$SPAM_TEMP"
     if [[ -n "$DIALOG_PID" ]] && /bin/kill -0 "$DIALOG_PID" 2>/dev/null; then
         /bin/kill -s TERM "$DIALOG_PID" 2>/dev/null || true
         wait "$DIALOG_PID" 2>/dev/null || true
@@ -189,6 +192,84 @@ fixture_style_commit_identity() {
     ' "$payload_file"
 }
 
+# Store literal lines, never patterns or shell code. ASCII case folding matches
+# the remote service byte-for-byte; control characters cannot become rules.
+spam_subject() {
+    # macOS awk truncates at NUL. Never learn a shortened version of a subject.
+    /usr/bin/tr -d '\000' < "$PAYLOAD" | /usr/bin/cmp -s "$PAYLOAD" - || return 0
+    /usr/bin/awk '
+        {
+            subject = $0
+            sub(/\r$/, "", subject)
+            gsub(/^[ \t]+|[ \t]+$/, "", subject)
+            if (subject == "") next
+            if (subject !~ /[[:cntrl:]]/) print tolower(subject)
+            exit
+        }
+    ' "$MESSAGE"
+}
+
+reject_spam_subject() {
+    [[ -s "$SPAM_SUBJECT_FILE" ]] || return 0
+    if [[ -e "$SPAM_FILE" || -L "$SPAM_FILE" ]]; then
+        if [[ ! -f "$SPAM_FILE" || -L "$SPAM_FILE" || ! -r "$SPAM_FILE" ]]; then
+            error "cannot read spam subject list: $SPAM_FILE; refusing to sign"
+            exit 70
+        fi
+        /usr/bin/grep -Fqx -f "$SPAM_SUBJECT_FILE" "$SPAM_FILE"
+        local status=$?
+        if [[ "$status" -eq 0 ]]; then
+            audit_decision "spam-reject" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+            error "subject marked as spam; remove its line from $SPAM_FILE to allow it again"
+            exit 65
+        elif [[ "$status" -ne 1 ]]; then
+            error "cannot read spam subject list: $SPAM_FILE; refusing to sign"
+            exit 70
+        fi
+    fi
+}
+
+remember_spam_subject() {
+    # Caller holds dialog.lock, shared by local wrappers and the remote service.
+    [[ -s "$SPAM_SUBJECT_FILE" ]] || return 1
+    SPAM_TEMP=$(/usr/bin/mktemp "$SPAM_FILE.XXXXXX") || return 1
+    if { [[ ! -e "$SPAM_FILE" && ! -L "$SPAM_FILE" ]] ||
+         { [[ -f "$SPAM_FILE" && ! -L "$SPAM_FILE" ]] && /usr/bin/awk '1' "$SPAM_FILE" > "$SPAM_TEMP"; }; } &&
+       /bin/cat "$SPAM_SUBJECT_FILE" >> "$SPAM_TEMP" &&
+       /bin/chmod 600 "$SPAM_TEMP" && /bin/mv -f "$SPAM_TEMP" "$SPAM_FILE"; then
+        SPAM_TEMP=""
+        return 0
+    fi
+    /bin/rm -f "$SPAM_TEMP"
+    SPAM_TEMP=""
+    return 1
+}
+
+handle_operator_rejection() {
+    case "$DECISION_VALUE" in
+        cancel|spam)
+            if [[ -n "$CHILD_PID" ]]; then
+                /bin/kill -s TERM "$CHILD_PID" 2>/dev/null || true
+                wait "$CHILD_PID" 2>/dev/null || true
+                CHILD_PID=""
+            fi
+            if [[ "$DECISION_VALUE" == spam ]]; then
+                if ! remember_spam_subject; then
+                    audit_decision "spam-save-error" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+                    error "signing cancelled, but could not save spam subject to $SPAM_FILE"
+                    exit 70
+                fi
+                audit_decision "spam-mark" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+                error "signing cancelled; subject marked as spam (edit $SPAM_FILE to undo)"
+            else
+                audit_decision "cancel" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+                error "signing cancelled by user"
+            fi
+            exit 1
+            ;;
+    esac
+}
+
 append_limited_sanitized() {
     local source="$1" limit="$2"
     /usr/bin/head -c "$limit" "$source" | sanitize_stream
@@ -284,6 +365,7 @@ MESSAGE="$REQUEST_DIR/message.txt"
 DIFFSTAT="$REQUEST_DIR/diffstat.txt"
 FULL_DIFF="$REQUEST_DIR/full-diff.txt"
 DECISION="$REQUEST_DIR/decision"
+SPAM_SUBJECT_FILE="$REQUEST_DIR/spam-subject"
 : > "$PAYLOAD"
 /bin/chmod 600 "$PAYLOAD"
 /bin/cat > "$PAYLOAD" || {
@@ -346,6 +428,11 @@ elif [[ "$FIRST_LINE" == certificate\ version\ * ]]; then
 fi
 
 /usr/bin/awk 'body { print; next } $0 == "" { body=1 }' "$PAYLOAD" > "$MESSAGE"
+: > "$SPAM_SUBJECT_FILE"
+if [[ "$REQUEST_TYPE" == commit ]]; then
+    spam_subject > "$SPAM_SUBJECT_FILE"
+    reject_spam_subject
+fi
 : > "$DIFFSTAT"
 : > "$FULL_DIFF"
 
@@ -498,6 +585,8 @@ if ! acquire_dialog_lock; then
     error "could not acquire the signing-preview dialog lock"
     exit 70
 fi
+# Another request may have marked this subject while we waited for the lock.
+reject_spam_subject
 
 # Show the preview and engage real GPG concurrently. GPG blocks on the
 # hardware confirmation (and the PIN only when the agent has not cached it),
@@ -510,7 +599,9 @@ fi
 # engaged. This ordering means the PIN prompt (pinentry) launches last and
 # stays frontmost and focused instead of appearing behind the preview.
 READY="$REQUEST_DIR/ready"
-/usr/bin/osascript -l JavaScript "$UI_HELPER" "$SUMMARY" "$DETAILS" "$DECISION" "$READY" >/dev/null 2>&1 &
+SPAM_ACTION=""
+[[ -s "$SPAM_SUBJECT_FILE" ]] && SPAM_ACTION="mark-spam"
+/usr/bin/osascript -l JavaScript "$UI_HELPER" "$SUMMARY" "$DETAILS" "$DECISION" "$READY" "$SPAM_ACTION" >/dev/null 2>&1 &
 DIALOG_PID=$!
 
 ready_waited=0
@@ -525,7 +616,9 @@ while [[ ! -e "$READY" ]]; do
     fi
 done
 
-"$REAL_GPG" "$@" < "$PAYLOAD" &
+# Hold the output until the final decision check, so a simultaneous touch and
+# rejection cannot leak a signature to Git.
+"$REAL_GPG" "$@" < "$PAYLOAD" > "$REQUEST_DIR/gpg.stdout" &
 GPG_PID=$!
 CHILD_PID=$GPG_PID
 
@@ -550,16 +643,8 @@ while :; do
 done
 
 if [[ "$OUTCOME" == "dialog" ]]; then
+    handle_operator_rejection
     case "$DECISION_VALUE" in
-        cancel)
-            /bin/kill -s TERM "$GPG_PID" 2>/dev/null || true
-            wait "$GPG_PID" 2>/dev/null || true
-            CHILD_PID=""
-            release_dialog_lock
-            audit_decision "cancel" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
-            error "signing cancelled by user"
-            exit 1
-            ;;
         sign)
             # Explicit approval; the hardware signature may still be pending.
             wait "$GPG_PID"
@@ -587,7 +672,10 @@ if [[ -n "$DIALOG_PID" ]] && /bin/kill -0 "$DIALOG_PID" 2>/dev/null; then
 fi
 DIALOG_PID=""
 CHILD_PID=""
+DECISION_VALUE=$(/bin/cat "$DECISION" 2>/dev/null || true)
+handle_operator_rejection
 release_dialog_lock
+/bin/cat "$REQUEST_DIR/gpg.stdout"
 
 if [[ "$GPG_STATUS" -eq 0 ]]; then
     audit_decision "sign" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true

@@ -46,11 +46,11 @@ function run(argv) {
     // "cancel" it reports no touch, and the wrapper kills GPG before signing.
     // The touch file is keyed by the payload SHA-256 shown in the summary so
     // that concurrent, distinct requests stay isolated from one another.
-    if (decision === 'sign' && touch) {
+    if ((decision === 'sign' || decision === 'touch-then-spam') && touch) {
         const match = readText(argv[0]).match(/SHA-256:\s*([0-9a-f]+)/);
         const key = match ? match[1] : 'default';
         $.NSData.data.writeToFileAtomically(touch + '.' + key, true);
     }
-    write(argv[2], decision);
+    write(argv[2], decision === 'touch-then-spam' ? 'spam' : decision);
     if (log) append(log, 'end ' + $.NSProcessInfo.processInfo.processIdentifier + '\n');
 }

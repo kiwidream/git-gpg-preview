@@ -1,0 +1,61 @@
+// Exercise the production dialog's AppKit controls and decision dispatch without
+// presenting windows or touching a hardware key. Only modal responses are faked.
+ObjC.import('Cocoa');
+
+var responses = [];
+var expectedSpam = false;
+var modalCount = 0;
+function modalResponse(alert) {
+    const buttons = alert.buttons;
+    const count = Number(buttons.count);
+    if (count !== (expectedSpam ? 3 : 2)) throw new Error('Unexpected button count: ' + count);
+    if (ObjC.unwrap(buttons.objectAtIndex(1).title) !== 'Cancel') throw new Error('Cancel moved');
+    if (expectedSpam && ObjC.unwrap(buttons.objectAtIndex(2).title) !== 'Mark as Spam') throw new Error('Spam button missing');
+    if (!responses.length) throw new Error('Unexpected extra modal');
+    modalCount++;
+    return responses.shift();
+}
+
+function run(argv) {
+    const source = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null));
+    const substitutions = [
+        ['function run(argv)', 'function runPreview(argv)'],
+        ['app.activateIgnoringOtherApps(true);', ''],
+        ['Number(alert.runModal)', 'modalResponse(alert)'],
+        ['Number(detailAlert.runModal)', 'modalResponse(detailAlert)']
+    ];
+    let instrumented = source;
+    substitutions.forEach(function(pair) {
+        if (instrumented.split(pair[0]).length !== 2) throw new Error('Dialog test seam changed: ' + pair[0]);
+        instrumented = instrumented.replace(pair[0], pair[1]);
+    });
+    eval(instrumented);
+    const summary = argv[1] + '/dialog-summary';
+    const details = argv[1] + '/dialog-details';
+    const decision = argv[1] + '/dialog-decision';
+    const ready = argv[1] + '/dialog-ready';
+    $.NSString.stringWithString('Request type: commit\nMessage:\nNoisy subject').writeToFileAtomicallyEncodingError(summary, true, $.NSUTF8StringEncoding, null);
+    $.NSString.stringWithString('Exact payload and details').writeToFileAtomicallyEncodingError(details, true, $.NSUTF8StringEncoding, null);
+    [
+        {spam: true, responses: [1002], decision: 'spam'},
+        {spam: true, responses: [1000, 1002], decision: 'spam'},
+        {spam: true, responses: [1001], decision: 'cancel'},
+        {spam: true, responses: [1000, 1001], decision: 'cancel'},
+        {spam: true, responses: [1000, 1000, 1001], decision: 'cancel'},
+        {spam: false, responses: [1001], decision: 'cancel'},
+        {spam: false, responses: [1000, 1001], decision: 'cancel'}
+    ].forEach(function(test) {
+        $.NSData.data.writeToFileAtomically(decision, true);
+        $.NSFileManager.defaultManager.removeItemAtPathError(ready, null);
+        expectedSpam = test.spam;
+        responses = test.responses.slice();
+        modalCount = 0;
+        const args = [summary, details, decision, ready];
+        if (test.spam) args.push('mark-spam');
+        runPreview(args);
+        if (readText(decision) !== test.decision) throw new Error('Wrong decision');
+        if (responses.length || modalCount !== test.responses.length) throw new Error('Wrong modal sequence');
+        if (!$.NSFileManager.defaultManager.fileExistsAtPath(ready)) throw new Error('Readiness missing');
+    });
+    return 'Dialog actions passed (7 cases)';
+}
