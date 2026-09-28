@@ -9,8 +9,8 @@ export LC_ALL=C
 
 PROGRAM_NAME="git-gpg-preview"
 # Single source of truth for rejected fixture-style commit subjects
-# (lowercase, space-separated). Tests read this line; keep the format.
-FIXTURE_SUBJECTS="base fixture init initial main production seed work more msg message x"
+# (lowercase, pipe-separated). Tests read this line; keep the format.
+FIXTURE_SUBJECTS="base|fixture|init|initial|initial commit|main|production|seed|work|more|msg|message|x|pr head|mr head"
 # Blocked author/committer domains: documentation, testing, and local-use
 # names (RFC 2606, 6761, 6762), including subdomains. This fixture heuristic
 # also blocks legitimate .local identities. Tests read this line; keep the format.
@@ -132,7 +132,8 @@ valid_object_id() {
 
 fixture_style_commit_subject() {
     local message_file="$1"
-    /usr/bin/awk -v subjects=" $FIXTURE_SUBJECTS " '
+    /usr/bin/awk -v subjects="$FIXTURE_SUBJECTS" '
+        BEGIN { count = split(subjects, list, /\|/) }
         {
             subject = $0
             sub(/\r$/, "", subject)
@@ -142,9 +143,12 @@ fixture_style_commit_subject() {
                 next
             }
             subject = tolower(subject)
-            if (index(subjects, " " subject " ") > 0) {
-                print subject
-                matched = 1
+            for (i = 1; i <= count; i++) {
+                if (subject == list[i]) {
+                    print subject
+                    matched = 1
+                    break
+                }
             }
             exit
         }

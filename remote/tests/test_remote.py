@@ -289,10 +289,43 @@ class RemoteSigningTests(unittest.TestCase):
 
     def test_fixture_subjects_match_the_wrapper(self):
         wrapper = (ROOT.parent / 'git-gpg-preview').read_text()
-        subjects = re.search(r'^FIXTURE_SUBJECTS="(.*)"$', wrapper, re.M).group(1).split()
+        subjects = re.search(r'^FIXTURE_SUBJECTS="(.*)"$', wrapper, re.M).group(1).split('|')
         domains = re.search(r'^FIXTURE_EMAIL_DOMAINS="(.*)"$', wrapper, re.M).group(1).split()
         self.assertEqual(frozenset(subjects), remote.FIXTURE_SUBJECTS)
         self.assertEqual(tuple(domains), remote.FIXTURE_EMAIL_DOMAINS)
+
+    def test_reported_spam_subjects_are_refused_before_preview_and_gpg(self):
+        header = self.initial.partition(b'\n\n')[0]
+        for subject in ('pr head', 'mr head', 'initial commit', 'PR HEAD', '  MR HEAD\t', '\n\tInitial Commit \r'):
+            with self.subTest(subject=subject):
+                payload = header + b'\n\n' + subject.encode() + b'\n'
+                result = self.h.client(self.sign_args(), payload, self.repo)
+                self.assertEqual(result.returncode, 65, result.stderr)
+                self.assertEqual(result.stdout, b'')
+                code, body = self.h.post({'version': 1, 'args': self.sign_args(),
+                                         'payload': base64.b64encode(payload).decode(), 'context': {}})
+                self.assertEqual((code, body['status'], body['decision']), (200, 65, 'policy-reject'))
+                self.assertEqual(body['stdout'], '')
+        self.assertEqual(self.h.gpg_calls(), [])
+        self.assertEqual(list(self.h.captures.iterdir()), [])
+
+    def test_fixture_subject_parser_matches_wrapper(self):
+        wrapper = (ROOT.parent / 'git-gpg-preview').read_text()
+        subjects = re.search(r'^FIXTURE_SUBJECTS=.*$', wrapper, re.M).group()
+        parser = re.search(r'^fixture_style_commit_subject\(\) \{\n.*?^\}', wrapper, re.M | re.S).group()
+        script = subjects + '\n' + parser + '\nfixture_style_commit_subject "$1"\n'
+        messages = {'pr head': 'pr head', 'mr head': 'mr head', 'initial commit': 'initial commit',
+                    '\n \tPR HEAD\t\r\nbody': 'pr head', 'Initial commit: preview tool': None,
+                    'pr head update': None, 'mr heading': None, 'head': None, 'pr': None,
+                    'base fixture': None, 'Fix preview\n\npr head': None, '': None}
+        message = self.tmp / 'subject.txt'
+        for value, expected in messages.items():
+            with self.subTest(message=value):
+                message.write_text(value + '\n')
+                result = subprocess.run(['bash', '-c', script, 'bash', str(message)], capture_output=True)
+                self.assertEqual(result.returncode, 0 if expected else 1, result.stderr)
+                self.assertEqual(result.stdout.decode().strip() or None, expected)
+                self.assertEqual(remote.fixture_subject(value), expected)
 
     def test_remote_fixture_policy_cannot_be_overridden_by_requester(self):
         header = self.initial.partition(b'\n\n')[0]
