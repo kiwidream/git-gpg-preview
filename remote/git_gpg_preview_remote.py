@@ -44,7 +44,7 @@ PROTOCOL_VERSION = 1
 DEFAULT_PORT = 24824
 # Single source of truth for rejected fixture-style commits; both must match
 # FIXTURE_SUBJECTS and FIXTURE_EMAIL_DOMAINS in the git-gpg-preview wrapper.
-FIXTURE_SUBJECTS = frozenset('base fixture init initial main production seed work more msg message x'.split())
+FIXTURE_SUBJECTS = frozenset('base|fixture|init|initial|initial commit|main|production|seed|work|more|msg|message|x|pr head|mr head'.split('|'))
 # Blocked documentation, testing, and local-use domains (RFC 2606, 6761, 6762).
 # This fixture heuristic deliberately includes .local, even though legitimate
 # identities can use it. A listed domain or any subdomain matches.

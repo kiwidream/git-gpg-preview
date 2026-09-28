@@ -120,16 +120,17 @@ git -C "$FIXTURE" cat-file commit "$NEAR_MISS" > "$TMP/policy-near-miss.payload"
 
 # The blocklist's single source of truth is the FIXTURE_SUBJECTS line in
 # the wrapper itself; "Production" is added as a case-insensitivity probe.
-REJECTED_SUBJECTS="$(sed -n 's/^FIXTURE_SUBJECTS="\(.*\)"$/\1/p' "$ROOT/git-gpg-preview") Production"
-[[ "$REJECTED_SUBJECTS" != " Production" ]] || fail 'could not read FIXTURE_SUBJECTS from wrapper'
+REJECTED_SUBJECTS=$(sed -n 's/^FIXTURE_SUBJECTS="\(.*\)"$/\1/p' "$ROOT/git-gpg-preview" | tr '|' '\n')
+[[ -n "$REJECTED_SUBJECTS" ]] || fail 'could not read FIXTURE_SUBJECTS from wrapper'
+REJECTED_SUBJECTS+=$'\nProduction\nPR HEAD\nMR HEAD\nInitial Commit'
 
-for rejected_subject in $REJECTED_SUBJECTS; do
+while IFS= read -r rejected_subject; do
     printf '%s\n' "$rejected_subject" > "$FIXTURE/policy.txt"
     git -C "$FIXTURE" add -- policy.txt
     git -C "$FIXTURE" commit -m "$rejected_subject" >/dev/null
     REJECTED_COMMIT=$(git -C "$FIXTURE" rev-parse HEAD)
     git -C "$FIXTURE" cat-file commit "$REJECTED_COMMIT" > "$TMP/policy-$rejected_subject.payload"
-done
+done <<< "$REJECTED_SUBJECTS"
 
 # The identity rule reads author and committer emails from the payload
 # header; one reserved address in either role is enough.
@@ -200,7 +201,7 @@ pass 'annotated tag payload'
 
 before_calls=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
 before_dialogs=$(wc -l < "$FAKE_DIALOG_LOG")
-for rejected_subject in $REJECTED_SUBJECTS; do
+while IFS= read -r rejected_subject; do
     set +e
     "$ROOT/git-gpg-preview" -bsau TEST < "$TMP/policy-$rejected_subject.payload" > "$TMP/policy-reject.stdout" 2> "$TMP/policy-reject.stderr"
     rejected_status=$?
@@ -211,7 +212,7 @@ for rejected_subject in $REJECTED_SUBJECTS; do
     grep -F 'if this is a test or fixture repository: disable signing there' "$TMP/policy-reject.stderr" >/dev/null || fail "fixture-style subject $rejected_subject omitted fixture remediation"
     grep -F 'GIT_GPG_PREVIEW_ALLOW_FIXTURE=1' "$TMP/policy-reject.stderr" >/dev/null || fail "fixture-style subject $rejected_subject omitted the override hint"
     grep -F 'remote signing has no fixture override' "$TMP/policy-reject.stderr" >/dev/null || fail "fixture-style subject $rejected_subject omitted the remote policy limit"
-done
+done <<< "$REJECTED_SUBJECTS"
 for rejected_email in $REJECTED_EMAILS; do
     for role in author committer; do
         set +e
