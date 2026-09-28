@@ -78,6 +78,25 @@ The preview appears and reports readiness before GPG is engaged, so when a PIN i
 
 There is no **Sign** button: the signature is produced by the hardware confirmation that is already pending while the preview is shown. Touching the key completes signing with the captured bytes and original arguments and dismisses the window. **Cancel** kills GPG before it produces a signature and returns nonzero, so Git aborts.
 
+For commits, **Mark as Spam** cancels signing and remembers the first non-empty
+subject line. Future commits with that exact subject are rejected before the
+preview or GPG starts, across repositories and requesting hosts. Matching ignores
+surrounding spaces/tabs and ASCII letter case; it does not use patterns or match
+longer subjects. Tags, unknown payloads, empty subjects, and subjects containing
+control characters do not offer this action. Payloads containing NUL bytes cannot
+create rules either.
+
+The local wrapper and remote signing service share the signing Mac's
+`~/.config/git-gpg-preview/spam-subjects` (under `XDG_CONFIG_HOME` when set, or
+the service's `--config-dir`). This private mode-0600 text file contains one
+normalized subject per line. **To undo a mark, remove that line**; the next request
+reads the updated file without a restart. Upgrades preserve the list; uninstalling
+removes it with the configuration. Fixture override variables do not bypass these
+operator-created rules, and remote requesters cannot create rules. If saving a
+rule fails, the current request is still cancelled and the error says the subject
+was not saved. Audit entries record `spam-mark`, `spam-reject`, or `spam-save-error`
+without including the subject. Only the separate spam list stores subject text.
+
 The dialog deliberately labels two different things:
 
 1. **Exact signed payload:** the bytes supplied to GPG. This includes the proposed commit/tag object headers and message.
@@ -193,7 +212,7 @@ GnuPG round trip with a disposable key when `gpg` is installed.
 
 A signing request is rejected before GPG runs when the real-GPG path or UI helper is missing, a recognized commit/tag payload cannot be safely parsed against available Git objects, or a secure temporary area cannot be created. Once the preview and GPG are engaged, a **Cancel** decision, a preview process that exits without approval, or any outcome other than a completed signature kills GPG before it produces a signature. Unknown signing formats still receive a clearly labeled exact-payload review.
 
-Non-signing operations require a valid real-GPG configuration too; when configured correctly, they use `exec` for transparent argument, descriptor, signal, stdout/stderr, and exit behavior. For signing, stdout and stderr remain connected directly to GPG, and the wrapper propagates GPG's exact exit code and forwards termination signals. The wrapper never writes UI or diagnostic text to stdout because Git expects the detached signature there.
+Non-signing operations require a valid real-GPG configuration too; when configured correctly, they use `exec` for transparent argument, descriptor, signal, stdout/stderr, and exit behavior. For signing, stderr remains connected directly to GPG; stdout is held in a private request file until the final dialog decision is checked, so a simultaneous touch and cancellation or spam mark cannot return a signature to Git. The wrapper propagates GPG's exact exit code and forwards termination signals. The wrapper never writes UI or diagnostic text to stdout because Git expects the detached signature there.
 
 ## Threat model and limitations
 

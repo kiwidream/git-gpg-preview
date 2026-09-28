@@ -270,6 +270,48 @@ def fixture_reason(info: dict) -> str | None:
     return f"identity '{email}'" if email else None
 
 
+def spam_subject(payload: bytes) -> bytes:
+    """Literal first nonempty commit subject; match the wrapper's C-locale awk."""
+    if not payload.startswith(b'tree ') or b'\0' in payload:
+        return b''
+    for line in payload.partition(b'\n\n')[2].split(b'\n'):
+        subject = line.removesuffix(b'\r').strip(b' \t')
+        if subject:
+            return b'' if any(c < 32 or c == 127 for c in subject) else subject.lower()
+    return b''
+
+
+def read_spam_subjects(path: Path) -> bytes:
+    try:
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise OSError('spam subject list must be a regular file')
+        return path.read_bytes()
+    except FileNotFoundError:
+        return b''
+    except OSError as exc:
+        raise RemoteError(f'cannot read spam subject list: {path}; refusing to sign') from exc
+
+
+def remember_spam_subject(path: Path, subject: bytes) -> None:
+    """Atomic replacement under the shared dialog lock; repeated marks are safe."""
+    if not subject:
+        raise RemoteError('no usable commit subject to mark as spam')
+    previous = read_spam_subjects(path)
+    if subject in previous.split(b'\n'):
+        return
+    fd, name = tempfile.mkstemp(prefix='.spam-subjects.', dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(previous)
+            if previous and not previous.endswith(b'\n'):
+                stream.write(b'\n')
+            stream.write(subject + b'\n')
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def valid_oid(value: str) -> bool:
     return bool(re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', value))
 
@@ -406,6 +448,7 @@ def resolve_signing_key(real_gpg: str, configured: str = '') -> tuple[str, str]:
 
 class ServeConfig:
     def __init__(self, base: Path) -> None:
+        self.spam_file = base / 'spam-subjects'
         wrapper = read_kv(base / 'config')
         own = read_kv(base / 'serve')
         self.real_gpg = own.get('real_gpg') or wrapper.get('real_gpg', '')
@@ -580,6 +623,28 @@ class Service:
                     f'\tpeer={one_line(peer)}\tcaller=remote\tdecision={decision}\n')
 
     # -- the review + sign flow
+    def _spam_rejection(self, payload, info, digest, repo, peer):
+        subject = spam_subject(payload)
+        if subject and subject in read_spam_subjects(self.config.spam_file).split(b'\n'):
+            self.audit('spam-reject', repo, info['type'], digest, peer)
+            return {'status': EX_POLICY, 'decision': 'spam-reject', 'stdout': '',
+                    'stderr': f'git-gpg-preview: subject marked as spam; remove its line from '
+                              f'{self.config.spam_file} on the signing Mac to allow it again\n'}
+        return None
+
+    def _mark_spam(self, paths, info, digest, repo, peer):
+        try:
+            remember_spam_subject(self.config.spam_file, spam_subject(paths['payload'].read_bytes()))
+        except (OSError, RemoteError):
+            self.audit('spam-save-error', repo, info['type'], digest, peer)
+            return {'status': EX_SOFTWARE, 'decision': 'spam-save-error', 'stdout': '',
+                    'stderr': f'git-gpg-preview: signing cancelled, but could not save spam subject '
+                              f'to {self.config.spam_file}\n'}
+        self.audit('spam-mark', repo, info['type'], digest, peer)
+        return {'status': EX_CANCELLED, 'decision': 'spam-mark', 'stdout': '',
+                'stderr': f'git-gpg-preview: signing cancelled; subject marked as spam '
+                          f'(edit {self.config.spam_file} on the signing Mac to undo)\n'}
+
     def sign(self, request: dict, who: dict) -> dict:
         args = request.get('args')
         if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
@@ -612,6 +677,9 @@ class Service:
         digest = hashlib.sha256(payload).hexdigest()
         repo = context.get('repository', '(unknown repository)')
         peer = f"{who['node'] or '?'} ({who['login'] or 'no login'})"
+        spam = self._spam_rejection(payload, info, digest, repo, peer)
+        if spam:
+            return spam
         rejected = fixture_reason(info)
         if rejected:
             self.audit('policy-reject', repo, info['type'], digest, peer)
@@ -681,6 +749,10 @@ class Service:
                 paths[p].chmod(0o600)
 
             with DialogLock(lock_root / 'dialog.lock'):
+                # Includes marks made by a local wrapper while we were queued.
+                spam = self._spam_rejection(payload, info, digest, repo, peer)
+                if spam:
+                    return spam
                 return self._run_dialog_and_gpg(args, paths, info, digest, repo, peer)
 
     def _run_dialog_and_gpg(self, args, paths, info, digest, repo, peer) -> dict:
@@ -690,6 +762,7 @@ class Service:
         else:
             dialog_cmd = ['/usr/bin/osascript', '-l', 'JavaScript', config.ui_helper]
         dialog_cmd += [str(paths['summary.txt']), str(paths['details.txt']), str(paths['decision']), str(paths['ready'])]
+        dialog_cmd.append('mark-spam' if spam_subject(paths['payload'].read_bytes()) else '')
         dialog = subprocess.Popen(dialog_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         deadline = time.monotonic() + 5
         while not paths['ready'].exists() and dialog.poll() is None and time.monotonic() < deadline:
@@ -725,6 +798,10 @@ class Service:
             decision = paths['decision'].read_text().strip()
             if decision == 'sign':
                 outcome = 'signed'
+            elif decision == 'spam':
+                stop(gpg)
+                gpg.communicate()
+                return self._mark_spam(paths, info, digest, repo, peer)
             elif decision == 'cancel':
                 stop(gpg)
                 self.audit('cancel', repo, info['type'], digest, peer)
@@ -759,6 +836,8 @@ class Service:
             decision = paths['decision'].read_text().strip()
         except OSError:
             decision = ''
+        if decision == 'spam':
+            return self._mark_spam(paths, info, digest, repo, peer)
         if decision == 'cancel':
             self.audit('cancel', repo, info['type'], digest, peer)
             return {'status': EX_CANCELLED, 'decision': 'cancel', 'stdout': '',

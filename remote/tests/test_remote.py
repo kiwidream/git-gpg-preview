@@ -2,6 +2,7 @@
 tailscale/gpg/dialog helpers, driven by the real client, plus one run
 against real GnuPG with a disposable key."""
 import base64
+import concurrent.futures
 import json
 import importlib.util
 import os
@@ -48,7 +49,8 @@ class Harness:
         self.decision.write_text('sign')
         for d in (self.serve_dir, self.client_dir, self.calls, self.captures, tmp / 'bin'):
             d.mkdir(parents=True, exist_ok=True)
-        (tmp / 'bin' / 'tailscale').symlink_to(HELPERS / 'fake-tailscale.py')
+        if not (tmp / 'bin' / 'tailscale').exists():
+            (tmp / 'bin' / 'tailscale').symlink_to(HELPERS / 'fake-tailscale.py')
         gpg = real_gpg or str(HELPERS / 'fake-gpg.py')
         (self.serve_dir / 'config').write_text(f'real_gpg={gpg}\nui_helper=/nonexistent\nlock_root={tmp}/lock\naudit_log={self.audit}\n')
         (self.serve_dir / 'serve').write_text(
@@ -76,6 +78,7 @@ class Harness:
         (tmp / 'gitconfig').write_text(f'[user]\n\tsigningkey = {git_signingkey}\n' if git_signingkey else '')
         (tmp / 'temp').mkdir(exist_ok=True)
         ready = tmp / 'ready'
+        ready.unlink(missing_ok=True)
         self.proc = subprocess.Popen([sys.executable, str(MODULE), 'serve', '--config-dir', str(self.serve_dir),
                                       '--ready-file', str(ready)], env=self.env,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -286,6 +289,140 @@ class RemoteSigningTests(unittest.TestCase):
                                   'context': {}})
         self.assertEqual((code, body['status'], body['decision']), (200, 65, 'policy-reject'))
         self.assertIn('decision=policy-reject', self.h.audit.read_text())
+
+    def test_mark_spam_persists_exact_subject_across_repositories_and_restart(self):
+        self.h.decision.write_text('spam')
+        result = self.h.client(self.sign_args(), self.second, self.repo)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, b'')
+        spam_file = self.h.serve_dir / 'spam-subjects'
+        self.assertEqual(spam_file.read_bytes(), 'second commit Ω\n'.encode())
+        self.assertEqual(spam_file.stat().st_mode & 0o777, 0o600)
+        self.assertIn('decision=spam-mark', self.h.audit.read_text())
+        self.assertEqual(next(self.h.captures.glob('*.spam-action')).read_text(), 'mark-spam')
+        before = len(list(self.h.captures.glob('*.summary')))
+        self.h.stop()
+        self.h = Harness(self.tmp)
+        self.addCleanup(self.h.stop)
+        payload = self.second.partition(b'\n\n')[0] + '\n\n \tSECOND COMMIT Ω\t\r\nnew body\n'.encode()
+        code, body = self.h.post({'version': 1, 'args': self.sign_args(), 'payload': base64.b64encode(payload).decode(),
+                                  'context': {'repository': '/another/repository'}, 'fixture_override': True})
+        self.assertEqual((code, body['status'], body['decision']), (200, 65, 'spam-reject'))
+        self.assertEqual(body['stdout'], '')
+        self.assertEqual(len(list(self.h.captures.glob('*.summary'))), before)
+        self.assertEqual(self.h.gpg_calls(), [])
+        self.assertIn('decision=spam-reject', self.h.audit.read_text())
+        self.h.decision.write_text('sign')
+        near = payload.replace('SECOND COMMIT Ω'.encode(), 'SECOND COMMIT Ω follow-up'.encode())
+        result = self.h.client(self.sign_args(), near, self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        spam_file.unlink()  # removing the saved rule permits it again
+        result = self.h.client(self.sign_args(), payload, self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_touch_then_spam_never_returns_a_signature(self):
+        self.h.decision.write_text('touch-then-spam')
+        result = self.h.client(self.sign_args(), self.second, self.repo)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, b'')
+        self.assertIn('decision=spam-mark', self.h.audit.read_text())
+
+    def test_queued_spam_is_rechecked_before_dialog(self):
+        self.h.decision.write_text('delayed-spam')
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(self.h.client, self.sign_args(), self.second, self.repo)
+            deadline = time.monotonic() + 5
+            while not list(self.h.captures.glob('*.summary')) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(list(self.h.captures.glob('*.summary')))
+            second = pool.submit(self.h.client, self.sign_args(), self.second, self.repo)
+            a, b = first.result(timeout=10), second.result(timeout=10)
+        self.assertEqual((a.returncode, b.returncode), (1, 65), (a.stderr, b.stderr))
+        self.assertEqual((a.stdout, b.stdout), (b'', b''))
+        self.assertEqual(len(list(self.h.captures.glob('*.summary'))), 1)
+
+    def test_spam_save_failure_cancels_and_reports_failure(self):
+        self.h.decision.write_text('delayed-spam')
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(self.h.client, self.sign_args(), self.second, self.repo)
+            deadline = time.monotonic() + 5
+            while not list(self.h.captures.glob('*.summary')) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(list(self.h.captures.glob('*.summary')))
+            (self.h.serve_dir / 'spam-subjects').mkdir()
+            result = pending.result(timeout=10)
+        self.assertEqual(result.returncode, 70, result.stderr)
+        self.assertEqual(result.stdout, b'')
+        self.assertIn(b'could not save spam subject', result.stderr)
+        self.assertIn('decision=spam-save-error', self.h.audit.read_text())
+
+    def test_remote_request_cannot_mark_spam(self):
+        code, body = self.h.post({'version': 1, 'args': self.sign_args(), 'payload': base64.b64encode(self.second).decode(),
+                                  'decision': 'spam', 'context': {'decision': 'spam'}})
+        self.assertEqual((code, body['status']), (200, 0))
+        self.assertFalse((self.h.serve_dir / 'spam-subjects').exists())
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'local wrapper needs macOS')
+    def test_local_and_remote_signers_share_spam_rules(self):
+        (self.tmp / 'git-gpg-preview').symlink_to(self.h.serve_dir)
+        config = self.h.serve_dir / 'config'
+        config.write_text(config.read_text().replace('ui_helper=/nonexistent',
+                          f'ui_helper={ROOT.parent}/tests/helpers/fake-dialog.jxa'))
+        env = {**self.h.env, 'XDG_CONFIG_HOME': str(self.tmp), 'FAKE_DIALOG_DECISION': 'spam'}
+        result = subprocess.run([str(ROOT.parent / 'git-gpg-preview'), *self.sign_args()],
+                                input=self.second, cwd=self.repo, env=env, capture_output=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, b'')
+        result = self.h.client(self.sign_args(), self.second, self.repo)
+        self.assertEqual(result.returncode, 65, result.stderr)
+        self.assertEqual(result.stdout, b'')
+        self.h.decision.write_text('spam')
+        result = self.h.client(self.sign_args(), self.initial, self.repo)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        result = subprocess.run([str(ROOT.parent / 'git-gpg-preview'), *self.sign_args()],
+                                input=self.initial, cwd=self.repo, env=env, capture_output=True)
+        self.assertEqual(result.returncode, 65, result.stderr)
+        self.assertEqual(result.stdout, b'')
+        self.assertEqual((self.h.serve_dir / 'spam-subjects').read_bytes(),
+                         'second commit Ω\ninitial message\n'.encode())
+
+    def test_noncommit_payloads_do_not_offer_mark_spam(self):
+        oid = subprocess.check_output(['git', '-C', str(self.repo), 'rev-parse', 'HEAD']).strip()
+        for payload in (b'unknown\n\nSecond commit\n',
+                        b'object ' + oid + b'\ntype commit\ntag example\n\nSecond commit\n',
+                        self.second.partition(b'\n\n')[0] + b'\n\n'):
+            result = self.h.client(self.sign_args(), payload, self.repo)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(list(self.h.captures.glob('*.spam-action')))
+        for action in self.h.captures.glob('*.spam-action'):
+            self.assertEqual(action.read_text(), '')
+
+    def test_spam_parser_matches_wrapper_and_rules_are_literal(self):
+        wrapper = (ROOT.parent / 'git-gpg-preview').read_text()
+        parser = re.search(r'^spam_subject\(\) \{\n.*?^\}', wrapper, re.M | re.S).group()
+        script = 'export LC_ALL=C\nMESSAGE="$1"\nPAYLOAD="$2"\n' + parser + '\nspam_subject\n'
+        header = self.second.partition(b'\n\n')[0] + b'\n\n'
+        subjects = [b'\n \tFancy Subject \t\r\nbody', 'Subject Ω Ä'.encode(), b'$(touch bad); `id`',
+                    b'a\\b.*[0-9]|c', b'-n', b'a\x00b', b'a\tb', b'\n\t\n', b'\xffXYZ']
+        message = self.tmp / 'subject.txt'
+        payload = self.tmp / 'subject.payload'
+        for value in subjects:
+            with self.subTest(subject=value):
+                message.write_bytes(value)
+                payload.write_bytes(header + value)
+                result = subprocess.run(['bash', '-c', script, 'bash', str(message), str(payload)], capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.rstrip(b'\n'), remote.spam_subject(header + value))
+        spam_file = self.h.serve_dir / 'spam-subjects'
+        spam_file.write_bytes(b'existing rule')
+        remote.remember_spam_subject(spam_file, b'a\\b.*[0-9]|c')
+        remote.remember_spam_subject(spam_file, b'a\\b.*[0-9]|c')
+        self.assertEqual(spam_file.read_bytes(), b'existing rule\na\\b.*[0-9]|c\n')
+        self.h.decision.write_text('sign')
+        result = self.h.client(self.sign_args(), header + b'a\\b.*[0-9]|c\n', self.repo)
+        self.assertEqual(result.returncode, 65, result.stderr)
+        result = self.h.client(self.sign_args(), header + b'ab1\n', self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_fixture_subjects_match_the_wrapper(self):
         wrapper = (ROOT.parent / 'git-gpg-preview').read_text()

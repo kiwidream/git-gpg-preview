@@ -70,6 +70,8 @@ function run(argv) {
     const details = readText(argv[1]);
     const decisionPath = argv[2];
     const readyPath = argv.length > 3 ? argv[3] : '';
+    // Explicit capability from the signer; never infer it from payload text.
+    const canMarkSpam = argv.length > 4 && argv[4] === 'mark-spam';
 
     const app = $.NSApplication.sharedApplication;
     app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
@@ -84,9 +86,11 @@ function run(argv) {
         alert.alertStyle = $.NSAlertStyleInformational;
         alert.messageText = 'Confirm signature on your key';
         alert.informativeText = 'Touch your key to sign; this closes when done. View Details for the full payload, or Cancel to abort.';
+        if (canMarkSpam) alert.informativeText += ' Mark as Spam cancels and blocks this exact subject across repositories.';
         alert.accessoryView = scrollableText(summary, 460, 150);
         alert.addButtonWithTitle('View Details');
         alert.addButtonWithTitle('Cancel');
+        if (canMarkSpam) alert.addButtonWithTitle('Mark as Spam');
         // Report readiness only once, as the first preview is about to show,
         // so the wrapper engages GPG after this window is already up.
         if (first) {
@@ -98,6 +102,10 @@ function run(argv) {
             writeDecision(decisionPath, 'cancel');
             return;
         }
+        if (canMarkSpam && response === Number($.NSAlertThirdButtonReturn)) {
+            writeDecision(decisionPath, 'spam');
+            return;
+        }
 
         const detailAlert = $.NSAlert.alloc.init;
         detailAlert.alertStyle = $.NSAlertStyleInformational;
@@ -106,9 +114,14 @@ function run(argv) {
         detailAlert.accessoryView = scrollableText(details, 920, 600);
         detailAlert.addButtonWithTitle('Back');
         detailAlert.addButtonWithTitle('Cancel');
+        if (canMarkSpam) detailAlert.addButtonWithTitle('Mark as Spam');
         const detailResponse = Number(detailAlert.runModal);
         if (detailResponse === Number($.NSAlertSecondButtonReturn)) {
             writeDecision(decisionPath, 'cancel');
+            return;
+        }
+        if (canMarkSpam && detailResponse === Number($.NSAlertThirdButtonReturn)) {
+            writeDecision(decisionPath, 'spam');
             return;
         }
     }
