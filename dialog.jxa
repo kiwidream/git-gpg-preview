@@ -31,6 +31,19 @@ function writeDecision(path, decision) {
     handle.closeFile;
 }
 
+// A rejection is recorded in two steps: this marker, then the decision. The
+// signer terminates this process the moment GPG exits, which can land between
+// the two, so the marker is what tells it an answer is still in flight and must
+// be waited for rather than read as "the operator never answered".
+function markDeciding(path) {
+    $.NSData.data.writeToFileAtomically(path + '.deciding', true);
+}
+
+function rejectSignature(path, decision) {
+    markDeciding(path);
+    writeDecision(path, decision);
+}
+
 function markReady(path) {
     if (!path) return;
     $.NSData.data.writeToFileAtomically(path, true);
@@ -99,11 +112,11 @@ function run(argv) {
         }
         const response = Number(alert.runModal);
         if (response === Number($.NSAlertSecondButtonReturn)) {
-            writeDecision(decisionPath, 'cancel');
+            rejectSignature(decisionPath, 'cancel');
             return;
         }
         if (canMarkSpam && response === Number($.NSAlertThirdButtonReturn)) {
-            writeDecision(decisionPath, 'spam');
+            rejectSignature(decisionPath, 'spam');
             return;
         }
 
@@ -117,11 +130,11 @@ function run(argv) {
         if (canMarkSpam) detailAlert.addButtonWithTitle('Mark as Spam');
         const detailResponse = Number(detailAlert.runModal);
         if (detailResponse === Number($.NSAlertSecondButtonReturn)) {
-            writeDecision(decisionPath, 'cancel');
+            rejectSignature(decisionPath, 'cancel');
             return;
         }
         if (canMarkSpam && detailResponse === Number($.NSAlertThirdButtonReturn)) {
-            writeDecision(decisionPath, 'spam');
+            rejectSignature(decisionPath, 'spam');
             return;
         }
     }

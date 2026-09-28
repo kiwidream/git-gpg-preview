@@ -18,6 +18,10 @@ function write(path, text) {
     handle.closeFile;
 }
 
+function markDeciding(path) {
+    $.NSData.data.writeToFileAtomically(path + '.deciding', true);
+}
+
 function readText(path) {
     const data = $.NSData.dataWithContentsOfFile(path);
     if (!data) return '';
@@ -46,11 +50,21 @@ function run(argv) {
     // "cancel" it reports no touch, and the wrapper kills GPG before signing.
     // The touch file is keyed by the payload SHA-256 shown in the summary so
     // that concurrent, distinct requests stay isolated from one another.
-    if ((decision === 'sign' || decision === 'touch-then-spam') && touch) {
+    if ((decision === 'sign' || decision === 'touch-then-spam'
+         || decision === 'touch-then-stall-spam') && touch) {
         const match = readText(argv[0]).match(/SHA-256:\s*([0-9a-f]+)/);
         const key = match ? match[1] : 'default';
         $.NSData.data.writeToFileAtomically(touch + '.' + key, true);
     }
+    if (decision === 'touch-then-stall-spam') {
+        // Mark as Spam pressed as the touch lands: the marker is recorded and
+        // then this process is terminated before the decision itself can be.
+        markDeciding(argv[2]);
+        $.NSThread.sleepForTimeInterval(30);
+        return;
+    }
+    // The real dialog marks any rejection before writing it; mirror that here.
+    if (decision !== 'sign') markDeciding(argv[2]);
     write(argv[2], decision === 'touch-then-spam' ? 'spam' : decision);
     if (log) append(log, 'end ' + $.NSProcessInfo.processInfo.processIdentifier + '\n');
 }

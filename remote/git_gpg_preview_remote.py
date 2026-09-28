@@ -51,6 +51,11 @@ FIXTURE_SUBJECTS = frozenset('base|fixture|init|initial|initial commit|main|prod
 FIXTURE_EMAIL_DOMAINS = ('example.com', 'example.net', 'example.org', 'example', 'invalid', 'localhost', 'test', 'local')
 TAILNET_V4 = ipaddress.ip_network('100.64.0.0/10')
 TAILNET_V6 = ipaddress.ip_network('fd7a:115c:a1e0::/48')
+# A rejection is recorded as a marker and then the decision itself. The dialog
+# is terminated as soon as GPG exits, possibly between the two, so an answer in
+# flight gets this long to land before the outcome is read.
+DECISION_GRACE_SECONDS = 2.0
+
 EX_CANCELLED = 1
 EX_POLICY = 65
 EX_SOFTWARE = 70
@@ -755,6 +760,23 @@ class Service:
                     return spam
                 return self._run_dialog_and_gpg(args, paths, info, digest, repo, peer)
 
+    @staticmethod
+    def _deciding_marker(paths):
+        decision = paths['decision']
+        return decision.with_name(decision.name + '.deciding')
+
+    def _await_pending_decision(self, paths) -> None:
+        if not self._deciding_marker(paths).exists():
+            return
+        deadline = time.monotonic() + DECISION_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                if paths['decision'].read_text().strip():
+                    return
+            except OSError:
+                pass
+            time.sleep(0.05)
+
     def _run_dialog_and_gpg(self, args, paths, info, digest, repo, peer) -> dict:
         config = self.config
         if config.dialog_runner:
@@ -828,10 +850,12 @@ class Service:
                     'stderr': f'git-gpg-preview: no hardware confirmation within {int(config.sign_timeout)}s; refusing to sign\n'}
 
         stdout, stderr = gpg.communicate(timeout=30)
-        stop(dialog)
         # gpg finishing first does not override the operator: a Cancel pressed
         # in the same instant as the touch (or a key that needs no touch) must
-        # still yield no signature. The decision file is the last word.
+        # still yield no signature. The decision file is the last word, so an
+        # answer in flight is awaited before its writer is terminated.
+        self._await_pending_decision(paths)
+        stop(dialog)
         try:
             decision = paths['decision'].read_text().strip()
         except OSError:
@@ -842,6 +866,12 @@ class Service:
             self.audit('cancel', repo, info['type'], digest, peer)
             return {'status': EX_CANCELLED, 'decision': 'cancel', 'stdout': '',
                     'stderr': 'git-gpg-preview: signing cancelled by operator\n'}
+        if self._deciding_marker(paths).exists():
+            # The operator answered and the answer never arrived. A signature
+            # exists, but not one anybody approved.
+            self.audit('pending-decision-lost', repo, info['type'], digest, peer)
+            return {'status': EX_SOFTWARE, 'decision': 'pending-decision-lost', 'stdout': '',
+                    'stderr': 'git-gpg-preview: preview began a decision that never completed; refusing to sign\n'}
         status = gpg.returncode
         self.audit('sign' if status == 0 else 'gpg-error', repo, info['type'], digest, peer)
         return {'status': status, 'decision': 'sign' if status == 0 else 'gpg-error',

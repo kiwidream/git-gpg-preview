@@ -270,6 +270,22 @@ handle_operator_rejection() {
     esac
 }
 
+# The dialog marks a rejection before it writes one, and this script
+# terminates the dialog as soon as GPG exits -- possibly between the two steps.
+# Give an answer that is already in flight a bounded window to land, so a touch
+# and a Cancel in the same instant cannot be misread as "no decision".
+await_pending_decision() {
+    [[ -e "$DECIDING" ]] || return 0
+    local waited=0
+    while [[ ! -s "$DECISION" ]]; do
+        /bin/sleep 0.05
+        waited=$((waited + 1))
+        if [[ "$waited" -ge 40 ]]; then   # 2s
+            break
+        fi
+    done
+}
+
 append_limited_sanitized() {
     local source="$1" limit="$2"
     /usr/bin/head -c "$limit" "$source" | sanitize_stream
@@ -365,6 +381,7 @@ MESSAGE="$REQUEST_DIR/message.txt"
 DIFFSTAT="$REQUEST_DIR/diffstat.txt"
 FULL_DIFF="$REQUEST_DIR/full-diff.txt"
 DECISION="$REQUEST_DIR/decision"
+DECIDING="$DECISION.deciding"
 SPAM_SUBJECT_FILE="$REQUEST_DIR/spam-subject"
 : > "$PAYLOAD"
 /bin/chmod 600 "$PAYLOAD"
@@ -665,6 +682,8 @@ if [[ "$OUTCOME" == "dialog" ]]; then
 fi
 
 # Signing completed (GPG finished on its own, or after explicit approval).
+# A rejection already in flight has to land before its writer is terminated.
+await_pending_decision
 # Dismiss the review window if it is still open.
 if [[ -n "$DIALOG_PID" ]] && /bin/kill -0 "$DIALOG_PID" 2>/dev/null; then
     /bin/kill -s TERM "$DIALOG_PID" 2>/dev/null || true
@@ -674,6 +693,14 @@ DIALOG_PID=""
 CHILD_PID=""
 DECISION_VALUE=$(/bin/cat "$DECISION" 2>/dev/null || true)
 handle_operator_rejection
+if [[ -e "$DECIDING" ]]; then
+    # The operator answered and the answer never arrived. A signature exists,
+    # but not one anybody approved: never release it on an unreadable outcome.
+    release_dialog_lock
+    audit_decision "pending-decision-lost" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+    error "preview began a decision that never completed; refusing to sign"
+    exit 70
+fi
 release_dialog_lock
 /bin/cat "$REQUEST_DIR/gpg.stdout"
 
