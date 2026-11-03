@@ -93,7 +93,7 @@ If your security key rejects the PIN, the request does not fail straight away. T
 - **Try Again** shows the preview again, with a line saying which attempt this is and how many remain, then asks for the PIN again in a new, empty field. The wrong PIN cannot be submitted twice by accident.
 - **Cancel** ends the request; Git receives GPG's `Bad PIN` failure.
 - When the key reports no attempts left, the dialog says the PIN is blocked and offers only **OK**. Unblock it with the Admin PIN or reset code (`gpg --card-edit`, then `admin`, then `unblock`).
-- If the counter cannot be read, a request allows three attempts in total.
+- If the counter cannot be read, a request allows two attempts in total: wrong PINs from earlier requests may already have been counted, and a third could block the key.
 
 This also works with pinentry (`pin_prompt=pinentry`): each retry opens a new pinentry. The dialog lock stays held across retries, so other queued signing requests wait instead of failing. Audit entries record `bad-pin-retry` for each retry and `bad-pin` when the request stops after a wrong PIN. Only card PIN failures are retried; gpg-agent re-prompts for a wrong software-key passphrase itself. Remote signing does not use the PIN window or retry yet: a wrong PIN fails that remote commit.
 

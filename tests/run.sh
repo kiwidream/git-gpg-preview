@@ -424,14 +424,14 @@ pass 'wrong PINs stop when the key reports its PIN blocked'
 unset FAKE_GPG_PIN FAKE_PIN_ENTRIES
 
 # Without --status-fd=2 GPG's own pinentry is used; retries still work, and
-# with no readable counter a request allows three attempts in total.
+# with no readable counter a request allows two attempts in total.
 reset_pin_state
 unset FAKE_PIN_RETRIES
 export FAKE_GPG_BAD_PINS=99
 run_pin_case -bsau TEST
 [[ "$pin_status" -eq 2 ]] || fail "pinentry-path PIN status ($pin_status)"
-[[ $(wc -l < "$FAKE_GPG_CALL_DIR/bad-pin-calls") -eq 3 ]] || fail 'unknown-counter attempt limit'
-[[ $(pin_dialogs) == $'pin-error unknown retry counted\npin-error unknown retry counted\npin-error unknown final counted' ]] \
+[[ $(wc -l < "$FAKE_GPG_CALL_DIR/bad-pin-calls") -eq 2 ]] || fail 'unknown-counter attempt limit'
+[[ $(pin_dialogs) == $'pin-error unknown retry counted\npin-error unknown final counted' ]] \
     || fail "unknown-counter sequence: $(pin_dialogs)"
 pass 'pinentry path retries a wrong PIN and limits attempts without a counter'
 unset FAKE_GPG_BAD_PINS FAKE_PIN_ERROR_DECISION

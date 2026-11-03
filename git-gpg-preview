@@ -430,8 +430,10 @@ offer_pin_retry() {
         counted=uncounted
     fi
     if [[ "$remaining" == unknown ]]; then
-        # Without the card's counter, stop where most keys block the PIN.
-        [[ "$ATTEMPT" -lt 3 ]] || allow=final
+        # Without the card's counter, earlier requests may already have used
+        # attempts, so a second wrong PIN here could be the one that blocks
+        # the key. Allow one retry only.
+        [[ "$ATTEMPT" -lt 2 ]] || allow=final
     elif [[ "$remaining" -eq 0 || "$ATTEMPT" -ge "$PIN_ATTEMPT_LIMIT" ]]; then
         allow=final
     fi
