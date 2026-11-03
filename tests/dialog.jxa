@@ -16,13 +16,50 @@ function modalResponse(alert) {
     return responses.shift();
 }
 
+var pinResponses = [];
+var expectedPinButtons = [];
+function pinModalResponse(alert) {
+    const buttons = alert.buttons;
+    const titles = [];
+    for (let i = 0; i < Number(buttons.count); i++) titles.push(ObjC.unwrap(buttons.objectAtIndex(i).title));
+    if (titles.join('|') !== expectedPinButtons.join('|')) throw new Error('Unexpected PIN buttons: ' + titles.join('|'));
+    if (!pinResponses.length) throw new Error('Unexpected extra PIN modal');
+    lastPinText = ObjC.unwrap(alert.informativeText);
+    return pinResponses.shift();
+}
+var lastPinText = '';
+
+// PIN window: record what the user would see, type the scripted PIN, answer.
+var pinEntryScript = [];
+var pinEntrySeen = [];
+function pinEntryModalResponse(alert) {
+    const subviews = alert.accessoryView.subviews;
+    const field = subviews.objectAtIndex(0);
+    const label = subviews.objectAtIndex(1);
+    if (!pinEntryScript.length) throw new Error('Unexpected extra PIN window');
+    pinEntrySeen.push({
+        initial: ObjC.unwrap(field.stringValue),
+        label: ObjC.unwrap(label.stringValue),
+        red: !!label.textColor.isEqual($.NSColor.systemRedColor),
+        bold: (Number(label.font.fontDescriptor.symbolicTraits) & 2) !== 0,
+        secure: !!field.isKindOfClass($.NSSecureTextField)
+    });
+    const step = pinEntryScript.shift();
+    field.stringValue = step.pin;
+    return step.response;
+}
+
 function run(argv) {
     const source = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null));
     const substitutions = [
         ['function run(argv)', 'function runPreview(argv)'],
         ['app.activateIgnoringOtherApps(true);', ''],
         ['Number(alert.runModal)', 'modalResponse(alert)'],
-        ['Number(detailAlert.runModal)', 'modalResponse(detailAlert)']
+        ['Number(detailAlert.runModal)', 'modalResponse(detailAlert)'],
+        ['pinApp.activateIgnoringOtherApps(true);', ''],
+        ['Number(pinAlert.runModal)', 'pinModalResponse(pinAlert)'],
+        ['pinEntryApp.activateIgnoringOtherApps(true);', ''],
+        ['Number(pinEntryAlert.runModal)', 'pinEntryModalResponse(pinEntryAlert)']
     ];
     let instrumented = source;
     substitutions.forEach(function(pair) {
@@ -57,5 +94,54 @@ function run(argv) {
         if (responses.length || modalCount !== test.responses.length) throw new Error('Wrong modal sequence');
         if (!$.NSFileManager.defaultManager.fileExistsAtPath(ready)) throw new Error('Readiness missing');
     });
-    return 'Dialog actions passed (7 cases)';
+    // Wrong-PIN dialog: Try Again only while attempts remain and the signer allows it.
+    [
+        {args: ['2', 'retry'], buttons: ['Try Again', 'Cancel'], response: 1000, decision: 'retry', text: '2 attempts remaining'},
+        {args: ['2', 'retry'], buttons: ['Try Again', 'Cancel'], response: 1001, decision: 'cancel', text: '2 attempts remaining'},
+        {args: ['1', 'retry'], buttons: ['Try Again', 'Cancel'], response: 1000, decision: 'retry', text: '1 attempt remaining'},
+        {args: ['unknown', 'retry'], buttons: ['Try Again', 'Cancel'], response: 1000, decision: 'retry', text: 'could not be read'},
+        {args: ['0', 'retry'], buttons: ['OK'], response: 1000, decision: 'cancel', text: 'PIN is now blocked'},
+        {args: ['unknown', 'final'], buttons: ['OK'], response: 1000, decision: 'cancel', text: 'Signing was cancelled'}
+    ].forEach(function(test) {
+        $.NSData.data.writeToFileAtomically(decision, true);
+        expectedPinButtons = test.buttons;
+        pinResponses = [test.response];
+        runPreview(['--pin-error', decision].concat(test.args));
+        if (readText(decision) !== test.decision) throw new Error('Wrong PIN decision for ' + test.args.join(' '));
+        if (pinResponses.length) throw new Error('PIN modal not shown');
+        if (lastPinText.indexOf(test.text) < 0) throw new Error('PIN text missing "' + test.text + '"');
+    });
+    // PIN window: attempts line under the field, bold red at two or fewer;
+    // a too-short PIN is refused with a fresh, empty field.
+    const channel = argv[1] + '/dialog-pin-channel';
+    const plain = {red: false, bold: false};
+    const warn = {red: true, bold: true};
+    [
+        {remaining: '3', script: [{pin: '123456', response: 1000}], labels: [['3 attempts remaining', plain]], result: 'entered', sent: '123456\n'},
+        {remaining: '2', script: [{pin: '123456', response: 1000}], labels: [['2 attempts remaining', warn]], result: 'entered', sent: '123456\n'},
+        {remaining: '1', script: [{pin: '123456', response: 1000}], labels: [['1 attempt remaining', warn]], result: 'entered', sent: '123456\n'},
+        {remaining: 'unknown', script: [{pin: '123456', response: 1000}], labels: [['Attempts remaining: unknown', plain]], result: 'entered', sent: '123456\n'},
+        {remaining: '3', script: [{pin: '1234', response: 1000}, {pin: '123456', response: 1000}],
+         labels: [['3 attempts remaining', plain], ['PINs have at least 6 characters; nothing was sent to your key. 3 attempts remaining.', warn]],
+         result: 'entered', sent: '123456\n'},
+        {remaining: '3', script: [{pin: '123456', response: 1001}], labels: [['3 attempts remaining', plain]], result: 'cancel', sent: ''}
+    ].forEach(function(test, index) {
+        $.NSData.data.writeToFileAtomically(decision, true);
+        $.NSData.data.writeToFileAtomically(channel, true);
+        pinEntryScript = test.script.slice();
+        pinEntrySeen = [];
+        runPreview(['--pin-entry', channel, decision, test.remaining, '1']);
+        const where = 'PIN window case ' + (index + 1) + ': ';
+        if (pinEntryScript.length) throw new Error(where + 'not every window was shown');
+        if (readText(decision) !== test.result) throw new Error(where + 'wrong result');
+        if (readText(channel) !== test.sent) throw new Error(where + 'wrong PIN sent');
+        test.labels.forEach(function(expected, i) {
+            const seen = pinEntrySeen[i];
+            if (seen.label !== expected[0]) throw new Error(where + 'label was "' + seen.label + '"');
+            if (seen.red !== expected[1].red || seen.bold !== expected[1].bold) throw new Error(where + 'label style');
+            if (seen.initial !== '') throw new Error(where + 'PIN field was not empty');
+            if (!seen.secure) throw new Error(where + 'PIN field is not secure');
+        });
+    });
+    return 'Dialog actions passed (19 cases)';
 }

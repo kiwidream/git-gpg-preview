@@ -10,6 +10,40 @@ payload="$CALL_DIR/$id.stdin"
 args="$CALL_DIR/$id.args"
 cat > "$payload"
 
+# Wrong PINs are counted across calls so the card's retry counter drops.
+# A too-short PIN fails the same way but never reaches the card.
+bad_pin_log="$CALL_DIR/bad-pin-calls"
+counted_log="$CALL_DIR/counted-bad-pins"
+bad_pins=0
+counted_pins=0
+[[ -f "$bad_pin_log" ]] && bad_pins=$(wc -l < "$bad_pin_log" | tr -d ' ')
+[[ -f "$counted_log" ]] && counted_pins=$(wc -l < "$counted_log" | tr -d ' ')
+fail_bad_pin() {
+    printf '%s\n' "$id" >> "$bad_pin_log"
+    [[ "${1-}" == uncounted ]] || printf '%s\n' "$id" >> "$counted_log"
+    printf 'gpg: signing failed: Bad PIN\n[GNUPG:] SC_OP_FAILURE 2\n' >&2
+    exit 2
+}
+
+# Card status: report FAKE_PIN_RETRIES minus wrong PINs so far. Unset means
+# no card counter is available, like a key without a smart card.
+for arg in "$@"; do
+    if [[ "$arg" == --list-secret-keys ]]; then
+        # FAKE_KEY_TOKEN: a card serial (default), + for a software key.
+        printf 'sec:u:255:22:AAAA:1:::::::cSC:::%s:::ed25519:::0:\n' '+'
+        printf 'ssb:u:255:22:BBBB:1::::::s:::%s:::ed25519::\n' "${FAKE_KEY_TOKEN-D2760001240100000006000000010000}"
+        exit 0
+    fi
+    if [[ "$arg" == --card-status ]]; then
+        printf '%s\n' "$id" >> "$CALL_DIR/card-status-calls"
+        [[ -n "${FAKE_PIN_RETRIES-}" ]] || exit 2
+        left=$((FAKE_PIN_RETRIES - counted_pins))
+        [[ "$left" -ge 0 ]] || left=0
+        printf 'reader:fake:\npinretry:%d:0:3:\n' "$left"
+        exit 0
+    fi
+done
+
 # Simulate a hardware confirmation for signing invocations: block until the
 # fake dialog reports a touch. Verification and other pass-through operations
 # never wait. If the wrapper cancels, it kills this process during the wait,
@@ -17,11 +51,19 @@ cat > "$payload"
 signing=0
 verify=0
 after_options=0
+command_fd=""
+expect_command_fd=0
 for arg in "$@"; do
     if [[ "$after_options" -eq 1 ]]; then
         continue
     fi
+    if [[ "$expect_command_fd" -eq 1 ]]; then
+        command_fd=$arg
+        expect_command_fd=0
+        continue
+    fi
     case "$arg" in
+        --command-fd) expect_command_fd=1 ;;
         --verify) verify=1 ;;
         --sign|--detach-sign|--clear-sign|--clearsign) signing=1 ;;
         --) after_options=1 ;;
@@ -33,6 +75,31 @@ for arg in "$@"; do
             ;;
     esac
 done
+# A wrong PIN fails before any touch, the way the card rejects VERIFY first.
+# pinentry path: the first FAKE_GPG_BAD_PINS signing calls get a wrong PIN.
+# Loopback path (--command-fd): when FAKE_GPG_PIN is set, ask for the PIN on
+# the status fd like real GPG and compare what arrives on the command fd.
+if [[ "$signing" -eq 1 && "$verify" -eq 0 ]]; then
+    if [[ -n "$command_fd" && -n "${FAKE_GPG_ASK-}" ]]; then
+        # A non-PIN question on the command fd, e.g. "GET_BOOL cardctrl...".
+        printf '[GNUPG:] %s\n' "$FAKE_GPG_ASK" >&2
+        IFS= read -r -t 20 answer <&"$command_fd" || { printf 'fake-gpg: no answer\n' >&2; exit 2; }
+        exit 2
+    elif [[ -n "$command_fd" && -n "${FAKE_GPG_PIN-}" ]]; then
+        printf '[GNUPG:] INQUIRE_MAXLEN 100\n[GNUPG:] GET_HIDDEN passphrase.enter\n' >&2
+        pin=""
+        IFS= read -r -t 20 pin <&"$command_fd" || { printf 'fake-gpg: no PIN\n' >&2; exit 2; }
+        printf '%s\n' "$pin" >> "$CALL_DIR/pins-received"
+        if [[ "${#pin}" -lt 6 ]]; then
+            fail_bad_pin uncounted
+        elif [[ "$pin" != "$FAKE_GPG_PIN" ]]; then
+            fail_bad_pin
+        fi
+    elif [[ -z "$command_fd" && "$bad_pins" -lt "${FAKE_GPG_BAD_PINS:-0}" ]]; then
+        printf '[GNUPG:] PINENTRY_LAUNCHED 1 curses 1.3.1 - - - - 0/0 0\n' >&2
+        fail_bad_pin "${FAKE_GPG_BAD_PIN_COUNTED:-counted}"
+    fi
+fi
 if [[ "$signing" -eq 1 && "$verify" -eq 0 && -n "${FAKE_TOUCH_FILE-}" ]]; then
     sha=$(shasum -a 256 "$payload" | awk '{print $1}')
     touch_file="$FAKE_TOUCH_FILE.$sha"

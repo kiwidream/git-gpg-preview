@@ -97,6 +97,12 @@ fi
 /usr/bin/install -m 600 "$SCRIPT_DIR/dialog.jxa" "$INSTALL_LIB"
 /usr/bin/install -m 600 "$SCRIPT_DIR/touch-prompt.jxa" "$INSTALL_TOUCH"
 
+# Keep the user's PIN prompt choice across re-installs.
+PIN_PROMPT=""
+if [[ -f "$CONFIG_FILE" ]]; then
+    PIN_PROMPT=$(sed -n 's/^pin_prompt=//p' "$CONFIG_FILE" | tail -n 1)
+fi
+
 CONFIG_TEMP=$(mktemp "$CONFIG_DIR/config.XXXXXX")
 trap 'rm -f "$CONFIG_TEMP"' EXIT
 {
@@ -105,6 +111,7 @@ trap 'rm -f "$CONFIG_TEMP"' EXIT
     printf 'touch_helper=%s\n' "$INSTALL_TOUCH"
     printf 'lock_root=%s\n' "$LOCK_ROOT"
     printf 'audit_log=%s\n' "$AUDIT_LOG"
+    [[ -z "$PIN_PROMPT" ]] || printf 'pin_prompt=%s\n' "$PIN_PROMPT"
 } > "$CONFIG_TEMP"
 chmod 600 "$CONFIG_TEMP"
 mv -f "$CONFIG_TEMP" "$CONFIG_FILE"
