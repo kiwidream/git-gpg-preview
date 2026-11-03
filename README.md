@@ -74,20 +74,28 @@ The main dialog is deliberately small and concise, showing:
 
 **View Details** opens a selectable, scrollable report containing everything else: the full repository/worktree path, the tree and parent/target object hashes, the per-parent changed-file summary, the verbatim captured payload, a byte-preserving hex view, and the complete safely generated diff for commits.
 
-The preview appears and reports readiness before GPG is engaged, so when a PIN is required the pinentry prompt launches last and stays frontmost and focused rather than opening behind the preview. The preview does not steal focus back, so you can type the PIN and then touch the key.
+The preview appears and reports readiness before GPG is engaged, so when a PIN is required the PIN prompt opens last and stays frontmost and focused rather than opening behind the preview. The preview does not steal focus back, so you can type the PIN and then touch the key.
 
-There is no **Sign** button: the signature is produced by the hardware confirmation that is already pending while the preview is shown. Touching the key completes signing with the captured bytes and original arguments and dismisses the window. **Cancel** kills GPG before it produces a signature and returns nonzero, so Git aborts.
+There is no **Sign** button: the signature is produced by the hardware confirmation that is already pending while the preview is shown. Touching the key completes signing with the captured bytes and Git's arguments (plus the PIN options below, when the PIN window is used) and dismisses the window. **Cancel** kills GPG before it produces a signature and returns nonzero, so Git aborts.
+
+### PIN window
+
+When the signing key is on a smart card (such as a YubiKey) and Git is the caller (it passes `--status-fd=2`), the wrapper asks for the PIN itself instead of gpg-agent's pinentry. It runs GPG with `--pinentry-mode loopback --command-fd 3`; when GPG asks for the PIN, the wrapper shows a **PIN window** with a secure field and, under it, how many attempts the key has left (read with `gpg --card-status` before each attempt). At two or fewer, that line is **bold red**. The PIN travels from the window to GPG through a pipe in the private request directory. It is never written to a file, logged or audited.
+
+The window refuses a PIN shorter than 6 characters. GnuPG rejects such a PIN itself, without sending it to the key, and reports the same `Bad PIN` error as a wrong one. **Cancel** in the PIN window cancels signing, like **Cancel** in the preview. A PIN the key already holds needs no window, so only the touch is asked for.
+
+Software keys, callers other than Git, and callers that choose their own PIN handling keep gpg-agent's pinentry. Add `pin_prompt=pinentry` to `~/.config/git-gpg-preview/config` to always use pinentry. Upgrades and re-installs keep that line. Loopback needs gpg-agent's default `allow-loopback-pinentry`. If `no-allow-loopback-pinentry` is set, use `pin_prompt=pinentry`.
 
 ### Wrong PIN
 
-If your security key rejects the PIN, the request does not fail straight away. The wrapper reads how many PIN attempts the key has left (`gpg --card-status`) and shows an **Incorrect PIN** dialog with that number:
+If your security key rejects the PIN, the request does not fail straight away. The wrapper reads how many PIN attempts the key has left and shows an **Incorrect PIN** dialog with that number. If the count did not drop, the dialog says the PIN never reached the key and no attempt was used.
 
-- **Try Again** shows the preview again, with a line saying which attempt this is and how many remain, and starts GPG again with the same captured payload. That opens a new pinentry, so the PIN box is empty and the wrong PIN cannot be submitted twice by accident.
+- **Try Again** shows the preview again, with a line saying which attempt this is and how many remain, then asks for the PIN again in a new, empty field. The wrong PIN cannot be submitted twice by accident.
 - **Cancel** ends the request; Git receives GPG's `Bad PIN` failure.
 - When the key reports no attempts left, the dialog says the PIN is blocked and offers only **OK**. Unblock it with the Admin PIN or reset code (`gpg --card-edit`, then `admin`, then `unblock`).
 - If the counter cannot be read, a request allows three attempts in total.
 
-The dialog lock stays held across retries, so other queued signing requests wait instead of failing. Audit entries record `bad-pin-retry` for each retry and `bad-pin` when the request stops after a wrong PIN. Only card PIN failures are retried; gpg-agent already re-prompts for a wrong software-key passphrase. Remote signing does not retry yet: a wrong PIN fails that remote commit.
+This also works with pinentry (`pin_prompt=pinentry`): each retry opens a new pinentry. The dialog lock stays held across retries, so other queued signing requests wait instead of failing. Audit entries record `bad-pin-retry` for each retry and `bad-pin` when the request stops after a wrong PIN. Only card PIN failures are retried; gpg-agent re-prompts for a wrong software-key passphrase itself. Remote signing does not use the PIN window or retry yet: a wrong PIN fails that remote commit.
 
 For commits, **Mark as Spam** cancels signing and remembers the first non-empty
 subject line. Future commits with that exact subject are rejected before the
@@ -267,7 +275,7 @@ The uninstaller restores all previously recorded `gpg.openpgp.program` values, o
 
 ## Tests
 
-`./tests/run.sh` uses a fake GPG and a noninteractive fake dialog in an isolated home directory. It covers normal and initial commits, merge commits, annotated tags, push certificates, unknown/binary payloads, hostile Unicode content, fixture-style subject and identity rejection, near-misses, and the override, cancellation, verification pass-through, GPG failure status, stdout purity, wrong-PIN retry, cancellation and PIN-blocked handling, exact stdin/argument forwarding, concurrent queueing, stale lock recovery, safe diff options, and audit logging.
+`./tests/run.sh` uses a fake GPG and a noninteractive fake dialog in an isolated home directory. It covers normal and initial commits, merge commits, annotated tags, push certificates, unknown/binary payloads, hostile Unicode content, fixture-style subject and identity rejection, near-misses, and the override, cancellation, verification pass-through, GPG failure status, stdout purity, the PIN window (remaining-attempts line, short-PIN refusal, cancel), wrong-PIN retry, uncounted and blocked PINs, the pinentry fallback, exact stdin/argument forwarding, concurrent queueing, stale lock recovery, safe diff options, and audit logging.
 
 ## License
 

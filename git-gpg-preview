@@ -29,6 +29,9 @@ LOCK_HELD=0
 CHILD_PID=""
 DIALOG_PID=""
 GPG_STDERR=""
+PIN_DIALOG_PID=""
+# builtin: the wrapper's own PIN window (GnuPG loopback). pinentry: gpg-agent's.
+PIN_PROMPT="builtin"
 # Upper bound on PIN attempts per request, even when the card reports more.
 PIN_ATTEMPT_LIMIT=10
 
@@ -44,6 +47,7 @@ cleanup() {
         wait "$DIALOG_PID" 2>/dev/null || true
         DIALOG_PID=""
     fi
+    dismiss_pin_entry
     if [[ "$LOCK_HELD" -eq 1 && -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
         local owner=""
         owner=$(/bin/cat "$LOCK_FILE" 2>/dev/null || true)
@@ -86,9 +90,15 @@ read_config() {
             ui_helper=*) UI_HELPER=${line#ui_helper=} ;;
             lock_root=*) LOCK_ROOT=${line#lock_root=} ;;
             audit_log=*) AUDIT_LOG=${line#audit_log=} ;;
+            pin_prompt=*) PIN_PROMPT=${line#pin_prompt=} ;;
             ''|'#'*) ;;
         esac
     done < "$CONFIG_FILE"
+
+    if [[ "$PIN_PROMPT" != builtin && "$PIN_PROMPT" != pinentry ]]; then
+        error "pin_prompt must be builtin or pinentry"
+        return 1
+    fi
 
     if [[ "$REAL_GPG" != /* || ! -x "$REAL_GPG" ]]; then
         error "real_gpg must name an executable absolute path"
@@ -307,11 +317,12 @@ bad_pin_failure() {
     /usr/bin/grep -Eq '^\[GNUPG:\] SC_OP_FAILURE 2$|signing failed: Bad PIN$' "$GPG_STDERR"
 }
 
-# The card's remaining PIN (PW1) attempts, or nothing when it cannot be read.
-# Bounded, so a wedged card cannot hold the dialog lock forever.
-card_pin_retries() {
-    local output="$REQUEST_DIR/card-status" pid waited=0
-    "$REAL_GPG" --batch --card-status --with-colons < /dev/null > "$output" 2>/dev/null &
+# Runs a read-only GPG query into a file. Bounded, so a wedged card or agent
+# cannot hold the dialog lock forever.
+run_gpg_query() {
+    local output="$1" pid waited=0
+    shift
+    "$REAL_GPG" --batch "$@" < /dev/null > "$output" 2>/dev/null 4>&- &
     pid=$!
     CHILD_PID=$pid
     while /bin/kill -0 "$pid" 2>/dev/null; do
@@ -324,16 +335,92 @@ card_pin_retries() {
     done
     wait "$pid" 2>/dev/null || true
     CHILD_PID=""
-    /usr/bin/awk -F: '$1 == "pinretry" && $2 ~ /^[0-9]+$/ { print $2 + 0; exit }' "$output" 2>/dev/null
+}
+
+# The card's remaining PIN (PW1) attempts, or nothing when it cannot be read.
+card_pin_retries() {
+    run_gpg_query "$REQUEST_DIR/card-status" --card-status --with-colons
+    /usr/bin/awk -F: '$1 == "pinretry" && $2 ~ /^[0-9]+$/ { print $2 + 0; exit }' "$REQUEST_DIR/card-status" 2>/dev/null
+}
+
+# Whether the requested key signs with a key stored on a card. Field 15 of a
+# secret key line holds the card serial number for such keys. Software keys
+# keep gpg-agent's pinentry, which re-prompts for a wrong passphrase itself
+# and has no minimum length.
+signing_key_on_card() {
+    [[ "$KEY_SELECTOR" != "(not supplied)" ]] || return 1
+    run_gpg_query "$REQUEST_DIR/secret-keys" --with-colons --list-secret-keys -- "$KEY_SELECTOR"
+    /usr/bin/awk -F: '
+        ($1 == "sec" || $1 == "ssb") && $12 ~ /s/ && $15 != "" && $15 != "+" && $15 != "#" { found = 1 }
+        END { exit found ? 0 : 1 }
+    ' "$REQUEST_DIR/secret-keys" 2>/dev/null
+}
+
+# The wrapper's own PIN window replaces gpg-agent's pinentry when the key is
+# on a card, GPG reports its status on stderr (Git always passes
+# --status-fd=2) and the caller has not chosen its own PIN handling. GPG then asks for the PIN on stderr
+# (GET_HIDDEN) and reads it from fd 3, a pipe the PIN window writes into.
+uses_builtin_pin_entry() {
+    [[ "$PIN_PROMPT" == builtin ]] || return 1
+    local arg status_on_stderr=0 expect_status_fd=0
+    for arg in "$@"; do
+        if [[ "$expect_status_fd" -eq 1 ]]; then
+            [[ "$arg" == 2 ]] && status_on_stderr=1
+            expect_status_fd=0
+            continue
+        fi
+        case "$arg" in
+            --status-fd=2) status_on_stderr=1 ;;
+            --status-fd) expect_status_fd=1 ;;
+            --pinentry-mode|--pinentry-mode=*|--command-fd|--command-fd=*|--command-file*|--passphrase*) return 1 ;;
+            --) break ;;
+        esac
+    done
+    [[ "$status_on_stderr" -eq 1 ]] && signing_key_on_card
+}
+
+dismiss_pin_entry() {
+    if [[ -n "$PIN_DIALOG_PID" ]] && /bin/kill -0 "$PIN_DIALOG_PID" 2>/dev/null; then
+        /bin/kill -s TERM "$PIN_DIALOG_PID" 2>/dev/null || true
+        wait "$PIN_DIALOG_PID" 2>/dev/null || true
+    fi
+    PIN_DIALOG_PID=""
+}
+
+# Called while GPG runs. Opens the PIN window when GPG asks for the PIN.
+# Fails when the window closed without sending a PIN, because GPG would
+# otherwise wait for one forever.
+poll_pin_entry() {
+    if [[ -n "$PIN_DIALOG_PID" ]]; then
+        /bin/kill -0 "$PIN_DIALOG_PID" 2>/dev/null && return 0
+        wait "$PIN_DIALOG_PID" 2>/dev/null || true
+        PIN_DIALOG_PID=""
+        [[ "$(/bin/cat "$PIN_RESULT" 2>/dev/null)" == entered ]]
+        return
+    fi
+    local asked
+    asked=$(/usr/bin/grep -c '^\[GNUPG:\] GET_HIDDEN passphrase\.enter$' "$GPG_STDERR" 2>/dev/null) || asked=0
+    if [[ "$asked" -gt "$PIN_PROMPTS_SHOWN" ]]; then
+        PIN_PROMPTS_SHOWN=$asked
+        : > "$PIN_RESULT"
+        /usr/bin/osascript -l JavaScript "$UI_HELPER" --pin-entry "$PIN_CHANNEL" "$PIN_RESULT" \
+            "${PIN_REMAINING_BEFORE:-unknown}" "$ATTEMPT" >/dev/null 2>&1 4>&- &
+        PIN_DIALOG_PID=$!
+    fi
+    return 0
 }
 
 # After a wrong PIN: tell the user how many attempts the key has left and let
 # them try again. Succeeds only on an explicit Try Again while the key still
-# has attempts; the next attempt starts a new pinentry, so the box is empty.
+# has attempts; the next attempt asks for the PIN in a new, empty field.
 offer_pin_retry() {
-    local remaining allow=retry choice remaining_text
+    local remaining allow=retry choice remaining_text counted=counted
     remaining=$(card_pin_retries)
     [[ -n "$remaining" ]] || remaining=unknown
+    # A PIN that never reached the key leaves its counter unchanged.
+    if [[ "$remaining" != unknown && "$remaining" == "${PIN_REMAINING_BEFORE:-}" ]]; then
+        counted=uncounted
+    fi
     if [[ "$remaining" == unknown ]]; then
         # Without the card's counter, stop where most keys block the PIN.
         [[ "$ATTEMPT" -lt 3 ]] || allow=final
@@ -349,7 +436,7 @@ offer_pin_retry() {
     fi
 
     : > "$PIN_DECISION"
-    /usr/bin/osascript -l JavaScript "$UI_HELPER" --pin-error "$PIN_DECISION" "$remaining" "$allow" >/dev/null 2>&1 &
+    /usr/bin/osascript -l JavaScript "$UI_HELPER" --pin-error "$PIN_DECISION" "$remaining" "$allow" "$counted" >/dev/null 2>&1 4>&- &
     DIALOG_PID=$!
     wait "$DIALOG_PID" 2>/dev/null || true
     DIALOG_PID=""
@@ -359,7 +446,11 @@ offer_pin_retry() {
         audit_decision "bad-pin-retry" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
         PREVIEW_SUMMARY="$REQUEST_DIR/summary-attempt-$((ATTEMPT + 1)).txt"
         {
-            printf 'PIN attempt %d: the previous PIN was incorrect (%s).\n\n' "$((ATTEMPT + 1))" "$remaining_text"
+            if [[ "$counted" == uncounted ]]; then
+                printf 'PIN attempt %d: the previous PIN was rejected before reaching the key (%s).\n\n' "$((ATTEMPT + 1))" "$remaining_text"
+            else
+                printf 'PIN attempt %d: the previous PIN was incorrect (%s).\n\n' "$((ATTEMPT + 1))" "$remaining_text"
+            fi
             /bin/cat "$SUMMARY"
         } > "$PREVIEW_SUMMARY"
         return 0
@@ -701,7 +792,7 @@ reject_spam_subject
 # confirmation, not a software button, is the authorization gate.
 #
 # The preview is started first and reports readiness; only then is GPG
-# engaged. This ordering means the PIN prompt (pinentry) launches last and
+# engaged. This ordering means the PIN prompt (the PIN window or pinentry) launches last and
 # stays frontmost and focused instead of appearing behind the preview.
 #
 # A wrong PIN does not end the request: the wrapper shows how many attempts
@@ -713,12 +804,32 @@ PIN_DECISION="$REQUEST_DIR/pin-decision"
 SPAM_ACTION=""
 [[ -s "$SPAM_SUBJECT_FILE" ]] && SPAM_ACTION="mark-spam"
 PREVIEW_SUMMARY="$SUMMARY"
+GPG_ARGS=("$@")
+BUILTIN_PIN=0
+if uses_builtin_pin_entry "$@"; then
+    BUILTIN_PIN=1
+    PIN_CHANNEL="$REQUEST_DIR/pin-channel"
+    PIN_RESULT="$REQUEST_DIR/pin-result"
+    # A pipe, so the PIN only ever exists in memory. The wrapper keeps it open
+    # so GPG never reads end-of-file before the PIN window has answered.
+    if ! /usr/bin/mkfifo -m 600 "$PIN_CHANNEL" || ! exec 4<>"$PIN_CHANNEL"; then
+        error "could not create the PIN channel; refusing to sign"
+        exit 70
+    fi
+    GPG_ARGS=(--pinentry-mode loopback --command-fd 3 "$@")
+fi
 ATTEMPT=1
 while :; do
     # Each attempt starts with a fresh, unanswered preview.
     : > "$DECISION"
     /bin/rm -f "$DECIDING" "$READY" "$GPG_STDOUT"
-    /usr/bin/osascript -l JavaScript "$UI_HELPER" "$PREVIEW_SUMMARY" "$DETAILS" "$DECISION" "$READY" "$SPAM_ACTION" >/dev/null 2>&1 &
+    PIN_PROMPTS_SHOWN=0
+    PIN_REMAINING_BEFORE=""
+    if [[ "$BUILTIN_PIN" -eq 1 ]]; then
+        # Read before GPG starts: the card is busy while GPG waits for the PIN.
+        PIN_REMAINING_BEFORE=$(card_pin_retries)
+    fi
+    /usr/bin/osascript -l JavaScript "$UI_HELPER" "$PREVIEW_SUMMARY" "$DETAILS" "$DECISION" "$READY" "$SPAM_ACTION" >/dev/null 2>&1 4>&- &
     DIALOG_PID=$!
 
     ready_waited=0
@@ -736,7 +847,11 @@ while :; do
     # Hold the output until the final decision check, so a simultaneous touch
     # and rejection cannot leak a signature to Git.
     GPG_STDERR="$REQUEST_DIR/gpg.stderr"
-    "$REAL_GPG" "$@" < "$PAYLOAD" > "$GPG_STDOUT" 2> "$GPG_STDERR" &
+    if [[ "$BUILTIN_PIN" -eq 1 ]]; then
+        "$REAL_GPG" "${GPG_ARGS[@]}" < "$PAYLOAD" > "$GPG_STDOUT" 2> "$GPG_STDERR" 3<&4 4>&- &
+    else
+        "$REAL_GPG" "${GPG_ARGS[@]}" < "$PAYLOAD" > "$GPG_STDOUT" 2> "$GPG_STDERR" &
+    fi
     GPG_PID=$!
     CHILD_PID=$GPG_PID
 
@@ -757,6 +872,10 @@ while :; do
             OUTCOME="dialog"
             break
         fi
+        if [[ "$BUILTIN_PIN" -eq 1 ]] && ! poll_pin_entry; then
+            OUTCOME="pin-window"
+            break
+        fi
         /bin/sleep 0.1
     done
 
@@ -764,11 +883,21 @@ while :; do
         handle_operator_rejection
         case "$DECISION_VALUE" in
             sign)
-                # Explicit approval; the hardware signature may still be pending.
-                wait "$GPG_PID"
-                GPG_STATUS=$?
-                CHILD_PID=""
-                OUTCOME="signed"
+                # Explicit approval; the hardware signature (and possibly the
+                # PIN) may still be pending.
+                while /bin/kill -0 "$GPG_PID" 2>/dev/null; do
+                    if [[ "$BUILTIN_PIN" -eq 1 ]] && ! poll_pin_entry; then
+                        OUTCOME="pin-window"
+                        break
+                    fi
+                    /bin/sleep 0.1
+                done
+                if [[ "$OUTCOME" != "pin-window" ]]; then
+                    wait "$GPG_PID"
+                    GPG_STATUS=$?
+                    CHILD_PID=""
+                    OUTCOME="signed"
+                fi
                 ;;
             *)
                 /bin/kill -s TERM "$GPG_PID" 2>/dev/null || true
@@ -782,6 +911,21 @@ while :; do
         esac
     fi
 
+    if [[ "$OUTCOME" == "pin-window" ]]; then
+        if [[ "$(/bin/cat "$PIN_RESULT" 2>/dev/null)" == cancel ]]; then
+            # Same as Cancel in the preview: GPG is stopped before signing.
+            DECISION_VALUE=cancel
+            handle_operator_rejection
+        fi
+        /bin/kill -s TERM "$GPG_PID" 2>/dev/null || true
+        wait "$GPG_PID" 2>/dev/null || true
+        CHILD_PID=""
+        release_dialog_lock
+        audit_decision "invalid-ui-decision" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+        error "PIN window closed without an answer; refusing to sign"
+        exit 70
+    fi
+
     # Signing completed (GPG finished on its own, or after explicit approval).
     # A rejection already in flight has to land before its writer is terminated.
     await_pending_decision
@@ -791,6 +935,7 @@ while :; do
         wait "$DIALOG_PID" 2>/dev/null || true
     fi
     DIALOG_PID=""
+    dismiss_pin_entry
     CHILD_PID=""
     DECISION_VALUE=$(/bin/cat "$DECISION" 2>/dev/null || true)
     handle_operator_rejection

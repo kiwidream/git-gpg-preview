@@ -77,7 +77,7 @@ function scrollableText(text, width, height) {
 
 // Wording for the wrong-PIN dialog. `remaining` is the card's PIN retry
 // counter as a decimal string, or 'unknown' when it could not be read.
-function pinErrorText(remaining, allowRetry) {
+function pinErrorText(remaining, allowRetry, uncounted) {
     const known = /^[0-9]+$/.test(remaining);
     const count = known ? Number(remaining) : -1;
     if (count === 0) {
@@ -89,7 +89,11 @@ function pinErrorText(remaining, allowRetry) {
             canRetry: false
         };
     }
-    let info = 'Your security key did not accept the PIN. ';
+    // GnuPG rejects a PIN that is too short before it reaches the key, so a
+    // wrong PIN does not always use up an attempt.
+    let info = uncounted
+        ? 'The PIN was rejected before it reached your security key, so no attempt was used (PINs are at least 6 characters). '
+        : 'Your security key did not accept the PIN. ';
     if (count === 1) {
         info += '1 attempt remaining. One more wrong PIN blocks the key\'s PIN until it is unblocked with the Admin PIN.';
     } else if (known) {
@@ -113,7 +117,8 @@ function runPinError(argv) {
     }
     const decisionPath = argv[0];
     const remaining = argv.length > 1 ? String(argv[1]) : 'unknown';
-    const text = pinErrorText(remaining, argv.length > 2 && argv[2] === 'retry');
+    const text = pinErrorText(remaining, argv.length > 2 && argv[2] === 'retry',
+                              argv.length > 3 && argv[3] === 'uncounted');
 
     const pinApp = $.NSApplication.sharedApplication;
     pinApp.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
@@ -134,9 +139,102 @@ function runPinError(argv) {
     writeDecision(decisionPath, retry ? 'retry' : 'cancel');
 }
 
+// OpenPGP cards need at least 6 bytes for the user PIN; scdaemon rejects
+// shorter ones without asking the key, which would look like a wrong PIN.
+const MIN_PIN_BYTES = 6;
+
+// The line under the PIN field. Two or fewer attempts left is a warning.
+function remainingAttemptsLabel(remaining) {
+    if (!/^[0-9]+$/.test(remaining)) {
+        return {text: 'Attempts remaining: unknown', warn: false};
+    }
+    const count = Number(remaining);
+    if (count === 0) return {text: 'PIN blocked: no attempts remaining', warn: true};
+    return {text: count + (count === 1 ? ' attempt remaining' : ' attempts remaining'), warn: count <= 2};
+}
+
+function pinEntryView(labelText, warn) {
+    const view = $.NSView.alloc.initWithFrame($.NSMakeRect(0, 0, 320, 64));
+    const field = $.NSSecureTextField.alloc.initWithFrame($.NSMakeRect(0, 38, 320, 24));
+    field.placeholderString = 'PIN';
+    const label = $.NSTextField.wrappingLabelWithString(labelText);
+    label.frame = $.NSMakeRect(0, 0, 320, 32);
+    if (warn) {
+        label.font = $.NSFont.boldSystemFontOfSize(13);
+        label.textColor = $.NSColor.systemRedColor;
+    } else {
+        label.font = $.NSFont.systemFontOfSize(12);
+        label.textColor = $.NSColor.secondaryLabelColor;
+    }
+    view.addSubview(field);
+    view.addSubview(label);
+    return {view: view, field: field, label: label};
+}
+
+// The PIN goes straight into the pipe GPG reads; it is never written to a file.
+function sendPin(channelPath, pin) {
+    const handle = $.NSFileHandle.fileHandleForWritingAtPath(channelPath);
+    if (!handle) {
+        throw new Error('Unable to open the PIN channel.');
+    }
+    handle.writeData($.NSString.stringWithString(pin + '\n').dataUsingEncoding($.NSUTF8StringEncoding));
+    handle.closeFile;
+}
+
+// Shown by the signer when GPG asks for the card PIN. Writes 'entered' after
+// sending the PIN, or 'cancel'. Every prompt starts with an empty field.
+function runPinEntry(argv) {
+    if (argv.length < 2) {
+        throw new Error('Expected PIN channel and result paths.');
+    }
+    const channelPath = argv[0];
+    const resultPath = argv[1];
+    const remaining = argv.length > 2 ? String(argv[2]) : 'unknown';
+    const attempt = argv.length > 3 ? (Number(argv[3]) || 1) : 1;
+    const status = remainingAttemptsLabel(remaining);
+
+    const pinEntryApp = $.NSApplication.sharedApplication;
+    pinEntryApp.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
+    pinEntryApp.activateIgnoringOtherApps(true);
+
+    let problem = '';
+    while (true) {
+        const pinEntryAlert = $.NSAlert.alloc.init;
+        pinEntryAlert.alertStyle = $.NSAlertStyleInformational;
+        pinEntryAlert.messageText = attempt > 1 ? 'Enter your security key PIN again' : 'Enter your security key PIN';
+        pinEntryAlert.informativeText = (attempt > 1 ? 'The previous PIN was incorrect. ' : '') +
+            'Git is asking your key to sign the request in the review window. Enter the PIN, then touch the key when it blinks.';
+        const parts = problem
+            ? pinEntryView(problem + ' ' + status.text + '.', true)
+            : pinEntryView(status.text, status.warn);
+        pinEntryAlert.accessoryView = parts.view;
+        pinEntryAlert.addButtonWithTitle('OK');
+        pinEntryAlert.addButtonWithTitle('Cancel');
+        pinEntryAlert.window.initialFirstResponder = parts.field;
+        const response = Number(pinEntryAlert.runModal);
+        if (response !== Number($.NSAlertFirstButtonReturn)) {
+            writeDecision(resultPath, 'cancel');
+            return;
+        }
+        const pin = ObjC.unwrap(parts.field.stringValue).replace(/[\r\n]/g, '');
+        const bytes = Number($.NSString.stringWithString(pin).lengthOfBytesUsingEncoding($.NSUTF8StringEncoding));
+        if (bytes < MIN_PIN_BYTES) {
+            problem = 'PINs have at least ' + MIN_PIN_BYTES + ' characters; nothing was sent to your key.';
+            continue;
+        }
+        sendPin(channelPath, pin);
+        writeDecision(resultPath, 'entered');
+        return;
+    }
+}
+
 function run(argv) {
     if (argv.length > 0 && argv[0] === '--pin-error') {
         runPinError(argv.slice(1));
+        return;
+    }
+    if (argv.length > 0 && argv[0] === '--pin-entry') {
+        runPinEntry(argv.slice(1));
         return;
     }
     if (argv.length < 3) {
