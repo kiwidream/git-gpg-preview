@@ -420,6 +420,17 @@ run_pin_case -bsau TEST
 pass 'pinentry path retries a wrong PIN and limits attempts without a counter'
 unset FAKE_GPG_BAD_PINS FAKE_PIN_ERROR_DECISION
 
+# pinentry lets a too-short PIN through; the key never sees it, and the
+# error dialog says no attempt was used.
+reset_pin_state
+export FAKE_PIN_RETRIES=3 FAKE_GPG_BAD_PINS=1 FAKE_GPG_BAD_PIN_COUNTED=uncounted
+export FAKE_PIN_ERROR_DECISION=retry FAKE_GPG_STDOUT='signature-after-short-pin'
+run_pin_case -bsau TEST
+[[ "$pin_status" -eq 0 && "$pin_output" == 'signature-after-short-pin' ]] || fail "pinentry short PIN retry ($pin_status)"
+[[ $(pin_dialogs) == 'pin-error 3 retry uncounted' ]] || fail "pinentry short PIN sequence: $(pin_dialogs)"
+pass 'pinentry path reports a PIN that never reached the key'
+unset FAKE_GPG_BAD_PINS FAKE_GPG_BAD_PIN_COUNTED FAKE_PIN_ERROR_DECISION FAKE_PIN_RETRIES
+
 # pin_prompt=pinentry keeps gpg-agent's pinentry even for Git's arguments.
 reset_pin_state
 cp "$XDG_CONFIG_HOME/git-gpg-preview/config" "$TMP/config.saved"

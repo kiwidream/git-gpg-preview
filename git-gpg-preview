@@ -830,11 +830,11 @@ while :; do
         fi
     fi
     PIN_PROMPTS_SHOWN=0
-    PIN_REMAINING_BEFORE=""
-    if [[ "$BUILTIN_PIN" -eq 1 ]]; then
-        # Read before GPG starts: the card is busy while GPG waits for the PIN.
-        PIN_REMAINING_BEFORE=$(card_pin_retries)
-    fi
+    # Read before GPG starts: the card is busy while GPG waits for the PIN.
+    # The PIN window shows it, and after a wrong PIN an unchanged count means
+    # the PIN never reached the key (pinentry lets through PINs that are too
+    # short; scdaemon then rejects them without asking the card).
+    PIN_REMAINING_BEFORE=$(card_pin_retries)
     /usr/bin/osascript -l JavaScript "$UI_HELPER" "$PREVIEW_SUMMARY" "$DETAILS" "$DECISION" "$READY" "$SPAM_ACTION" >/dev/null 2>&1 4>&- &
     DIALOG_PID=$!
 
