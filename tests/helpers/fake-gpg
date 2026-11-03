@@ -10,6 +10,24 @@ payload="$CALL_DIR/$id.stdin"
 args="$CALL_DIR/$id.args"
 cat > "$payload"
 
+# Wrong PINs are counted across calls so the card's retry counter drops.
+bad_pin_log="$CALL_DIR/bad-pin-calls"
+bad_pins=0
+[[ -f "$bad_pin_log" ]] && bad_pins=$(wc -l < "$bad_pin_log" | tr -d ' ')
+
+# Card status: report FAKE_PIN_RETRIES minus wrong PINs so far. Unset means
+# no card counter is available, like a key without a smart card.
+for arg in "$@"; do
+    if [[ "$arg" == --card-status ]]; then
+        printf '%s\n' "$id" >> "$CALL_DIR/card-status-calls"
+        [[ -n "${FAKE_PIN_RETRIES-}" ]] || exit 2
+        left=$((FAKE_PIN_RETRIES - bad_pins))
+        [[ "$left" -ge 0 ]] || left=0
+        printf 'reader:fake:\npinretry:%d:0:3:\n' "$left"
+        exit 0
+    fi
+done
+
 # Simulate a hardware confirmation for signing invocations: block until the
 # fake dialog reports a touch. Verification and other pass-through operations
 # never wait. If the wrapper cancels, it kills this process during the wait,
@@ -33,6 +51,13 @@ for arg in "$@"; do
             ;;
     esac
 done
+# A wrong PIN fails before any touch, the way the card rejects VERIFY first.
+if [[ "$signing" -eq 1 && "$verify" -eq 0 && "$bad_pins" -lt "${FAKE_GPG_BAD_PINS:-0}" ]]; then
+    printf '%s\n' "$id" >> "$bad_pin_log"
+    printf '[GNUPG:] PINENTRY_LAUNCHED 1 curses 1.3.1 - - - - 0/0 0\n' >&2
+    printf 'gpg: signing failed: Bad PIN\n[GNUPG:] SC_OP_FAILURE 2\n' >&2
+    exit 2
+fi
 if [[ "$signing" -eq 1 && "$verify" -eq 0 && -n "${FAKE_TOUCH_FILE-}" ]]; then
     sha=$(shasum -a 256 "$payload" | awk '{print $1}')
     touch_file="$FAKE_TOUCH_FILE.$sha"

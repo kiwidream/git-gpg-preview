@@ -28,6 +28,9 @@ LOCK_FILE=""
 LOCK_HELD=0
 CHILD_PID=""
 DIALOG_PID=""
+GPG_STDERR=""
+# Upper bound on PIN attempts per request, even when the card reports more.
+PIN_ATTEMPT_LIMIT=10
 
 error() {
     printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
@@ -35,6 +38,7 @@ error() {
 
 cleanup() {
     [[ -z "$SPAM_TEMP" ]] || /bin/rm -f "$SPAM_TEMP"
+    flush_gpg_stderr
     if [[ -n "$DIALOG_PID" ]] && /bin/kill -0 "$DIALOG_PID" 2>/dev/null; then
         /bin/kill -s TERM "$DIALOG_PID" 2>/dev/null || true
         wait "$DIALOG_PID" 2>/dev/null || true
@@ -253,6 +257,7 @@ handle_operator_rejection() {
                 wait "$CHILD_PID" 2>/dev/null || true
                 CHILD_PID=""
             fi
+            flush_gpg_stderr
             if [[ "$DECISION_VALUE" == spam ]]; then
                 if ! remember_spam_subject; then
                     audit_decision "spam-save-error" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
@@ -284,6 +289,89 @@ await_pending_decision() {
             break
         fi
     done
+}
+
+# GPG's stderr is held per attempt so a wrong-PIN attempt that is retried
+# does not reach Git. Whatever attempt ends the request is forwarded once.
+flush_gpg_stderr() {
+    if [[ -n "$GPG_STDERR" && -f "$GPG_STDERR" ]]; then
+        /bin/cat "$GPG_STDERR" >&2
+    fi
+    GPG_STDERR=""
+}
+
+# Locale is forced to C above, so GPG's text is not translated. The status
+# line is what Git's --status-fd=2 produces; the text covers other callers.
+bad_pin_failure() {
+    [[ -n "$GPG_STDERR" && -f "$GPG_STDERR" ]] || return 1
+    /usr/bin/grep -Eq '^\[GNUPG:\] SC_OP_FAILURE 2$|signing failed: Bad PIN$' "$GPG_STDERR"
+}
+
+# The card's remaining PIN (PW1) attempts, or nothing when it cannot be read.
+# Bounded, so a wedged card cannot hold the dialog lock forever.
+card_pin_retries() {
+    local output="$REQUEST_DIR/card-status" pid waited=0
+    "$REAL_GPG" --batch --card-status --with-colons < /dev/null > "$output" 2>/dev/null &
+    pid=$!
+    CHILD_PID=$pid
+    while /bin/kill -0 "$pid" 2>/dev/null; do
+        /bin/sleep 0.05
+        waited=$((waited + 1))
+        if [[ "$waited" -ge 200 ]]; then   # 10s
+            /bin/kill -s TERM "$pid" 2>/dev/null || true
+            break
+        fi
+    done
+    wait "$pid" 2>/dev/null || true
+    CHILD_PID=""
+    /usr/bin/awk -F: '$1 == "pinretry" && $2 ~ /^[0-9]+$/ { print $2 + 0; exit }' "$output" 2>/dev/null
+}
+
+# After a wrong PIN: tell the user how many attempts the key has left and let
+# them try again. Succeeds only on an explicit Try Again while the key still
+# has attempts; the next attempt starts a new pinentry, so the box is empty.
+offer_pin_retry() {
+    local remaining allow=retry choice remaining_text
+    remaining=$(card_pin_retries)
+    [[ -n "$remaining" ]] || remaining=unknown
+    if [[ "$remaining" == unknown ]]; then
+        # Without the card's counter, stop where most keys block the PIN.
+        [[ "$ATTEMPT" -lt 3 ]] || allow=final
+    elif [[ "$remaining" -eq 0 || "$ATTEMPT" -ge "$PIN_ATTEMPT_LIMIT" ]]; then
+        allow=final
+    fi
+    if [[ "$remaining" == unknown ]]; then
+        remaining_text="remaining attempts unknown"
+    elif [[ "$remaining" -eq 1 ]]; then
+        remaining_text="1 PIN attempt remaining"
+    else
+        remaining_text="$remaining PIN attempts remaining"
+    fi
+
+    : > "$PIN_DECISION"
+    /usr/bin/osascript -l JavaScript "$UI_HELPER" --pin-error "$PIN_DECISION" "$remaining" "$allow" >/dev/null 2>&1 &
+    DIALOG_PID=$!
+    wait "$DIALOG_PID" 2>/dev/null || true
+    DIALOG_PID=""
+    choice=$(/bin/cat "$PIN_DECISION" 2>/dev/null || true)
+
+    if [[ "$allow" == retry && "$choice" == retry ]]; then
+        audit_decision "bad-pin-retry" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+        PREVIEW_SUMMARY="$REQUEST_DIR/summary-attempt-$((ATTEMPT + 1)).txt"
+        {
+            printf 'PIN attempt %d: the previous PIN was incorrect (%s).\n\n' "$((ATTEMPT + 1))" "$remaining_text"
+            /bin/cat "$SUMMARY"
+        } > "$PREVIEW_SUMMARY"
+        return 0
+    fi
+
+    audit_decision "bad-pin" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+    if [[ "$remaining" == 0 ]]; then
+        error "incorrect PIN; the key's PIN is now blocked (unblock with the Admin PIN: gpg --card-edit, admin, unblock)"
+    else
+        error "incorrect PIN; signing cancelled ($remaining_text)"
+    fi
+    return 1
 }
 
 append_limited_sanitized() {
@@ -615,94 +703,118 @@ reject_spam_subject
 # The preview is started first and reports readiness; only then is GPG
 # engaged. This ordering means the PIN prompt (pinentry) launches last and
 # stays frontmost and focused instead of appearing behind the preview.
+#
+# A wrong PIN does not end the request: the wrapper shows how many attempts
+# the key has left and, on Try Again, repeats the preview and GPG with the
+# same payload. The lock stays held, so queued requests keep waiting.
 READY="$REQUEST_DIR/ready"
+GPG_STDOUT="$REQUEST_DIR/gpg.stdout"
+PIN_DECISION="$REQUEST_DIR/pin-decision"
 SPAM_ACTION=""
 [[ -s "$SPAM_SUBJECT_FILE" ]] && SPAM_ACTION="mark-spam"
-/usr/bin/osascript -l JavaScript "$UI_HELPER" "$SUMMARY" "$DETAILS" "$DECISION" "$READY" "$SPAM_ACTION" >/dev/null 2>&1 &
-DIALOG_PID=$!
-
-ready_waited=0
-while [[ ! -e "$READY" ]]; do
-    if ! /bin/kill -0 "$DIALOG_PID" 2>/dev/null; then
-        break
-    fi
-    /bin/sleep 0.05
-    ready_waited=$((ready_waited + 1))
-    if [[ "$ready_waited" -ge 100 ]]; then
-        break
-    fi
-done
-
-# Hold the output until the final decision check, so a simultaneous touch and
-# rejection cannot leak a signature to Git.
-"$REAL_GPG" "$@" < "$PAYLOAD" > "$REQUEST_DIR/gpg.stdout" &
-GPG_PID=$!
-CHILD_PID=$GPG_PID
-
-OUTCOME=""
-DECISION_VALUE=""
-GPG_STATUS=0
+PREVIEW_SUMMARY="$SUMMARY"
+ATTEMPT=1
 while :; do
-    if ! /bin/kill -0 "$GPG_PID" 2>/dev/null; then
-        wait "$GPG_PID"
-        GPG_STATUS=$?
-        OUTCOME="signed"
-        break
-    fi
-    if ! /bin/kill -0 "$DIALOG_PID" 2>/dev/null; then
-        wait "$DIALOG_PID" 2>/dev/null || true
-        DIALOG_PID=""
-        DECISION_VALUE=$(/bin/cat "$DECISION" 2>/dev/null || true)
-        OUTCOME="dialog"
-        break
-    fi
-    /bin/sleep 0.1
-done
+    # Each attempt starts with a fresh, unanswered preview.
+    : > "$DECISION"
+    /bin/rm -f "$DECIDING" "$READY" "$GPG_STDOUT"
+    /usr/bin/osascript -l JavaScript "$UI_HELPER" "$PREVIEW_SUMMARY" "$DETAILS" "$DECISION" "$READY" "$SPAM_ACTION" >/dev/null 2>&1 &
+    DIALOG_PID=$!
 
-if [[ "$OUTCOME" == "dialog" ]]; then
-    handle_operator_rejection
-    case "$DECISION_VALUE" in
-        sign)
-            # Explicit approval; the hardware signature may still be pending.
+    ready_waited=0
+    while [[ ! -e "$READY" ]]; do
+        if ! /bin/kill -0 "$DIALOG_PID" 2>/dev/null; then
+            break
+        fi
+        /bin/sleep 0.05
+        ready_waited=$((ready_waited + 1))
+        if [[ "$ready_waited" -ge 100 ]]; then
+            break
+        fi
+    done
+
+    # Hold the output until the final decision check, so a simultaneous touch
+    # and rejection cannot leak a signature to Git.
+    GPG_STDERR="$REQUEST_DIR/gpg.stderr"
+    "$REAL_GPG" "$@" < "$PAYLOAD" > "$GPG_STDOUT" 2> "$GPG_STDERR" &
+    GPG_PID=$!
+    CHILD_PID=$GPG_PID
+
+    OUTCOME=""
+    DECISION_VALUE=""
+    GPG_STATUS=0
+    while :; do
+        if ! /bin/kill -0 "$GPG_PID" 2>/dev/null; then
             wait "$GPG_PID"
             GPG_STATUS=$?
-            CHILD_PID=""
             OUTCOME="signed"
-            ;;
-        *)
-            /bin/kill -s TERM "$GPG_PID" 2>/dev/null || true
-            wait "$GPG_PID" 2>/dev/null || true
-            CHILD_PID=""
-            release_dialog_lock
-            audit_decision "invalid-ui-decision" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
-            error "preview returned no valid decision; refusing to sign"
-            exit 70
-            ;;
-    esac
-fi
+            break
+        fi
+        if ! /bin/kill -0 "$DIALOG_PID" 2>/dev/null; then
+            wait "$DIALOG_PID" 2>/dev/null || true
+            DIALOG_PID=""
+            DECISION_VALUE=$(/bin/cat "$DECISION" 2>/dev/null || true)
+            OUTCOME="dialog"
+            break
+        fi
+        /bin/sleep 0.1
+    done
 
-# Signing completed (GPG finished on its own, or after explicit approval).
-# A rejection already in flight has to land before its writer is terminated.
-await_pending_decision
-# Dismiss the review window if it is still open.
-if [[ -n "$DIALOG_PID" ]] && /bin/kill -0 "$DIALOG_PID" 2>/dev/null; then
-    /bin/kill -s TERM "$DIALOG_PID" 2>/dev/null || true
-    wait "$DIALOG_PID" 2>/dev/null || true
-fi
-DIALOG_PID=""
-CHILD_PID=""
-DECISION_VALUE=$(/bin/cat "$DECISION" 2>/dev/null || true)
-handle_operator_rejection
-if [[ -e "$DECIDING" ]]; then
-    # The operator answered and the answer never arrived. A signature exists,
-    # but not one anybody approved: never release it on an unreadable outcome.
-    release_dialog_lock
-    audit_decision "pending-decision-lost" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
-    error "preview began a decision that never completed; refusing to sign"
-    exit 70
-fi
+    if [[ "$OUTCOME" == "dialog" ]]; then
+        handle_operator_rejection
+        case "$DECISION_VALUE" in
+            sign)
+                # Explicit approval; the hardware signature may still be pending.
+                wait "$GPG_PID"
+                GPG_STATUS=$?
+                CHILD_PID=""
+                OUTCOME="signed"
+                ;;
+            *)
+                /bin/kill -s TERM "$GPG_PID" 2>/dev/null || true
+                wait "$GPG_PID" 2>/dev/null || true
+                CHILD_PID=""
+                release_dialog_lock
+                audit_decision "invalid-ui-decision" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+                error "preview returned no valid decision; refusing to sign"
+                exit 70
+                ;;
+        esac
+    fi
+
+    # Signing completed (GPG finished on its own, or after explicit approval).
+    # A rejection already in flight has to land before its writer is terminated.
+    await_pending_decision
+    # Dismiss the review window if it is still open.
+    if [[ -n "$DIALOG_PID" ]] && /bin/kill -0 "$DIALOG_PID" 2>/dev/null; then
+        /bin/kill -s TERM "$DIALOG_PID" 2>/dev/null || true
+        wait "$DIALOG_PID" 2>/dev/null || true
+    fi
+    DIALOG_PID=""
+    CHILD_PID=""
+    DECISION_VALUE=$(/bin/cat "$DECISION" 2>/dev/null || true)
+    handle_operator_rejection
+    if [[ -e "$DECIDING" ]]; then
+        # The operator answered and the answer never arrived. A signature
+        # exists, but not one anybody approved: never release it on an
+        # unreadable outcome.
+        release_dialog_lock
+        audit_decision "pending-decision-lost" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+        error "preview began a decision that never completed; refusing to sign"
+        exit 70
+    fi
+
+    if [[ "$GPG_STATUS" -ne 0 ]] && bad_pin_failure && offer_pin_retry; then
+        # Drop the failed attempt's output; Git sees only the final attempt.
+        GPG_STDERR=""
+        ATTEMPT=$((ATTEMPT + 1))
+        continue
+    fi
+    break
+done
 release_dialog_lock
-/bin/cat "$REQUEST_DIR/gpg.stdout"
+flush_gpg_stderr
+/bin/cat "$GPG_STDOUT"
 
 if [[ "$GPG_STATUS" -eq 0 ]]; then
     audit_decision "sign" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true

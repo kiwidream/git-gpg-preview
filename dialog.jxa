@@ -75,7 +75,70 @@ function scrollableText(text, width, height) {
     return scroll;
 }
 
+// Wording for the wrong-PIN dialog. `remaining` is the card's PIN retry
+// counter as a decimal string, or 'unknown' when it could not be read.
+function pinErrorText(remaining, allowRetry) {
+    const known = /^[0-9]+$/.test(remaining);
+    const count = known ? Number(remaining) : -1;
+    if (count === 0) {
+        return {
+            title: 'PIN blocked',
+            info: 'Your security key rejected the PIN and has no attempts left, so its PIN is now blocked. ' +
+                'Signing was cancelled. Unblock it with your Admin PIN or reset code: run ' +
+                '`gpg --card-edit`, then `admin`, then `unblock` (or `passwd`).',
+            canRetry: false
+        };
+    }
+    let info = 'Your security key did not accept the PIN. ';
+    if (count === 1) {
+        info += '1 attempt remaining. One more wrong PIN blocks the key\'s PIN until it is unblocked with the Admin PIN.';
+    } else if (known) {
+        info += count + ' attempts remaining before the key blocks its PIN.';
+    } else {
+        info += 'The number of remaining attempts could not be read from the key (most keys block the PIN after 3 wrong attempts).';
+    }
+    if (allowRetry) {
+        info += '\n\nTry Again opens a new, empty PIN prompt. Cancel aborts this signature.';
+    } else {
+        info += '\n\nSigning was cancelled.';
+    }
+    return {title: 'Incorrect PIN', info: info, canRetry: allowRetry};
+}
+
+// Shown by the signer after GPG fails with a wrong PIN. Writes 'retry' only
+// when the user explicitly picks Try Again; anything else is 'cancel'.
+function runPinError(argv) {
+    if (argv.length < 1) {
+        throw new Error('Expected a decision path.');
+    }
+    const decisionPath = argv[0];
+    const remaining = argv.length > 1 ? String(argv[1]) : 'unknown';
+    const text = pinErrorText(remaining, argv.length > 2 && argv[2] === 'retry');
+
+    const pinApp = $.NSApplication.sharedApplication;
+    pinApp.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
+    pinApp.activateIgnoringOtherApps(true);
+
+    const pinAlert = $.NSAlert.alloc.init;
+    pinAlert.alertStyle = $.NSAlertStyleCritical;
+    pinAlert.messageText = text.title;
+    pinAlert.informativeText = text.info;
+    if (text.canRetry) {
+        pinAlert.addButtonWithTitle('Try Again');
+        pinAlert.addButtonWithTitle('Cancel');
+    } else {
+        pinAlert.addButtonWithTitle('OK');
+    }
+    const response = Number(pinAlert.runModal);
+    const retry = text.canRetry && response === Number($.NSAlertFirstButtonReturn);
+    writeDecision(decisionPath, retry ? 'retry' : 'cancel');
+}
+
 function run(argv) {
+    if (argv.length > 0 && argv[0] === '--pin-error') {
+        runPinError(argv.slice(1));
+        return;
+    }
     if (argv.length < 3) {
         throw new Error('Expected summary, details, and decision paths.');
     }

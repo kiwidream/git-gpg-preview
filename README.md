@@ -78,6 +78,17 @@ The preview appears and reports readiness before GPG is engaged, so when a PIN i
 
 There is no **Sign** button: the signature is produced by the hardware confirmation that is already pending while the preview is shown. Touching the key completes signing with the captured bytes and original arguments and dismisses the window. **Cancel** kills GPG before it produces a signature and returns nonzero, so Git aborts.
 
+### Wrong PIN
+
+If your security key rejects the PIN, the request does not fail straight away. The wrapper reads how many PIN attempts the key has left (`gpg --card-status`) and shows an **Incorrect PIN** dialog with that number:
+
+- **Try Again** shows the preview again, with a line saying which attempt this is and how many remain, and starts GPG again with the same captured payload. That opens a new pinentry, so the PIN box is empty and the wrong PIN cannot be submitted twice by accident.
+- **Cancel** ends the request; Git receives GPG's `Bad PIN` failure.
+- When the key reports no attempts left, the dialog says the PIN is blocked and offers only **OK**. Unblock it with the Admin PIN or reset code (`gpg --card-edit`, then `admin`, then `unblock`).
+- If the counter cannot be read, a request allows three attempts in total.
+
+The dialog lock stays held across retries, so other queued signing requests wait instead of failing. Audit entries record `bad-pin-retry` for each retry and `bad-pin` when the request stops after a wrong PIN. Only card PIN failures are retried; gpg-agent already re-prompts for a wrong software-key passphrase. Remote signing does not retry yet: a wrong PIN fails that remote commit.
+
 For commits, **Mark as Spam** cancels signing and remembers the first non-empty
 subject line. Future commits with that exact subject are rejected before the
 preview or GPG starts, across repositories and requesting hosts. Matching ignores
@@ -212,7 +223,7 @@ GnuPG round trip with a disposable key when `gpg` is installed.
 
 A signing request is rejected before GPG runs when the real-GPG path or UI helper is missing, a recognized commit/tag payload cannot be safely parsed against available Git objects, or a secure temporary area cannot be created. Once the preview and GPG are engaged, a **Cancel** decision, a preview process that exits without approval, or any outcome other than a completed signature kills GPG before it produces a signature. Unknown signing formats still receive a clearly labeled exact-payload review.
 
-Non-signing operations require a valid real-GPG configuration too; when configured correctly, they use `exec` for transparent argument, descriptor, signal, stdout/stderr, and exit behavior. For signing, stderr remains connected directly to GPG; stdout is held in a private request file until the final dialog decision is checked, so a simultaneous touch and cancellation or spam mark cannot return a signature to Git. Because the preview is terminated as soon as GPG exits, a decision could otherwise be cut off before it reaches that file: the preview therefore records a marker the instant a rejection is chosen, and a marked request waits up to two seconds for the decision itself and refuses to sign if it never lands. An outcome that cannot be read is never treated as approval. The wrapper propagates GPG's exact exit code and forwards termination signals. The wrapper never writes UI or diagnostic text to stdout because Git expects the detached signature there.
+Non-signing operations require a valid real-GPG configuration too; when configured correctly, they use `exec` for transparent argument, descriptor, signal, stdout/stderr, and exit behavior. For signing, GPG's stderr is held per attempt and forwarded once the request ends, so a wrong-PIN attempt that is retried never reaches Git; stdout is held in a private request file until the final dialog decision is checked, so a simultaneous touch and cancellation or spam mark cannot return a signature to Git. Because the preview is terminated as soon as GPG exits, a decision could otherwise be cut off before it reaches that file: the preview therefore records a marker the instant a rejection is chosen, and a marked request waits up to two seconds for the decision itself and refuses to sign if it never lands. An outcome that cannot be read is never treated as approval. The wrapper propagates GPG's exact exit code and forwards termination signals. The wrapper never writes UI or diagnostic text to stdout because Git expects the detached signature there.
 
 ## Threat model and limitations
 
@@ -256,7 +267,7 @@ The uninstaller restores all previously recorded `gpg.openpgp.program` values, o
 
 ## Tests
 
-`./tests/run.sh` uses a fake GPG and a noninteractive fake dialog in an isolated home directory. It covers normal and initial commits, merge commits, annotated tags, push certificates, unknown/binary payloads, hostile Unicode content, fixture-style subject and identity rejection, near-misses, and the override, cancellation, verification pass-through, GPG failure status, stdout purity, exact stdin/argument forwarding, concurrent queueing, stale lock recovery, safe diff options, and audit logging.
+`./tests/run.sh` uses a fake GPG and a noninteractive fake dialog in an isolated home directory. It covers normal and initial commits, merge commits, annotated tags, push certificates, unknown/binary payloads, hostile Unicode content, fixture-style subject and identity rejection, near-misses, and the override, cancellation, verification pass-through, GPG failure status, stdout purity, wrong-PIN retry, cancellation and PIN-blocked handling, exact stdin/argument forwarding, concurrent queueing, stale lock recovery, safe diff options, and audit logging.
 
 ## License
 

@@ -16,13 +16,28 @@ function modalResponse(alert) {
     return responses.shift();
 }
 
+var pinResponses = [];
+var expectedPinButtons = [];
+function pinModalResponse(alert) {
+    const buttons = alert.buttons;
+    const titles = [];
+    for (let i = 0; i < Number(buttons.count); i++) titles.push(ObjC.unwrap(buttons.objectAtIndex(i).title));
+    if (titles.join('|') !== expectedPinButtons.join('|')) throw new Error('Unexpected PIN buttons: ' + titles.join('|'));
+    if (!pinResponses.length) throw new Error('Unexpected extra PIN modal');
+    lastPinText = ObjC.unwrap(alert.informativeText);
+    return pinResponses.shift();
+}
+var lastPinText = '';
+
 function run(argv) {
     const source = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null));
     const substitutions = [
         ['function run(argv)', 'function runPreview(argv)'],
         ['app.activateIgnoringOtherApps(true);', ''],
         ['Number(alert.runModal)', 'modalResponse(alert)'],
-        ['Number(detailAlert.runModal)', 'modalResponse(detailAlert)']
+        ['Number(detailAlert.runModal)', 'modalResponse(detailAlert)'],
+        ['pinApp.activateIgnoringOtherApps(true);', ''],
+        ['Number(pinAlert.runModal)', 'pinModalResponse(pinAlert)']
     ];
     let instrumented = source;
     substitutions.forEach(function(pair) {
@@ -57,5 +72,22 @@ function run(argv) {
         if (responses.length || modalCount !== test.responses.length) throw new Error('Wrong modal sequence');
         if (!$.NSFileManager.defaultManager.fileExistsAtPath(ready)) throw new Error('Readiness missing');
     });
-    return 'Dialog actions passed (7 cases)';
+    // Wrong-PIN dialog: Try Again only while attempts remain and the signer allows it.
+    [
+        {args: ['2', 'retry'], buttons: ['Try Again', 'Cancel'], response: 1000, decision: 'retry', text: '2 attempts remaining'},
+        {args: ['2', 'retry'], buttons: ['Try Again', 'Cancel'], response: 1001, decision: 'cancel', text: '2 attempts remaining'},
+        {args: ['1', 'retry'], buttons: ['Try Again', 'Cancel'], response: 1000, decision: 'retry', text: '1 attempt remaining'},
+        {args: ['unknown', 'retry'], buttons: ['Try Again', 'Cancel'], response: 1000, decision: 'retry', text: 'could not be read'},
+        {args: ['0', 'retry'], buttons: ['OK'], response: 1000, decision: 'cancel', text: 'PIN is now blocked'},
+        {args: ['unknown', 'final'], buttons: ['OK'], response: 1000, decision: 'cancel', text: 'Signing was cancelled'}
+    ].forEach(function(test) {
+        $.NSData.data.writeToFileAtomically(decision, true);
+        expectedPinButtons = test.buttons;
+        pinResponses = [test.response];
+        runPreview(['--pin-error', decision].concat(test.args));
+        if (readText(decision) !== test.decision) throw new Error('Wrong PIN decision for ' + test.args.join(' '));
+        if (pinResponses.length) throw new Error('PIN modal not shown');
+        if (lastPinText.indexOf(test.text) < 0) throw new Error('PIN text missing "' + test.text + '"');
+    });
+    return 'Dialog actions passed (13 cases)';
 }

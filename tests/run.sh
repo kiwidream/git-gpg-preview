@@ -298,7 +298,78 @@ unset FAKE_GPG_EXIT
 [[ "$failure_status" -eq 42 ]] || fail "GPG exit status changed ($failure_status)"
 [[ $(<"$TMP/failure.stdout") == 'gpg-failure-output' ]] || fail 'GPG failure stdout changed'
 assert_forwarded "$TMP/commit.payload"
+! grep -q '^pin-error' "$FAKE_DIALOG_LOG" || fail 'non-PIN GPG failure offered a PIN retry'
 pass 'GPG failure and exact exit code propagation'
+
+# Wrong PIN, then Try Again: the preview comes back with the attempt count,
+# a fresh GPG run signs, and Git sees only the successful attempt's stderr.
+reset_pin_state() {
+    rm -f "$FAKE_TOUCH_FILE".* "$FAKE_GPG_CALL_DIR/bad-pin-calls" "$FAKE_GPG_CALL_DIR/card-status-calls" "$TMP/captures"/*
+    : > "$FAKE_DIALOG_LOG"
+    : > "$TMP/audit.log"
+}
+reset_pin_state
+export FAKE_GPG_STDOUT='signature-after-retry'
+export FAKE_PIN_RETRIES=3 FAKE_GPG_BAD_PINS=1 FAKE_PIN_ERROR_DECISION=retry
+before=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
+pin_output=$("$ROOT/git-gpg-preview" --status-fd=2 -bsau TEST < "$TMP/commit.payload" 2>"$TMP/pin.stderr")
+after=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
+[[ "$pin_output" == 'signature-after-retry' ]] || fail 'PIN retry did not return the signature'
+[[ $((after - before)) -eq 1 ]] || fail 'PIN retry did not sign exactly once'
+assert_forwarded "$TMP/commit.payload"
+[[ $(wc -l < "$FAKE_GPG_CALL_DIR/bad-pin-calls") -eq 1 ]] || fail 'PIN retry attempt count'
+grep -qx 'pin-error 2 retry' "$FAKE_DIALOG_LOG" || fail 'PIN error dialog did not show 2 remaining attempts'
+[[ $(grep -c '^start ' "$FAKE_DIALOG_LOG") -eq 2 ]] || fail 'preview was not shown again for the retry'
+grep -lq 'PIN attempt 2: the previous PIN was incorrect (2 PIN attempts remaining)' "$TMP/captures"/*.summary \
+    || fail 'retry preview did not show the attempt and remaining count'
+! grep -q 'Bad PIN' "$TMP/pin.stderr" || fail 'retried attempt leaked its failure to Git'
+grep -q 'decision=bad-pin-retry' "$TMP/audit.log" || fail 'PIN retry not audited'
+grep -q 'decision=sign$' "$TMP/audit.log" || fail 'signature after PIN retry not audited'
+pass 'wrong PIN shows remaining attempts and signs on Try Again'
+
+# Wrong PIN, then Cancel in the error dialog: GPG's failure reaches Git.
+reset_pin_state
+export FAKE_PIN_ERROR_DECISION=cancel
+before=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
+set +e
+pin_output=$("$ROOT/git-gpg-preview" --status-fd=2 -bsau TEST < "$TMP/commit.payload" 2>"$TMP/pin.stderr")
+pin_status=$?
+set -e
+after=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
+[[ "$pin_status" -eq 2 && -z "$pin_output" ]] || fail "cancelled PIN retry status/stdout ($pin_status)"
+[[ "$before" -eq "$after" ]] || fail 'cancelled PIN retry signed'
+[[ $(wc -l < "$FAKE_GPG_CALL_DIR/bad-pin-calls") -eq 1 ]] || fail 'cancelled PIN retry ran GPG again'
+grep -q 'signing failed: Bad PIN' "$TMP/pin.stderr" || fail 'final GPG failure not forwarded to Git'
+grep -q 'incorrect PIN; signing cancelled (2 PIN attempts remaining)' "$TMP/pin.stderr" || fail 'cancel message'
+grep -q 'decision=bad-pin$' "$TMP/audit.log" || fail 'cancelled PIN retry not audited'
+pass 'Cancel after a wrong PIN fails with the GPG error'
+
+# Every PIN wrong: retry until the card reports 0, then say it is blocked.
+reset_pin_state
+export FAKE_PIN_RETRIES=2 FAKE_GPG_BAD_PINS=99 FAKE_PIN_ERROR_DECISION=retry
+set +e
+pin_output=$("$ROOT/git-gpg-preview" --status-fd=2 -bsau TEST < "$TMP/commit.payload" 2>"$TMP/pin.stderr")
+pin_status=$?
+set -e
+[[ "$pin_status" -eq 2 && -z "$pin_output" ]] || fail "blocked PIN status/stdout ($pin_status)"
+[[ $(wc -l < "$FAKE_GPG_CALL_DIR/bad-pin-calls") -eq 2 ]] || fail 'retried past the card retry counter'
+[[ $(grep '^pin-error' "$FAKE_DIALOG_LOG") == $'pin-error 1 retry\npin-error 0 final' ]] || fail 'blocked PIN dialog sequence'
+grep -q 'PIN is now blocked' "$TMP/pin.stderr" || fail 'blocked PIN not reported'
+pass 'wrong PINs stop when the key reports its PIN blocked'
+
+# No readable retry counter: allow three attempts in total, then stop.
+reset_pin_state
+unset FAKE_PIN_RETRIES
+set +e
+"$ROOT/git-gpg-preview" --status-fd=2 -bsau TEST < "$TMP/commit.payload" > /dev/null 2>"$TMP/pin.stderr"
+pin_status=$?
+set -e
+[[ "$pin_status" -eq 2 ]] || fail "unknown-counter PIN status ($pin_status)"
+[[ $(wc -l < "$FAKE_GPG_CALL_DIR/bad-pin-calls") -eq 3 ]] || fail 'unknown-counter attempt limit'
+[[ $(grep '^pin-error' "$FAKE_DIALOG_LOG") == $'pin-error unknown retry\npin-error unknown retry\npin-error unknown final' ]] \
+    || fail 'unknown-counter dialog sequence'
+pass 'unreadable PIN counter limits a request to three attempts'
+unset FAKE_GPG_BAD_PINS FAKE_PIN_ERROR_DECISION
 
 export FAKE_GPG_STDOUT=''
 export FAKE_GPG_SIGNAL=TERM
@@ -457,7 +528,7 @@ export FAKE_DIALOG_DECISION=sign
 pass 'spam persistence failure cancels signing and reports that the rule was not saved'
 
 /usr/bin/osascript -l JavaScript "$ROOT/tests/dialog.jxa" "$ROOT/dialog.jxa" "$TMP"
-pass 'AppKit main and detail dialogs dispatch spam/cancel and preserve legacy callers'
+pass 'AppKit main and detail dialogs dispatch spam/cancel, wrong-PIN retry, and preserve legacy callers'
 
 INSTALL_TEST="$TMP/install-home"
 mkdir -p "$INSTALL_TEST"
