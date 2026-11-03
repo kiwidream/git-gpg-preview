@@ -319,9 +319,9 @@ bad_pin_failure() {
 }
 
 # Runs a read-only GPG query into a file. Bounded, so a wedged card or agent
-# cannot hold the dialog lock forever.
+# cannot hold the dialog lock forever. Fails when GPG fails or is cut off.
 run_gpg_query() {
-    local output="$1" pid waited=0
+    local output="$1" pid waited=0 status=0
     shift
     "$REAL_GPG" --batch "$@" < /dev/null > "$output" 2>/dev/null 4>&- &
     pid=$!
@@ -334,8 +334,9 @@ run_gpg_query() {
             break
         fi
     done
-    wait "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || status=$?
     CHILD_PID=""
+    return "$status"
 }
 
 # The card's remaining PIN (PW1) attempts, or nothing when it cannot be read.
@@ -344,17 +345,78 @@ card_pin_retries() {
     /usr/bin/awk -F: '$1 == "pinretry" && $2 ~ /^[0-9]+$/ { print $2 + 0; exit }' "$REQUEST_DIR/card-status" 2>/dev/null
 }
 
-# Whether the requested key signs with a key stored on a card. Field 15 of a
-# secret key line holds the card serial number for such keys. Software keys
-# keep gpg-agent's pinentry, which re-prompts for a wrong passphrase itself
-# and has no minimum length.
+# The key GPG will sign with, judged from a --with-colons secret key listing:
+# "<fingerprint> card" or "<fingerprint> software", or nothing when no key
+# can sign. A selector ending in ! names that exact primary key or subkey.
+# Any other selector, a subkey's own fingerprint included, takes the first
+# matching certificate that can sign, and from it the newest usable signing
+# subkey, or the primary key when no subkey can sign: GnuPG 2.2's choice.
+# GnuPG 2.3 and later rank a key on a card above a software key whose
+# passphrase is not cached, so whenever this picks a card key, GPG signs with
+# a card key or asks for nothing. Any other pick keeps pinentry, which
+# handles both. A listing always shows whole certificates, so the other keys
+# in it never decide.
+selected_signing_key() {
+    local exact=""
+    if [[ "$2" == *! ]]; then
+        exact=${2%!}
+        exact=${exact// /}
+        exact=${exact#0[xX]}
+    fi
+    /usr/bin/awk -F: -v exact="$exact" -v now="$(/bin/date +%s)" '
+        # Never an invalid, revoked or expired key (a primary key passes its
+        # state on to its subkeys) or a stub without its secret part.
+        function usable(i) { return valid[i] !~ /^[eri]$/ && caps[i] ~ /s/ && token[i] != "#" }
+        function kind(i) { return token[i] != "" && token[i] != "+" ? "card" : "software" }
+        function named(f,    e) {
+            e = toupper(exact)
+            if (e !~ /^[0-9A-F]+$/) return 0
+            if (length(e) == length(f)) return e == f
+            if (length(e) != 8 && length(e) != 16) return 0
+            # A v4 key ID ends the fingerprint; a v5 key ID starts it.
+            if (length(f) == 64) return substr(f, 1, length(e)) == e
+            return substr(f, length(f) - length(e) + 1) == e
+        }
+        function decide(    i, best, unclear) {
+            for (i = 2; i <= n; i++) {
+                if (!usable(i)) continue
+                # GPG skips a subkey from the future unless ignore-valid-from is set.
+                if (created[i] + 0 > now + 0) unclear = 1
+                if (!best || created[i] + 0 > created[best] + 0) best = i
+            }
+            if (!best && usable(1)) best = 1
+            if (!best) return
+            finished = 1
+            if (!unclear) print fpr[best], kind(best)
+            exit
+        }
+        $1 == "sec" { if (n && exact == "") decide(); n = 0 }
+        $1 == "sec" || $1 == "ssb" {
+            n++; valid[n] = $2; created[n] = $6; caps[n] = $12; token[n] = $15; fpr[n] = "-"; key = n
+            next
+        }
+        $1 == "fpr" && key {
+            fpr[key] = toupper($10)
+            if (exact != "" && named(fpr[key]) && usable(key)) {
+                finished = 1
+                print fpr[key], kind(key)
+                exit
+            }
+        }
+        { key = 0 }
+        END { if (!finished && n && exact == "") decide() }
+    ' "$1" 2>/dev/null
+}
+
+# Whether the key GPG will sign with is stored on a card. Software keys keep
+# gpg-agent's pinentry, which re-prompts for a wrong passphrase itself and has
+# no minimum length. So does a request naming more than one key, since -u
+# wins over --default-key and every -u key signs, and a listing that failed
+# or was cut off, since a missing key could be the one GPG picks.
 signing_key_on_card() {
-    [[ "$KEY_SELECTOR" != "(not supplied)" ]] || return 1
-    run_gpg_query "$REQUEST_DIR/secret-keys" --with-colons --list-secret-keys -- "$KEY_SELECTOR"
-    /usr/bin/awk -F: '
-        ($1 == "sec" || $1 == "ssb") && $12 ~ /s/ && $15 != "" && $15 != "+" && $15 != "#" { found = 1 }
-        END { exit found ? 0 : 1 }
-    ' "$REQUEST_DIR/secret-keys" 2>/dev/null
+    [[ "$KEY_SELECTORS" -eq 1 ]] || return 1
+    run_gpg_query "$REQUEST_DIR/secret-keys" --with-colons --list-secret-keys -- "$KEY_SELECTOR" || return 1
+    [[ "$(selected_signing_key "$REQUEST_DIR/secret-keys" "$KEY_SELECTOR")" == *" card" ]]
 }
 
 # The wrapper's own PIN window replaces gpg-agent's pinentry when the key is
@@ -374,6 +436,7 @@ uses_builtin_pin_entry() {
             --status-fd=2) status_on_stderr=1 ;;
             --status-fd) expect_status_fd=1 ;;
             --pinentry-mode|--pinentry-mode=*|--command-fd|--command-fd=*|--command-file*|--passphrase*) return 1 ;;
+            --homedir|--homedir=*|--keyring|--keyring=*|--no-default-keyring|--options|--options=*) return 1 ;;
             --) break ;;
         esac
     done
@@ -596,16 +659,18 @@ elif branch_value=$(git --no-pager rev-parse --short HEAD 2>/dev/null); then
 fi
 
 KEY_SELECTOR="(not supplied)"
+KEY_SELECTORS=0
 expect_key=0
 for arg in "$@"; do
     if [[ "$expect_key" -eq 1 ]]; then
         KEY_SELECTOR=$arg
+        KEY_SELECTORS=$((KEY_SELECTORS + 1))
         expect_key=0
         continue
     fi
     case "$arg" in
         -u|--local-user|--default-key) expect_key=1 ;;
-        --local-user=*|--default-key=*) KEY_SELECTOR=${arg#*=} ;;
+        --local-user=*|--default-key=*) KEY_SELECTOR=${arg#*=}; KEY_SELECTORS=$((KEY_SELECTORS + 1)) ;;
         -[!-]*u) expect_key=1 ;;
     esac
 done
