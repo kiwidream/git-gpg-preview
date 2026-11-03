@@ -361,6 +361,22 @@ run_pin_case --status-fd=2 -bsau TEST
     || fail "a stale PIN reached the next attempt: $(tr '\n' ' ' < "$FAKE_GPG_CALL_DIR/pins-received")"
 pass 'each attempt reads the PIN from a new pipe'
 
+# A yes/no question on the PIN pipe cannot be answered: fail fast, not hang.
+reset_pin_state
+export FAKE_GPG_ASK='GET_BOOL cardctrl.insert_card.okay'
+before=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
+started=$SECONDS
+run_pin_case --status-fd=2 -bsau TEST
+after=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
+unset FAKE_GPG_ASK
+[[ "$pin_status" -eq 70 && -z "$pin_output" ]] || fail "unanswerable GPG prompt status ($pin_status)"
+[[ $((SECONDS - started)) -lt 10 ]] || fail 'unanswerable GPG prompt waited for a timeout'
+[[ "$before" -eq "$after" ]] || fail 'unanswerable GPG prompt signed'
+grep -q 'cannot answer (GET_BOOL cardctrl.insert_card.okay)' "$TMP/pin.stderr" || fail 'unanswerable prompt message'
+grep -q 'decision=unanswerable-gpg-prompt$' "$TMP/audit.log" || fail 'unanswerable prompt not audited'
+[[ -z $(pin_dialogs) ]] || fail 'PIN window shown for a non-PIN question'
+pass 'a non-PIN GPG question fails fast instead of hanging'
+
 # Cancel in the PIN window is the operator cancelling: nothing is signed.
 reset_pin_state
 export FAKE_PIN_ENTRIES=CANCEL

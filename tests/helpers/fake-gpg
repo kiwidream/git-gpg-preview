@@ -80,7 +80,12 @@ done
 # Loopback path (--command-fd): when FAKE_GPG_PIN is set, ask for the PIN on
 # the status fd like real GPG and compare what arrives on the command fd.
 if [[ "$signing" -eq 1 && "$verify" -eq 0 ]]; then
-    if [[ -n "$command_fd" && -n "${FAKE_GPG_PIN-}" ]]; then
+    if [[ -n "$command_fd" && -n "${FAKE_GPG_ASK-}" ]]; then
+        # A non-PIN question on the command fd, e.g. "GET_BOOL cardctrl...".
+        printf '[GNUPG:] %s\n' "$FAKE_GPG_ASK" >&2
+        IFS= read -r -t 20 answer <&"$command_fd" || { printf 'fake-gpg: no answer\n' >&2; exit 2; }
+        exit 2
+    elif [[ -n "$command_fd" && -n "${FAKE_GPG_PIN-}" ]]; then
         printf '[GNUPG:] INQUIRE_MAXLEN 100\n[GNUPG:] GET_HIDDEN passphrase.enter\n' >&2
         pin=""
         IFS= read -r -t 20 pin <&"$command_fd" || { printf 'fake-gpg: no PIN\n' >&2; exit 2; }

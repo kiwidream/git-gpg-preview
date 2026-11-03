@@ -30,6 +30,7 @@ CHILD_PID=""
 DIALOG_PID=""
 GPG_STDERR=""
 PIN_DIALOG_PID=""
+UNANSWERABLE_PROMPT=""
 # builtin: the wrapper's own PIN window (GnuPG loopback). pinentry: gpg-agent's.
 PIN_PROMPT="builtin"
 # Upper bound on PIN attempts per request, even when the card reports more.
@@ -388,8 +389,10 @@ dismiss_pin_entry() {
 }
 
 # Called while GPG runs. Opens the PIN window when GPG asks for the PIN.
-# Fails when the window closed without sending a PIN, because GPG would
-# otherwise wait for one forever.
+# Fails when the window closed without sending a PIN, or when GPG asks a
+# yes/no or text question on the PIN pipe (in loopback mode an agent prompt
+# such as "insert card" arrives this way), because GPG would otherwise wait
+# forever for an answer only the PIN window could give.
 poll_pin_entry() {
     if [[ -n "$PIN_DIALOG_PID" ]]; then
         /bin/kill -0 "$PIN_DIALOG_PID" 2>/dev/null && return 0
@@ -398,7 +401,12 @@ poll_pin_entry() {
         [[ "$(/bin/cat "$PIN_RESULT" 2>/dev/null)" == entered ]]
         return
     fi
-    local asked
+    local asked question
+    question=$(/usr/bin/sed -nE 's/^\[GNUPG:\] (GET_BOOL|GET_LINE) ([A-Za-z0-9._-]*).*/\1 \2/p' "$GPG_STDERR" 2>/dev/null | /usr/bin/head -n 1)
+    if [[ -n "$question" ]]; then
+        UNANSWERABLE_PROMPT=$question
+        return 1
+    fi
     asked=$(/usr/bin/grep -c '^\[GNUPG:\] GET_HIDDEN passphrase\.enter$' "$GPG_STDERR" 2>/dev/null) || asked=0
     if [[ "$asked" -gt "$PIN_PROMPTS_SHOWN" ]]; then
         PIN_PROMPTS_SHOWN=$asked
@@ -917,6 +925,16 @@ while :; do
         esac
     fi
 
+    if [[ "$OUTCOME" == "pin-window" && -n "$UNANSWERABLE_PROMPT" ]]; then
+        /bin/kill -s TERM "$GPG_PID" 2>/dev/null || true
+        wait "$GPG_PID" 2>/dev/null || true
+        CHILD_PID=""
+        release_dialog_lock
+        audit_decision "unanswerable-gpg-prompt" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+        error "GPG asked a question the PIN window cannot answer ($UNANSWERABLE_PROMPT); refusing to sign"
+        error "check that the security key is inserted, or set pin_prompt=pinentry in $CONFIG_FILE"
+        exit 70
+    fi
     if [[ "$OUTCOME" == "pin-window" ]]; then
         if [[ "$(/bin/cat "$PIN_RESULT" 2>/dev/null)" == cancel ]]; then
             # Same as Cancel in the preview: GPG is stopped before signing.
