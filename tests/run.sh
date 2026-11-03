@@ -352,6 +352,15 @@ grep -q 'decision=bad-pin-retry' "$TMP/audit.log" || fail 'PIN retry not audited
 grep -q 'decision=sign$' "$TMP/audit.log" || fail 'signature after PIN retry not audited'
 pass 'wrong PIN shows remaining attempts and signs on Try Again'
 
+# A PIN left unread when an attempt ends must not reach the next attempt.
+reset_pin_state
+export FAKE_PIN_ENTRIES=654321+111111,123456 FAKE_PIN_ERROR_DECISION=retry
+run_pin_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 0 ]] || fail "stale PIN case did not sign ($pin_status)"
+[[ $(<"$FAKE_GPG_CALL_DIR/pins-received") == $'654321\n123456' ]] \
+    || fail "a stale PIN reached the next attempt: $(tr '\n' ' ' < "$FAKE_GPG_CALL_DIR/pins-received")"
+pass 'each attempt reads the PIN from a new pipe'
+
 # Cancel in the PIN window is the operator cancelling: nothing is signed.
 reset_pin_state
 export FAKE_PIN_ENTRIES=CANCEL

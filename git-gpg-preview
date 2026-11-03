@@ -808,14 +808,7 @@ GPG_ARGS=("$@")
 BUILTIN_PIN=0
 if uses_builtin_pin_entry "$@"; then
     BUILTIN_PIN=1
-    PIN_CHANNEL="$REQUEST_DIR/pin-channel"
     PIN_RESULT="$REQUEST_DIR/pin-result"
-    # A pipe, so the PIN only ever exists in memory. The wrapper keeps it open
-    # so GPG never reads end-of-file before the PIN window has answered.
-    if ! /usr/bin/mkfifo -m 600 "$PIN_CHANNEL" || ! exec 4<>"$PIN_CHANNEL"; then
-        error "could not create the PIN channel; refusing to sign"
-        exit 70
-    fi
     GPG_ARGS=(--pinentry-mode loopback --command-fd 3 "$@")
 fi
 ATTEMPT=1
@@ -823,6 +816,19 @@ while :; do
     # Each attempt starts with a fresh, unanswered preview.
     : > "$DECISION"
     /bin/rm -f "$DECIDING" "$READY" "$GPG_STDOUT"
+    if [[ "$BUILTIN_PIN" -eq 1 ]]; then
+        # A pipe, so the PIN only ever exists in memory. The wrapper keeps it
+        # open so GPG never reads end-of-file before the PIN window answers.
+        # Each attempt gets a new pipe: a PIN sent as the previous attempt
+        # ended must never be read by the next attempt's GPG.
+        exec 4>&-
+        [[ -z "${PIN_CHANNEL:-}" ]] || /bin/rm -f "$PIN_CHANNEL"
+        PIN_CHANNEL="$REQUEST_DIR/pin-channel-$ATTEMPT"
+        if ! /usr/bin/mkfifo -m 600 "$PIN_CHANNEL" || ! exec 4<>"$PIN_CHANNEL"; then
+            error "could not create the PIN channel; refusing to sign"
+            exit 70
+        fi
+    fi
     PIN_PROMPTS_SHOWN=0
     PIN_REMAINING_BEFORE=""
     if [[ "$BUILTIN_PIN" -eq 1 ]]; then

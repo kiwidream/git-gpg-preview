@@ -48,8 +48,9 @@ function run(argv) {
             write(argv[2], 'cancel');
             return;
         }
+        // "a+b" sends two lines, like a PIN that lands as its attempt ends.
         const handle = $.NSFileHandle.fileHandleForWritingAtPath(argv[1]);
-        handle.writeData($.NSString.stringWithString(pin + '\n').dataUsingEncoding($.NSUTF8StringEncoding));
+        handle.writeData($.NSString.stringWithString(pin.split('+').join('\n') + '\n').dataUsingEncoding($.NSUTF8StringEncoding));
         handle.closeFile;
         write(argv[2], 'entered');
         return;
