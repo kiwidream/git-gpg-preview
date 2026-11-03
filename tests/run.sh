@@ -472,6 +472,87 @@ cmp -s "$TMP/expected.args" "$FAKE_GPG_CALL_DIR/$(latest_call).args" || fail 'so
 unset FAKE_KEY_TOKEN
 pass 'software signing keys keep the pinentry path'
 
+# A listing shows whole certificates whatever the selector, so only the key GPG
+# will sign with may switch to the PIN window: the exact key a trailing ! names,
+# else the first certificate's newest usable signing subkey, else its primary
+# key. GnuPG 2.3 and later may prefer an older card subkey; pinentry handles it.
+CARD=D2760001240100000006000000010000
+PRIMARY=AAAA000000000000000000000000000000000001
+CARD_SUB=AAAA000000000000000000000000000000000002
+SOFT_SUB=AAAA000000000000000000000000000000000003
+OTHER=BBBB000000000000000000000000000000000001
+OTHER_CARD=BBBB000000000000000000000000000000000002
+V5_CARD=CCCC000000000000000000000000000000000000000000000000000000000002
+export FAKE_SECRET_KEYS="$TMP/secret-keys" FAKE_GPG_STDOUT='signature-selected-key'
+# One certificate: primary fingerprint, capabilities and field 15, then the
+# fingerprint, validity, creation time and field 15 of each signing subkey.
+secret_keys() {
+    printf 'sec:u:255:22:%s:100::::::%s:::%s:::ed25519:::0:\nfpr:::::::::%s:\n' "${1:24:16}" "$2" "$3" "$1"
+    shift 3
+    while [[ "$#" -ge 4 ]]; do
+        printf 'ssb:%s:255:22:%s:%s::::::s:::%s:::ed25519::\nfpr:::::::::%s:\n' "$2" "${1:24:16}" "$3" "$4" "$1"
+        shift 4
+    done
+}
+assert_key_path() {
+    local label="$1" mode="$2"
+    shift 2
+    reset_pin_state
+    run_pin_case --status-fd=2 -bsau "$@"
+    [[ "$pin_status" -eq 0 && "$pin_output" == 'signature-selected-key' ]] || fail "$label: signing ($pin_status)"
+    if [[ "$mode" == window ]]; then
+        printf '%s\0' --pinentry-mode loopback --command-fd 3 --status-fd=2 -bsau "$@" > "$TMP/expected.args"
+    else
+        printf '%s\0' --status-fd=2 -bsau "$@" > "$TMP/expected.args"
+    fi
+    cmp -s "$TMP/expected.args" "$FAKE_GPG_CALL_DIR/$(latest_call).args" || fail "$label: expected the $mode path"
+}
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 200 "$CARD" "$SOFT_SUB" u 300 + > "$FAKE_SECRET_KEYS"
+assert_key_path 'newest subkey in software' pinentry TEST
+assert_key_path 'older card subkey named with !' window "$CARD_SUB!"
+assert_key_path 'card key ID named with !' window "0x${CARD_SUB:24}!"
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" "$SOFT_SUB" u 200 + > "$FAKE_SECRET_KEYS"
+assert_key_path 'newest subkey on the card' window TEST
+assert_key_path 'software subkey named with !' pinentry "$SOFT_SUB!"
+assert_key_path 'software subkey named without !' window "$SOFT_SUB"
+# Expired subkeys and stubs never sign; a tie goes to the first listed.
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" e 300 "$CARD" "$SOFT_SUB" u 200 + > "$FAKE_SECRET_KEYS"
+assert_key_path 'expired card subkey' pinentry TEST
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 200 "$CARD" "$SOFT_SUB" u 300 '#' > "$FAKE_SECRET_KEYS"
+assert_key_path 'newer subkey without its secret' window TEST
+assert_key_path 'card short key ID named with !' window "${CARD_SUB:32}!"
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" "$SOFT_SUB" u 300 + > "$FAKE_SECRET_KEYS"
+assert_key_path 'card subkey listed first at the same time' window TEST
+secret_keys "$PRIMARY" cSC '' "$SOFT_SUB" u 300 '' > "$FAKE_SECRET_KEYS"
+assert_key_path 'software key with an empty token field' pinentry TEST
+# A subkey from the future signs only under ignore-valid-from: unclear, so pinentry.
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 200 "$CARD" "$SOFT_SUB" u 4102444800 + > "$FAKE_SECRET_KEYS"
+assert_key_path 'software subkey from the future' pinentry TEST
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 4102444800 "$CARD" "$SOFT_SUB" u 200 + > "$FAKE_SECRET_KEYS"
+assert_key_path 'card subkey from the future' pinentry TEST
+# The primary key signs only when no subkey can; a disabled certificate still signs.
+secret_keys "$PRIMARY" scSCD + "$CARD_SUB" u 300 "$CARD" > "$FAKE_SECRET_KEYS"
+assert_key_path 'software primary with a card subkey' window TEST
+assert_key_path 'software primary named with !' pinentry "$PRIMARY!"
+# The first certificate that can sign decides.
+{ secret_keys "$PRIMARY" cSC + "$SOFT_SUB" e 300 +; secret_keys "$OTHER" cSC + "$OTHER_CARD" u 200 "$CARD"; } > "$FAKE_SECRET_KEYS"
+assert_key_path 'second certificate when the first cannot sign' window TEST
+{ secret_keys "$PRIMARY" scSC +; secret_keys "$OTHER" cSC + "$OTHER_CARD" u 200 "$CARD"; } > "$FAKE_SECRET_KEYS"
+assert_key_path 'first certificate that can sign' pinentry TEST
+# A v5 key ID starts its fingerprint.
+secret_keys "$PRIMARY" cSC + "$V5_CARD" u 300 "$CARD" "$SOFT_SUB" u 400 + > "$FAKE_SECRET_KEYS"
+assert_key_path 'v5 card key ID named with !' window "${V5_CARD:0:16}!"
+# A failed listing, more than one key, or the caller's own keyring: pinentry.
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" > "$FAKE_SECRET_KEYS"
+assert_key_path 'card subkey alone' window TEST
+export FAKE_SECRET_KEYS_STATUS=2
+assert_key_path 'listing that failed' pinentry TEST
+unset FAKE_SECRET_KEYS_STATUS
+assert_key_path 'a second key named with --default-key' pinentry TEST --default-key OTHER
+assert_key_path 'the caller'"'"'s own home directory' pinentry TEST --homedir "$TMP/elsewhere"
+unset FAKE_SECRET_KEYS
+pass 'only the key GPG will sign with decides the PIN window'
+
 export FAKE_GPG_STDOUT=''
 export FAKE_GPG_SIGNAL=TERM
 rm -f "$FAKE_TOUCH_FILE".*

@@ -29,6 +29,12 @@ fail_bad_pin() {
 # no card counter is available, like a key without a smart card.
 for arg in "$@"; do
     if [[ "$arg" == --list-secret-keys ]]; then
+        # FAKE_SECRET_KEYS: a file holding the whole listing to print instead,
+        # then exit with FAKE_SECRET_KEYS_STATUS (a listing that failed).
+        if [[ -n "${FAKE_SECRET_KEYS-}" ]]; then
+            cat "$FAKE_SECRET_KEYS"
+            exit "${FAKE_SECRET_KEYS_STATUS:-0}"
+        fi
         # FAKE_KEY_TOKEN: a card serial (default), + for a software key.
         printf 'sec:u:255:22:AAAA:1:::::::cSC:::%s:::ed25519:::0:\n' '+'
         printf 'ssb:u:255:22:BBBB:1::::::s:::%s:::ed25519::\n' "${FAKE_KEY_TOKEN-D2760001240100000006000000010000}"
