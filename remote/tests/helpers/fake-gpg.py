@@ -18,15 +18,18 @@ with (call_dir / 'calls').open('a') as f:
 if '--list-secret-keys' in args:
     # FAKE_GPG_SECRET_KEYS: comma-separated keys, each `PRIMARY[/SUBKEY...]`
     # fingerprints. A selector after the option lists only the key it names,
-    # by any of its fingerprints' suffix, as gpg does.
+    # by any of its fingerprints' suffix, as gpg does. FAKE_GPG_CARD_KEYS:
+    # comma-separated fingerprints of the keys stored on a card.
     keys = [k.split('/') for k in os.environ.get('FAKE_GPG_SECRET_KEYS', '041CE6A7BED57FE579D43B6C3DB3F5612E33B6BC').split(',') if k]
-    rest = args[args.index('--list-secret-keys') + 1:]
+    on_card = set(os.environ.get('FAKE_GPG_CARD_KEYS', '').split(','))
+    rest = [a for a in args[args.index('--list-secret-keys') + 1:] if a != '--']
     selector = rest[0].upper().removeprefix('0X') if rest else ''
     for fingerprints in keys:
         if selector and not any(fpr.endswith(selector) for fpr in fingerprints):
             continue
         for index, fpr in enumerate(fingerprints):
-            print(f"{'sec' if index == 0 else 'ssb'}:u:255:22:{fpr[-16:]}:1789650000:::u:::{'scESC' if index == 0 else 's'}:::+:::ed25519:::0:")
+            token = 'D2760001240100000006000000010000' if fpr in on_card else '+'
+            print(f"{'sec' if index == 0 else 'ssb'}:u:255:22:{fpr[-16:]}:1789650000:::u:::{'scESC' if index == 0 else 's'}:::{token}:::ed25519:::0:")
             print(f'fpr:::::::::{fpr}:')
     sys.exit(0)
 if '--list-keys' in args:

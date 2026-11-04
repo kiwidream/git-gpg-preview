@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 import urllib.request
 from pathlib import Path
 
@@ -622,6 +623,175 @@ PRIMARY_A = 'AAAA' * 9 + '0000000A'
 PRIMARY_B = 'BBBB' * 9 + '0000000B'
 SUBKEY_B = 'CCCC' * 9 + '0000000C'
 TWO_KEYS = f'{PRIMARY_A},{PRIMARY_B}/{SUBKEY_B}'
+
+
+class TouchPolicyTests(unittest.TestCase):
+    """A touch policy other than cached on the card key the service signs with
+    leads the preview with the ykman command, as in the wrapper; signing goes
+    ahead either way. The policy is read with the gpg-connect-agent beside
+    real GPG."""
+    PRIMARY = '041CE6A7BED57FE579D43B6C3DB3F5612E33B6BC'   # the fake service key
+    CARD_SUB = 'AAAA000000000000000000000000000000000002'
+    OTHER = 'BBBB000000000000000000000000000000000002'
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory(prefix='ggp-touch.')
+        self.addCleanup(self.tmpdir.cleanup)
+        self.tmp = Path(self.tmpdir.name)
+        self.gnupg = self.tmp / 'gnupg-bin'
+        self.gnupg.mkdir()
+        (self.gnupg / 'gpg').symlink_to(HELPERS / 'fake-gpg.py')
+        (self.gnupg / 'gpg-connect-agent').symlink_to(HELPERS / 'fake-gpg-connect-agent.py')
+        self.card = self.tmp / 'card'
+        self.repo, _, self.payload = fixture_repo(self.tmp)
+
+    def harness(self, name: str, real_gpg: Path | None = None, card_keys: str = CARD_SUB) -> Harness:
+        h = Harness(self.tmp / name, real_gpg=str(real_gpg or self.gnupg / 'gpg'),
+                    extra_env={'FAKE_GPG_SECRET_KEYS': f'{self.PRIMARY}/{self.CARD_SUB}',
+                               'FAKE_GPG_CARD_KEYS': card_keys, 'FAKE_CARD_FILE': str(self.card)})
+        self.addCleanup(h.stop)
+        return h
+
+    def sign(self, h: Harness, card: str) -> tuple[str, str]:
+        """Signs through the client with CARD in the reader: its signature key
+        and raw UIF-1 value, or '' for no card. Returns the preview summary
+        and the client's stderr."""
+        if card:
+            self.card.write_text(card)
+        else:
+            self.card.unlink(missing_ok=True)
+        result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b'signature:remote')
+        return h.latest_capture()[0], result.stderr.decode()
+
+    @staticmethod
+    def agent_calls(h: Harness) -> int:
+        calls = h.calls / 'connect-agent-calls'
+        return len(calls.read_text().splitlines()) if calls.exists() else 0
+
+    def test_off_and_on_lead_the_preview_and_signing_goes_ahead(self):
+        h = self.harness('h')
+        for uif, policy in (('%01+', 'on'), ('%00+', 'off')):
+            with self.subTest(policy=policy):
+                summary, stderr = self.sign(h, f'{self.CARD_SUB} {uif}')
+                self.assertTrue(summary.startswith(remote.TOUCH_NOTICES[policy] + '\n\nRequest type: commit\n'), summary)
+                self.assertIn('ykman openpgp keys set-touch sig cached', summary)
+                self.assertIn(f'git-gpg-preview: note from the signing Mac: {remote.TOUCH_NOTICES[policy]}\n', stderr)
+        self.assertEqual(self.agent_calls(h), 2, 'the policy is read once per request')
+
+    def test_cached_fixed_and_unreadable_policies_get_no_notice(self):
+        h = self.harness('h')
+        for card in (f'{self.CARD_SUB} %03+', f'{self.CARD_SUB} %04+', f'{self.CARD_SUB} %02+',
+                     f'{self.CARD_SUB} %05+', self.CARD_SUB, f'{self.OTHER} %01+', ''):
+            with self.subTest(card=card):
+                summary, stderr = self.sign(h, card)
+                self.assertTrue(summary.startswith('Request type: commit\n'), summary)
+                self.assertNotIn('ykman', stderr)
+
+    def test_a_software_key_or_no_gpg_connect_agent_gets_no_notice(self):
+        for name, h in (('software key', self.harness('software', card_keys='')),
+                        ('no gpg-connect-agent', self.harness('plain', real_gpg=HELPERS / 'fake-gpg.py'))):
+            with self.subTest(name):
+                summary, stderr = self.sign(h, f'{self.CARD_SUB} %01+')
+                self.assertTrue(summary.startswith('Request type: commit\n'), summary)
+                self.assertNotIn('ykman', stderr)
+                self.assertEqual(self.agent_calls(h), 0)
+
+    def test_the_note_reaches_git_beside_a_failure(self):
+        h = self.harness('h')
+        h.decision.write_text('cancel')
+        self.card.write_text(f'{self.CARD_SUB} %01+')
+        result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+        self.assertEqual((result.returncode, result.stdout), (1, b''))
+        stderr = result.stderr.decode()
+        self.assertIn(f'git-gpg-preview: note from the signing Mac: {remote.TOUCH_NOTICES["on"]}\n', stderr)
+        self.assertIn('signing cancelled by operator', stderr)
+
+    def test_a_failed_slow_or_late_card_query_gives_no_policy(self):
+        agent = str(HELPERS / 'fake-gpg-connect-agent.py')
+        self.card.write_text(f'{self.CARD_SUB} %01+')
+        calls = self.tmp / 'calls' / 'connect-agent-calls'
+        with unittest.mock.patch.dict(os.environ, {'FAKE_GPG_CALL_DIR': str(self.tmp / 'calls'),
+                                                   'FAKE_CARD_FILE': str(self.card)}):
+            self.assertEqual(remote.card_touch_policy(agent, self.CARD_SUB), 'on')
+            self.assertEqual(remote.card_touch_policy(agent, self.CARD_SUB, timeout=0), '')
+            self.assertEqual(len(calls.read_text().splitlines()), 1, 'no time left asks nothing')
+            with unittest.mock.patch.dict(os.environ, {'FAKE_CONNECT_AGENT_EXIT': '2'}):
+                self.assertEqual(remote.card_touch_policy(agent, self.CARD_SUB), '')
+            with unittest.mock.patch.dict(os.environ, {'FAKE_CONNECT_AGENT_SLEEP': '30'}):
+                started = time.monotonic()
+                self.assertEqual(remote.card_touch_policy(agent, self.CARD_SUB, timeout=0.5), '')
+                self.assertLess(time.monotonic() - started, 5)
+
+    def test_gpg_connect_agent_is_found_through_a_link_to_real_gpg(self):
+        linked = self.tmp / 'linked-bin'
+        linked.mkdir()
+        (linked / 'gpg').symlink_to(Path('..') / 'gnupg-bin' / 'gpg')
+        found = remote.gpg_connect_agent(str(linked / 'gpg'))
+        self.assertTrue(found and os.path.samefile(found, self.gnupg / 'gpg-connect-agent'), found)
+        self.assertEqual(remote.gpg_connect_agent(str(HELPERS / 'fake-gpg.py')), '')
+
+    def test_uif_values_and_the_card_key_decide_the_policy(self):
+        agent = str(HELPERS / 'fake-gpg-connect-agent.py')
+        cases = {f'{self.CARD_SUB} %00+': 'off', f'{self.CARD_SUB} %01+': 'on', f'{self.CARD_SUB} %02+': 'fixed',
+                 f'{self.CARD_SUB} %03+': 'cached', f'{self.CARD_SUB} %04+': 'cached-fixed',
+                 f'{self.CARD_SUB.lower()} %03+': 'cached', f'{self.CARD_SUB} %05+': '', f'{self.CARD_SUB} +': '',
+                 self.CARD_SUB: '', f'{self.OTHER} %01+': '', '': ''}
+        env = {'FAKE_GPG_CALL_DIR': str(self.tmp / 'calls'), 'FAKE_CARD_FILE': str(self.card)}
+        with unittest.mock.patch.dict(os.environ, env):
+            for card, policy in cases.items():
+                with self.subTest(card=card):
+                    self.card.write_text(card)
+                    self.assertEqual(remote.card_touch_policy(agent, self.CARD_SUB), policy)
+
+    def test_touch_notices_match_the_wrapper(self):
+        wrapper = (ROOT.parent / 'git-gpg-preview').read_text()
+        function = re.search(r'^touch_policy_notice\(\) \{\n.*?^\}', wrapper, re.M | re.S).group()
+        for policy in remote.TOUCH_POLICIES:
+            with self.subTest(policy=policy):
+                result = subprocess.run(['bash', '-c', function + '\ntouch_policy_notice "$1"', 'bash', policy],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0 if policy in remote.TOUCH_NOTICES else 1, result.stderr)
+                self.assertEqual(result.stdout, remote.TOUCH_NOTICES.get(policy, ''))
+
+    def test_signing_key_choice_matches_the_wrapper(self):
+        wrapper = (ROOT.parent / 'git-gpg-preview').read_text()
+        function = re.search(r'^selected_signing_key\(\) \{\n.*?^\}', wrapper, re.M | re.S).group()
+        card, primary, sub1, sub2 = 'D2760001240100000006000000010000', 'A' * 40, 'B' * 40, 'C' * 40
+        future = '4102444800'
+
+        def cert(fpr, caps, token, *subkeys):
+            lines = [f'sec:u:255:22:{fpr[-16:]}:100::::::{caps}:::{token}:::ed25519:::0:', f'fpr:::::::::{fpr}:']
+            for sub_fpr, valid, created, sub_token in subkeys:
+                lines += [f'ssb:{valid}:255:22:{sub_fpr[-16:]}:{created}::::::s:::{sub_token}:::ed25519::',
+                          f'fpr:::::::::{sub_fpr}:']
+            return '\n'.join(lines) + '\n'
+
+        listings = {
+            'newest subkey on the card': cert(primary, 'cSC', '+', (sub1, 'u', '200', '+'), (sub2, 'u', '300', card)),
+            'newest subkey in software': cert(primary, 'cSC', '+', (sub1, 'u', '300', '+'), (sub2, 'u', '200', card)),
+            'expired newest subkey': cert(primary, 'cSC', '+', (sub1, 'u', '200', card), (sub2, 'e', '300', '+')),
+            'stub without its secret': cert(primary, 'cSC', '+', (sub1, 'u', '200', card), (sub2, 'u', '300', '#')),
+            'tie goes to the first listed': cert(primary, 'cSC', '+', (sub1, 'u', '300', card), (sub2, 'u', '300', '+')),
+            'subkey from the future': cert(primary, 'cSC', '+', (sub1, 'u', '200', card), (sub2, 'u', future, '+')),
+            'primary when no subkey signs': cert(primary, 'scSC', card, (sub1, 'r', '300', '+')),
+            'nothing can sign': cert(primary, 'cSC', '+', (sub1, 'e', '300', card)),
+            'first certificate that can sign': cert(primary, 'cSC', '+', (sub1, 'e', '300', '+'))
+                                              + cert('D' * 40, 'cSC', '+', (sub2, 'u', '200', card)),
+            'empty token is software': cert(primary, 'cSC', '', (sub1, 'u', '300', '')),
+            'subkey before any primary': '\n'.join(cert(primary, 'cSC', '+', (sub1, 'u', '300', card)).splitlines()[2:])
+                                         + '\n' + cert('D' * 40, 'scSC', '+'),
+            'empty listing': '',
+        }
+        listing = self.tmp / 'listing'
+        for name, text in listings.items():
+            with self.subTest(name):
+                listing.write_text(text)
+                result = subprocess.run(['bash', '-c', function + '\nselected_signing_key "$1" "$2"', 'bash',
+                                         str(listing), primary], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(remote.selected_signing_key(text, time.time()), result.stdout.strip())
 
 
 class SigningKeyTests(unittest.TestCase):

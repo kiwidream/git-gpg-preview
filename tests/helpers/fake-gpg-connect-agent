@@ -1,0 +1,43 @@
+#!/bin/bash
+
+# Stands in for gpg-connect-agent: answers SCD GETATTR for the card in the
+# reader the way scdaemon does. FAKE_CARD_SIG_KEY is the fingerprint in its
+# signature slot (unset: no card) and FAKE_CARD_UIF the raw UIF-1 value as
+# scdaemon escapes it, such as "%01+" for touch policy on. Until SERIALNO
+# selects the OpenPGP application, another one (PIV, say) answers GETATTR.
+# FAKE_CONNECT_AGENT_EXIT is the exit status after answering.
+
+set -u
+umask 077
+
+printf '%s\n' "$*" >> "${FAKE_GPG_CALL_DIR:?}/connect-agent-calls"
+openpgp=0
+for command in "$@"; do
+    [[ "$command" == /bye ]] && break
+    if [[ -z "${FAKE_CARD_SIG_KEY-}" ]]; then
+        printf 'ERR 100696144 No such device <SCD>\n'
+        continue
+    fi
+    if [[ "$command" == 'SCD GETATTR '* && "$openpgp" -eq 0 ]]; then
+        printf 'ERR 100663423 Not supported <SCD>\n'
+        continue
+    fi
+    case "$command" in
+        'SCD SERIALNO openpgp')
+            openpgp=1
+            printf 'S SERIALNO D2760001240100000006000000010000 0\nOK\n'
+            ;;
+        'SCD GETATTR KEY-FPR')
+            printf 'S KEY-FPR 1 %s\nS KEY-FPR 2 DDDD000000000000000000000000000000000002\nOK\n' "$FAKE_CARD_SIG_KEY"
+            ;;
+        'SCD GETATTR UIF-1')
+            if [[ -n "${FAKE_CARD_UIF-}" ]]; then
+                printf 'S UIF-1 %s\nOK\n' "$FAKE_CARD_UIF"
+            else
+                printf 'ERR 100663354 No such object <SCD>\n'
+            fi
+            ;;
+        *) printf 'ERR 69 Unknown IPC command <User defined source 1>\n' ;;
+    esac
+done
+exit "${FAKE_CONNECT_AGENT_EXIT:-0}"
