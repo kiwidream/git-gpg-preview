@@ -72,7 +72,7 @@ for arg in "$@"; do
     case "$arg" in
         --command-fd) expect_command_fd=1 ;;
         --verify) verify=1 ;;
-        --sign|--detach-sign|--clear-sign|--clearsign) signing=1 ;;
+        --sign|--detach-sign|--detach|--clear-sign|--clearsign) signing=1 ;;
         --) after_options=1 ;;
         -[!-]*)
             short=${arg#-}
