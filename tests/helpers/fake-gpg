@@ -29,6 +29,7 @@ fail_bad_pin() {
 # no card counter is available, like a key without a smart card.
 for arg in "$@"; do
     if [[ "$arg" == --list-secret-keys ]]; then
+        printf '%s\n' "$id" >> "$CALL_DIR/secret-key-listings"
         # FAKE_SECRET_KEYS: a file holding the whole listing to print instead,
         # then exit with FAKE_SECRET_KEYS_STATUS (a listing that failed).
         if [[ -n "${FAKE_SECRET_KEYS-}" ]]; then

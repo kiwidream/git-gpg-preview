@@ -31,6 +31,9 @@ DIALOG_PID=""
 GPG_STDERR=""
 PIN_DIALOG_PID=""
 UNANSWERABLE_PROMPT=""
+SIGNING_KEY=""
+SIGNING_KEY_LOOKED_UP=0
+TOUCH_POLICY=""
 # builtin: the wrapper's own PIN window (GnuPG loopback). pinentry: gpg-agent's.
 PIN_PROMPT="builtin"
 # Upper bound on PIN attempts per request, even when the card reports more.
@@ -414,12 +417,12 @@ bad_pin_failure() {
     /usr/bin/grep -Eq '^\[GNUPG:\] SC_OP_FAILURE 2$|signing failed: Bad PIN$' "$GPG_STDERR"
 }
 
-# Runs a read-only GPG query into a file. Bounded, so a wedged card or agent
-# cannot hold the dialog lock forever. Fails when GPG fails or is cut off.
-run_gpg_query() {
+# Runs a read-only query into a file. Bounded, so a wedged card or agent
+# cannot hold the dialog lock forever. Fails when the query fails or is cut off.
+run_query() {
     local output="$1" pid waited=0 status=0
     shift
-    "$REAL_GPG" --batch "$@" < /dev/null > "$output" 2>/dev/null 4>&- &
+    "$@" < /dev/null > "$output" 2>/dev/null 4>&- &
     pid=$!
     CHILD_PID=$pid
     while /bin/kill -0 "$pid" 2>/dev/null; do
@@ -433,6 +436,12 @@ run_gpg_query() {
     wait "$pid" 2>/dev/null || status=$?
     CHILD_PID=""
     return "$status"
+}
+
+run_gpg_query() {
+    local output="$1"
+    shift
+    run_query "$output" "$REAL_GPG" --batch "$@"
 }
 
 # The card's remaining PIN (PW1) attempts, or nothing when it cannot be read.
@@ -504,15 +513,92 @@ selected_signing_key() {
     ' "$1" 2>/dev/null
 }
 
+# The key GPG will sign with, as selected_signing_key reports it, looked up
+# once per request. Nothing for a request naming more than one key, since -u
+# wins over --default-key and every -u key signs, or for a listing that
+# failed or was cut off, since a missing key could be the one GPG picks.
+look_up_signing_key() {
+    [[ "$SIGNING_KEY_LOOKED_UP" -eq 0 ]] || return 0
+    SIGNING_KEY_LOOKED_UP=1
+    [[ "$KEY_SELECTORS" -eq 1 ]] || return 0
+    run_gpg_query "$REQUEST_DIR/secret-keys" --with-colons --list-secret-keys -- "$KEY_SELECTOR" || return 0
+    SIGNING_KEY=$(selected_signing_key "$REQUEST_DIR/secret-keys" "$KEY_SELECTOR")
+}
+
 # Whether the key GPG will sign with is stored on a card. Software keys keep
 # gpg-agent's pinentry, which re-prompts for a wrong passphrase itself and has
-# no minimum length. So does a request naming more than one key, since -u
-# wins over --default-key and every -u key signs, and a listing that failed
-# or was cut off, since a missing key could be the one GPG picks.
+# no minimum length. So does any request whose key cannot be told.
 signing_key_on_card() {
-    [[ "$KEY_SELECTORS" -eq 1 ]] || return 1
-    run_gpg_query "$REQUEST_DIR/secret-keys" --with-colons --list-secret-keys -- "$KEY_SELECTOR" || return 1
-    [[ "$(selected_signing_key "$REQUEST_DIR/secret-keys" "$KEY_SELECTOR")" == *" card" ]]
+    look_up_signing_key
+    [[ "$SIGNING_KEY" == *" card" ]]
+}
+
+# gpg-connect-agent from real GPG's installation: beside it, or beside the
+# file a symbolic link to it leads to.
+gpg_connect_agent() {
+    local path=$REAL_GPG dir hops=0
+    while :; do
+        dir=$(dirname -- "$path")
+        if [[ -x "$dir/gpg-connect-agent" ]]; then
+            printf '%s\n' "$dir/gpg-connect-agent"
+            return 0
+        fi
+        [[ -L "$path" && "$hops" -lt 40 ]] || return 1
+        hops=$((hops + 1))
+        path=$(/usr/bin/readlink -- "$path") || return 1
+        [[ "$path" == /* ]] || path="$dir/$path"
+    done
+}
+
+# The touch policy of the key GPG will sign with, when that key is the
+# signature key of the card in the reader: off, on, fixed, cached or
+# cached-fixed, the YubiKey's UIF values 0 to 4. Nothing when that cannot be
+# told: a software key, another card or none, a card without the setting, or
+# no gpg-connect-agent. It is asked through gpg-agent because scdaemon holds
+# the card; ykman would kill scdaemon to reach it. SERIALNO selects the card's
+# OpenPGP application, as gpg does before it uses a card.
+card_touch_policy() {
+    local agent
+    TOUCH_POLICY=""
+    agent=$(gpg_connect_agent) || return 0
+    look_up_signing_key
+    [[ "$SIGNING_KEY" == *" card" ]] || return 0
+    run_query "$REQUEST_DIR/card-touch" "$agent" 'SCD SERIALNO openpgp' 'SCD GETATTR KEY-FPR' 'SCD GETATTR UIF-1' /bye ||
+        return 0
+    # scdaemon escapes the raw UIF bytes: the policy byte, then 0x20 ("+").
+    TOUCH_POLICY=$(/usr/bin/awk -v key="${SIGNING_KEY%% *}" '
+        $1 == "S" && $2 == "KEY-FPR" && $3 == "1" { card = toupper($4) }
+        $1 == "S" && $2 == "UIF-1" { uif = $3 }
+        END {
+            if (card != key || uif !~ /^%0[0-4]/) exit
+            split("off on fixed cached cached-fixed", policy, " ")
+            print policy[substr(uif, 3, 1) + 1]
+        }
+    ' "$REQUEST_DIR/card-touch" 2>/dev/null)
+}
+
+# What to tell the operator about a touch policy that is worth changing:
+# off signs without any touch, and on asks for one on every signature.
+# Fixed cannot be changed without replacing the key, so it gets nothing.
+touch_policy_notice() {
+    case "$1" in
+        off) printf '%s' "Touch policy is off: this key signs with no touch. To require one, run: ykman openpgp keys set-touch sig cached" ;;
+        on) printf '%s' "Touch policy is on: a touch for every signature. To let a touch cover 15 seconds, run: ykman openpgp keys set-touch sig cached" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Whether the request names its own home directory, keyring or options file.
+# What this wrapper looks up would then describe keys GPG does not use.
+names_own_gnupg_files() {
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --homedir|--homedir=*|--keyring|--keyring=*|--no-default-keyring|--options|--options=*) return 0 ;;
+            --) break ;;
+        esac
+    done
+    return 1
 }
 
 # The wrapper's own PIN window replaces gpg-agent's pinentry when the key is
@@ -521,6 +607,7 @@ signing_key_on_card() {
 # (GET_HIDDEN) and reads it from fd 3, a pipe the PIN window writes into.
 uses_builtin_pin_entry() {
     [[ "$PIN_PROMPT" == builtin ]] || return 1
+    names_own_gnupg_files "$@" && return 1
     local arg status_on_stderr=0 expect_status_fd=0
     for arg in "$@"; do
         if [[ "$expect_status_fd" -eq 1 ]]; then
@@ -532,7 +619,6 @@ uses_builtin_pin_entry() {
             --status-fd=2) status_on_stderr=1 ;;
             --status-fd) expect_status_fd=1 ;;
             --pinentry-mode|--pinentry-mode=*|--command-fd|--command-fd=*|--command-file*|--passphrase*) return 1 ;;
-            --homedir|--homedir=*|--keyring|--keyring=*|--no-default-keyring|--options|--options=*) return 1 ;;
             --) break ;;
         esac
     done
@@ -991,6 +1077,16 @@ if uses_builtin_pin_entry "$@"; then
     BUILTIN_PIN=1
     PIN_RESULT="$REQUEST_DIR/pin-result"
     GPG_ARGS=(--pinentry-mode loopback --command-fd 3 "$@")
+fi
+# Read under the lock, like the PIN counter: the card is busy while another
+# request waits for its touch. The notice sits above the summary in every
+# preview of this request, and goes to stderr too, which Git shows only when
+# signing fails. Advisory: signing goes ahead under the key's current policy.
+names_own_gnupg_files "$@" || card_touch_policy
+if TOUCH_NOTICE=$(touch_policy_notice "$TOUCH_POLICY"); then
+    { printf '%s\n\n' "$TOUCH_NOTICE"; /bin/cat "$SUMMARY"; } > "$SUMMARY.touch" &&
+        /bin/mv -f "$SUMMARY.touch" "$SUMMARY"
+    error "note: $TOUCH_NOTICE"
 fi
 ATTEMPT=1
 while :; do

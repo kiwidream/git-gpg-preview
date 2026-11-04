@@ -451,6 +451,108 @@ def resolve_signing_key(real_gpg: str, configured: str = '') -> tuple[str, str]:
     return blocks[0][0], 'the only secret key'
 
 
+# --- touch policy -------------------------------------------------------------
+
+# A YubiKey's touch policy for a key slot is the first byte of that slot's UIF
+# data object, which scdaemon reports escaped: "%01+" is on.
+TOUCH_POLICIES = ('off', 'on', 'fixed', 'cached', 'cached-fixed')
+# Must match touch_policy_notice in the git-gpg-preview wrapper. Fixed cannot
+# be changed without replacing the key, so it gets no notice.
+TOUCH_NOTICES = {
+    'off': 'Touch policy is off: this key signs with no touch. '
+           'To require one, run: ykman openpgp keys set-touch sig cached',
+    'on': 'Touch policy is on: a touch for every signature. '
+          'To let a touch cover 15 seconds, run: ykman openpgp keys set-touch sig cached',
+}
+
+
+def selected_signing_key(listing: str, now: float) -> str:
+    """The wrapper's selected_signing_key for a selector without a trailing !,
+    from a --with-colons secret key listing: '<fingerprint> card' or
+    '<fingerprint> software' for the first certificate that can sign, using its
+    newest usable signing subkey, or its primary key when no subkey can sign.
+    Empty when no key can sign, or when a usable subkey is from the future."""
+    certificates: list[list[dict]] = []
+    key = None
+    for line in listing.splitlines():
+        fields = line.split(':')
+        if fields[0] in ('sec', 'ssb'):
+            if fields[0] == 'sec' or not certificates:
+                certificates.append([])
+            fields += [''] * (15 - len(fields))
+            key = {'valid': fields[1], 'created': fields[5], 'caps': fields[11], 'token': fields[14], 'fpr': '-'}
+            certificates[-1].append(key)
+            continue
+        if fields[0] == 'fpr' and key is not None and len(fields) > 9:
+            key['fpr'] = fields[9].upper()
+        key = None
+
+    def usable(k: dict) -> bool:
+        return k['valid'] not in ('e', 'r', 'i') and 's' in k['caps'] and k['token'] != '#'
+
+    def created(k: dict) -> int:
+        return int(k['created']) if k['created'].isdigit() else 0
+
+    for keys in certificates:
+        best, unclear = None, False
+        for k in keys[1:]:
+            if not usable(k):
+                continue
+            # GPG skips a subkey from the future unless ignore-valid-from is set.
+            unclear = unclear or created(k) > now
+            if best is None or created(k) > created(best):
+                best = k
+        if best is None and usable(keys[0]):
+            best = keys[0]
+        if best is None:
+            continue
+        if unclear:
+            return ''
+        return f"{best['fpr']} {'software' if best['token'] in ('', '+') else 'card'}"
+    return ''
+
+
+def gpg_connect_agent(real_gpg: str) -> str:
+    """gpg-connect-agent from real GPG's installation, found as the wrapper
+    finds it: beside real GPG, or beside the file a symbolic link leads to."""
+    path = Path(real_gpg)
+    for _ in range(41):
+        candidate = path.parent / 'gpg-connect-agent'
+        if os.access(candidate, os.X_OK):
+            return str(candidate)
+        try:
+            target = Path(os.readlink(path))
+        except OSError:   # not a link, or one that cannot be read
+            return ''
+        path = target if target.is_absolute() else path.parent / target
+    return ''
+
+
+def card_touch_policy(agent: str, key_fpr: str, timeout: float = 10) -> str:
+    """The touch policy of KEY_FPR when it is the signature key of the card in
+    the reader, asked through gpg-agent because scdaemon holds the card; empty
+    when that cannot be told. ykman would kill scdaemon to reach the card.
+    SERIALNO selects the card's OpenPGP application, as gpg does."""
+    if timeout <= 0:
+        return ''
+    try:
+        result = subprocess.run([agent, 'SCD SERIALNO openpgp', 'SCD GETATTR KEY-FPR', 'SCD GETATTR UIF-1', '/bye'],
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+    if result.returncode:
+        return ''
+    card = uif = ''
+    for line in result.stdout.decode('ascii', 'replace').splitlines():
+        fields = line.split()
+        if fields[:3] == ['S', 'KEY-FPR', '1'] and len(fields) > 3:
+            card = fields[3].upper()
+        elif fields[:2] == ['S', 'UIF-1'] and len(fields) > 2:
+            uif = fields[2]
+    match = re.match(r'%0([0-4])', uif)
+    return TOUCH_POLICIES[int(match.group(1))] if match and card == key_fpr else ''
+
+
 class ServeConfig:
     def __init__(self, base: Path) -> None:
         self.spam_file = base / 'spam-subjects'
@@ -758,7 +860,37 @@ class Service:
                 spam = self._spam_rejection(payload, info, digest, repo, peer)
                 if spam:
                     return spam
-                return self._run_dialog_and_gpg(args, paths, info, digest, repo, peer)
+                # Read under the lock, as the wrapper does: the card is busy
+                # while another request waits for its touch. Advisory: signing
+                # goes ahead under the key's current policy.
+                notice = self._touch_notice()
+                if notice:
+                    paths['summary.txt'].write_text(f'{notice}\n\n{summary}')
+                result = self._run_dialog_and_gpg(args, paths, info, digest, repo, peer)
+                if notice:
+                    result['stderr'] = f'git-gpg-preview: note from the signing Mac: {notice}\n{result["stderr"]}'
+                return result
+
+    def _touch_notice(self) -> str:
+        """What the preview should say about the touch policy of the key this
+        service signs with, which is GPG's pick for --local-user FINGERPRINT.
+        Both lookups share one deadline, since they hold the dialog lock."""
+        deadline = time.monotonic() + 10
+        agent = gpg_connect_agent(self.config.real_gpg)
+        if not agent:
+            return ''
+        try:
+            listing = subprocess.run([self.config.real_gpg, '--batch', '--with-colons', '--list-secret-keys', '--',
+                                      self.service_fingerprint()],
+                                     stdin=subprocess.DEVNULL, capture_output=True, timeout=deadline - time.monotonic())
+        except (OSError, subprocess.TimeoutExpired):
+            return ''
+        if listing.returncode:
+            return ''
+        key = selected_signing_key(listing.stdout.decode('utf-8', 'replace'), time.time())
+        if not key.endswith(' card'):
+            return ''
+        return TOUCH_NOTICES.get(card_touch_policy(agent, key.split()[0], deadline - time.monotonic()), '')
 
     @staticmethod
     def _deciding_marker(paths):
