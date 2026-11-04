@@ -553,6 +553,106 @@ assert_key_path 'the caller'"'"'s own home directory' pinentry TEST --homedir "$
 unset FAKE_SECRET_KEYS
 pass 'only the key GPG will sign with decides the PIN window'
 
+# Before the first preview, the touch policy of the key GPG will sign with is
+# read through gpg-agent with the gpg-connect-agent beside real GPG, and only
+# when that key is the card's signature key. Off and on lead the preview with
+# the ykman command and repeat it on stderr; signing goes ahead either way.
+TOUCH_ON="Touch policy is on: a touch for every signature. To let a touch cover 15 seconds, run: ykman openpgp keys set-touch sig cached"
+TOUCH_OFF="Touch policy is off: this key signs with no touch. To require one, run: ykman openpgp keys set-touch sig cached"
+mkdir -p "$TMP/gnupg-bin" "$TMP/linked-bin"
+ln -s "$ROOT/tests/helpers/fake-gpg" "$TMP/gnupg-bin/gpg"
+ln -s "$ROOT/tests/helpers/fake-gpg-connect-agent" "$TMP/gnupg-bin/gpg-connect-agent"
+ln -s ../gnupg-bin/gpg "$TMP/linked-bin/gpg"
+cp "$XDG_CONFIG_HOME/git-gpg-preview/config" "$TMP/config.saved"
+use_real_gpg() {
+    { grep -v '^real_gpg=' "$TMP/config.saved"; printf 'real_gpg=%s\n' "$1"; } > "$XDG_CONFIG_HOME/git-gpg-preview/config"
+}
+connect_agent_calls() {
+    [[ -f "$FAKE_GPG_CALL_DIR/connect-agent-calls" ]] && wc -l < "$FAKE_GPG_CALL_DIR/connect-agent-calls" | tr -d ' ' || echo 0
+}
+# assert_touch_notice LABEL UIF EXPECTED-NOTICE GPG-ARGS...; an empty notice means none.
+assert_touch_notice() {
+    local label="$1" expected="$3" summary
+    export FAKE_CARD_UIF="$2"
+    shift 3
+    reset_pin_state
+    rm -f "$FAKE_GPG_CALL_DIR/connect-agent-calls" "$FAKE_GPG_CALL_DIR/secret-key-listings"
+    run_pin_case "$@"
+    [[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "$label: signing ($pin_status)"
+    summary=$(latest_capture)
+    if [[ -n "$expected" ]]; then
+        [[ $(head -n 1 "$summary") == "$expected" ]] || fail "$label: the preview does not lead with the notice"
+        [[ $(sed -n 3p "$summary") == 'Request type: commit' ]] || fail "$label: the notice displaced the summary"
+        grep -qxF "git-gpg-preview: note: $expected" "$TMP/pin.stderr" || fail "$label: notice missing from stderr"
+    else
+        ! grep -qF 'ykman' "$summary" "$TMP/pin.stderr" || fail "$label: unexpected touch notice"
+    fi
+}
+use_real_gpg "$TMP/gnupg-bin/gpg"
+export FAKE_SECRET_KEYS="$TMP/secret-keys" FAKE_GPG_STDOUT='signature-touch-policy' FAKE_CARD_SIG_KEY=$CARD_SUB
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" > "$FAKE_SECRET_KEYS"
+assert_touch_notice 'touch policy on' '%01+' "$TOUCH_ON" --status-fd=2 -bsau TEST
+[[ $(connect_agent_calls) -eq 1 ]] || fail 'touch policy was not read once'
+[[ $(wc -l < "$FAKE_GPG_CALL_DIR/secret-key-listings") -eq 1 ]] || fail 'the signing key was looked up more than once'
+assert_touch_notice 'touch policy off' '%00+' "$TOUCH_OFF" --status-fd=2 -bsau TEST
+assert_touch_notice 'touch policy on, pinentry path' '%01+' "$TOUCH_ON" -bsau TEST
+assert_touch_notice 'touch policy cached' '%03+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'touch policy cached-fixed' '%04+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'touch policy fixed' '%02+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'unknown touch policy byte' '%05+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'card without a touch setting' '' '' --status-fd=2 -bsau TEST
+export FAKE_CARD_SIG_KEY=$OTHER_CARD
+assert_touch_notice 'another key in the card signature slot' '%01+' '' --status-fd=2 -bsau TEST
+unset FAKE_CARD_SIG_KEY
+assert_touch_notice 'no card in the reader' '%01+' '' --status-fd=2 -bsau TEST
+export FAKE_CARD_SIG_KEY=$CARD_SUB
+assert_touch_notice 'the caller'"'"'s own home directory' '%01+' '' --status-fd=2 -bsau TEST --homedir "$TMP/elsewhere"
+[[ $(connect_agent_calls) -eq 0 ]] || fail 'touch policy read for the caller'"'"'s own home directory'
+assert_touch_notice 'the caller'"'"'s own keyring' '%01+' '' --status-fd=2 -bsau TEST --keyring "$TMP/elsewhere.kbx"
+assert_touch_notice 'a second key named with --default-key' '%01+' '' --status-fd=2 -bsau TEST --default-key OTHER
+export FAKE_SECRET_KEYS_STATUS=2
+assert_touch_notice 'listing that failed' '%01+' '' --status-fd=2 -bsau TEST
+unset FAKE_SECRET_KEYS_STATUS
+export FAKE_CONNECT_AGENT_EXIT=2
+assert_touch_notice 'gpg-connect-agent that failed' '%01+' '' --status-fd=2 -bsau TEST
+unset FAKE_CONNECT_AGENT_EXIT
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 200 "$CARD" "$SOFT_SUB" u 300 + > "$FAKE_SECRET_KEYS"
+assert_touch_notice 'software key signs' '%01+' '' --status-fd=2 -bsau TEST
+[[ $(connect_agent_calls) -eq 0 ]] || fail 'touch policy read for a software key'
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" > "$FAKE_SECRET_KEYS"
+use_real_gpg "$TMP/linked-bin/gpg"
+assert_touch_notice 'gpg-connect-agent beside the linked real GPG' '%01+' "$TOUCH_ON" --status-fd=2 -bsau TEST
+use_real_gpg "$ROOT/tests/helpers/fake-gpg"
+assert_touch_notice 'no gpg-connect-agent beside real GPG' '%01+' '' --status-fd=2 -bsau TEST
+[[ $(connect_agent_calls) -eq 0 ]] || fail 'a gpg-connect-agent not beside real GPG was used'
+pass 'a touch policy other than cached leads the preview with the ykman command, and signing goes ahead'
+
+# Git shows the stderr copy only when signing fails, so check it there.
+use_real_gpg "$TMP/gnupg-bin/gpg"
+reset_pin_state
+export FAKE_CARD_UIF=%01+ FAKE_GPG_EXIT=42 FAKE_GPG_STDERR=$'gpg: signing failed: Card error\n'
+run_pin_case --status-fd=2 -bsau TEST
+unset FAKE_GPG_EXIT FAKE_GPG_STDERR
+[[ "$pin_status" -eq 42 ]] || fail "the touch notice changed GPG's failure status ($pin_status)"
+grep -qxF "git-gpg-preview: note: $TOUCH_ON" "$TMP/pin.stderr" || fail 'a failed signature lost the touch notice'
+grep -qxF 'gpg: signing failed: Card error' "$TMP/pin.stderr" || fail "a failed signature lost GPG's error"
+pass 'a failed signature reports the touch notice next to the GPG error'
+
+# A wrong PIN repeats the preview: the notice stays, and the policy is read once.
+use_real_gpg "$TMP/gnupg-bin/gpg"
+reset_pin_state
+rm -f "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+export FAKE_CARD_UIF=%01+ FAKE_PIN_RETRIES=3 FAKE_GPG_PIN=123456
+export FAKE_PIN_ENTRIES=654321,123456 FAKE_PIN_ERROR_DECISION=retry
+run_pin_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "touch notice with a PIN retry ($pin_status)"
+retry_summary=$(grep -l '^PIN attempt 2: ' "$TMP/captures"/*.summary) || fail 'the retry preview was not shown'
+grep -qxF "$TOUCH_ON" "$retry_summary" || fail 'the retry preview lost the touch notice'
+[[ $(connect_agent_calls) -eq 1 ]] || fail 'touch policy was read again for the retry'
+unset FAKE_CARD_UIF FAKE_CARD_SIG_KEY FAKE_PIN_RETRIES FAKE_GPG_PIN FAKE_PIN_ENTRIES FAKE_PIN_ERROR_DECISION FAKE_SECRET_KEYS
+cp "$TMP/config.saved" "$XDG_CONFIG_HOME/git-gpg-preview/config"
+pass 'a PIN retry keeps the touch notice without reading the policy again'
+
 export FAKE_GPG_STDOUT=''
 export FAKE_GPG_SIGNAL=TERM
 rm -f "$FAKE_TOUCH_FILE".*
