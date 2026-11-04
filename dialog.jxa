@@ -84,8 +84,8 @@ function pinErrorText(remaining, allowRetry, uncounted) {
         return {
             title: 'PIN blocked',
             info: 'Your security key rejected the PIN and has no attempts left, so its PIN is now blocked. ' +
-                'Signing was cancelled. Unblock it with your Admin PIN or reset code: run ' +
-                '`gpg --card-edit`, then `admin`, then `unblock` (or `passwd`).',
+                'Signing was cancelled. To unblock it with your Admin PIN, run `gpg --card-edit`, then ' +
+                '`admin`, `passwd` and option 2. With a Reset Code, run `gpg --card-edit`, then `unblock`.',
             canRetry: false
         };
     }
@@ -260,7 +260,6 @@ function run(argv) {
         alert.alertStyle = $.NSAlertStyleInformational;
         alert.messageText = 'Confirm signature on your key';
         alert.informativeText = 'Touch your key to sign; this closes when done. View Details for the full payload, or Cancel to abort.';
-        if (canMarkSpam) alert.informativeText += ' Mark as Spam cancels and blocks this exact subject across repositories.';
         alert.accessoryView = scrollableText(summary, 460, 150);
         alert.addButtonWithTitle('View Details');
         alert.addButtonWithTitle('Cancel');

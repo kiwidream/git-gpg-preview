@@ -11,6 +11,7 @@ function modalResponse(alert) {
     if (count !== (expectedSpam ? 3 : 2)) throw new Error('Unexpected button count: ' + count);
     if (ObjC.unwrap(buttons.objectAtIndex(1).title) !== 'Cancel') throw new Error('Cancel moved');
     if (expectedSpam && ObjC.unwrap(buttons.objectAtIndex(2).title) !== 'Mark as Spam') throw new Error('Spam button missing');
+    if (ObjC.unwrap(alert.informativeText).indexOf('Spam') >= 0) throw new Error('Spam text in the preview: ' + ObjC.unwrap(alert.informativeText));
     if (!responses.length) throw new Error('Unexpected extra modal');
     modalCount++;
     return responses.shift();
@@ -101,6 +102,7 @@ function run(argv) {
         {args: ['1', 'retry'], buttons: ['Try Again', 'Cancel'], response: 1000, decision: 'retry', text: '1 attempt remaining'},
         {args: ['unknown', 'retry'], buttons: ['Try Again', 'Cancel'], response: 1000, decision: 'retry', text: 'could not be read'},
         {args: ['0', 'retry'], buttons: ['OK'], response: 1000, decision: 'cancel', text: 'PIN is now blocked'},
+        {args: ['0', 'retry'], buttons: ['OK'], response: 1000, decision: 'cancel', text: '`admin`, `passwd` and option 2'},
         {args: ['unknown', 'final'], buttons: ['OK'], response: 1000, decision: 'cancel', text: 'Signing was cancelled'}
     ].forEach(function(test) {
         $.NSData.data.writeToFileAtomically(decision, true);

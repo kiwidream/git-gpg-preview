@@ -116,24 +116,120 @@ read_config() {
 }
 
 is_signing_request() {
-    local arg verify=0 signing=0 short after_options=0
+    local arg signing=0 short after_options=0
     for arg in "$@"; do
         if [[ "$after_options" -eq 1 ]]; then
             continue
         fi
         case "$arg" in
-            --verify) verify=1 ;;
-            --sign|--detach-sign|--clear-sign|--clearsign) signing=1 ;;
             --) after_options=1 ;;
+            --*)
+                # GnuPG takes any unique prefix of a command's name. --verify
+                # does not overrule these: it may be another option's value,
+                # and GPG refuses a real signing and verifying command together.
+                if [[ "--sign" == "$arg"* || "--detach-sign" == "$arg"* || "--clear-sign" == "$arg"* || "--clearsign" == "$arg"* ]]; then
+                    signing=1
+                fi
+                ;;
             -[!-]*)
+                # A value-taking option ends the cluster: the rest is its value.
                 short=${arg#-}
+                short=${short%%[$GPG_VALUE_SHORT_OPTIONS]*}
                 if [[ "$short" == *s* || "$short" == *b* ]]; then
                     signing=1
                 fi
                 ;;
         esac
     done
-    [[ "$verify" -eq 0 && "$signing" -eq 1 ]]
+    [[ "$signing" -eq 1 ]]
+}
+
+# Long options that take their value from the next argument, each one
+# required in GnuPG 2.2 and 2.4's g10/gpg.c. Any other option is read as
+# taking none, so the value of an unlisted one counts as a file below and the
+# request is refused; --option=value always works. tests/run.sh holds this list
+# against the installed GnuPG, since a listed option that took no value would
+# let a file through.
+GPG_VALUE_OPTIONS=" agent-program attribute-fd attribute-file auto-key-locate cert-digest-algo charset command-fd command-file comment compliance compress-algo compress-level debug debug-level default-key default-sig-expire digest-algo display display-charset encrypt-to faked-system-time hidden-encrypt-to hidden-recipient hidden-recipient-file homedir input-size-hint keyid-format keyring lc-ctype lc-messages list-options local-user logger-fd logger-file max-output options output passphrase-fd passphrase-file passphrase-repeat personal-digest-preferences pinentry-mode recipient recipient-file secret-keyring sender set-filename set-notation set-policy-url sig-keyserver-url sig-notation sig-policy-url sign-with status-fd status-file trust-model trusted-key ttyname ttytype verify-options weak-digest xauthority "
+# The short options that take a value, the same in both versions.
+GPG_VALUE_SHORT_OPTIONS=FNRforuz
+
+# Whether an option's value makes GPG read standard input before signing, so
+# the signature would cover only what is left of it. GnuPG reads these fds as
+# numbers, cut down to an int (so 4294967296 is 0), and takes any unique prefix
+# of a long option's name. A link to /dev/stdin resolves to this wrapper's
+# standard input here and to GPG's there, so -ef catches it either way.
+value_reads_stdin() {
+    case "$1" in
+        --passphrase-fd|--command-fd|--override-session-key-|--override-session-key-f|--override-session-key-fd)
+            [[ "$2" =~ ^[1-9][0-9]{0,8}$ ]] || return 0
+            ;;
+    esac
+    # - and -&N name standard input or a descriptor, except as GPG's output.
+    if [[ "$2" == '-&'* || ( "$2" == - && "$1" != -o && "$1" != --output ) ]]; then
+        return 0
+    fi
+    [[ "$2" == /dev/stdin || "$2" == /dev/fd/0 || "$2" -ef /dev/stdin ]]
+}
+
+# The position of the first argument that would make GPG sign anything but the
+# whole previewed standard input, if any; never its text, which may be a secret
+# such as an unlisted option's value. Parsed the way GnuPG parses: a long option's value is
+# the next argument unless written with =, a short option's value is the rest
+# of its cluster or else the next argument, and -- ends the options. A lone -
+# counts as a file too: it may be the value of an option missing from the list.
+unpreviewed_input() {
+    local arg rest option="" options_done=0 position=0
+    for arg in "$@"; do
+        position=$((position + 1))
+        if [[ -n "$option" ]]; then
+            if value_reads_stdin "$option" "$arg"; then
+                printf '%d' "$position"
+                return 0
+            fi
+            option=""
+            continue
+        fi
+        if [[ "$options_done" -eq 0 ]]; then
+            case "$arg" in
+                --) options_done=1; continue ;;
+                --*=*)
+                    if value_reads_stdin "${arg%%=*}" "${arg#*=}"; then
+                        printf '%d' "$position"
+                        return 0
+                    fi
+                    continue
+                    ;;
+                --*)
+                    if [[ "$arg" != *[[:space:]]* && "$GPG_VALUE_OPTIONS" == *" ${arg#--} "* ]]; then
+                        option=$arg
+                    fi
+                    continue
+                    ;;
+                -?*)
+                    rest=${arg#-}
+                    while [[ -n "$rest" ]]; do
+                        case "${rest:0:1}" in
+                            [$GPG_VALUE_SHORT_OPTIONS])
+                                if [[ "${#rest}" -eq 1 ]]; then
+                                    option="-$rest"
+                                elif value_reads_stdin "-${rest:0:1}" "${rest:1}"; then
+                                    printf '%d' "$position"
+                                    return 0
+                                fi
+                                break
+                                ;;
+                        esac
+                        rest=${rest:1}
+                    done
+                    continue
+                    ;;
+            esac
+        fi
+        printf '%d' "$position"
+        return 0
+    done
+    return 1
 }
 
 sanitize_stream() {
@@ -531,7 +627,7 @@ offer_pin_retry() {
 
     audit_decision "bad-pin" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
     if [[ "$remaining" == 0 ]]; then
-        error "incorrect PIN; the key's PIN is now blocked (unblock with the Admin PIN: gpg --card-edit, admin, unblock)"
+        error "incorrect PIN; the key's PIN is now blocked (unblock with the Admin PIN: gpg --card-edit, admin, passwd, 2; or with a Reset Code: gpg --card-edit, unblock)"
     else
         error "incorrect PIN; signing cancelled ($remaining_text)"
     fi
@@ -696,6 +792,16 @@ elif [[ "$FIRST_LINE" == object\ * ]] && /usr/bin/awk 'NF == 0 { exit } $1 == "t
     OBJECT_HASH=$(/usr/bin/awk 'NF == 0 { exit } $1 == "object" { print $2; exit }' "$PAYLOAD")
 elif [[ "$FIRST_LINE" == certificate\ version\ * ]]; then
     REQUEST_TYPE="push certificate"
+fi
+
+# GPG must sign exactly the previewed standard input. A file named in the
+# arguments, or an option that reads part of standard input first, would get
+# something else signed behind a preview of it.
+if unpreviewed=$(unpreviewed_input "$@"); then
+    audit_decision "input-reject" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+    error "refusing to sign: argument $unpreviewed would make GPG sign something other than the previewed standard input"
+    error "pass the payload on standard input with no file arguments, and write option values as --option=value"
+    exit 65
 fi
 
 /usr/bin/awk 'body { print; next } $0 == "" { body=1 }' "$PAYLOAD" > "$MESSAGE"

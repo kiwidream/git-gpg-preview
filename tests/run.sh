@@ -420,6 +420,7 @@ run_pin_case --status-fd=2 -bsau TEST
 [[ $(pin_dialogs) == $'pin-entry 2 1\npin-error 1 retry counted\npin-entry 1 2\npin-error 0 final counted' ]] \
     || fail "blocked PIN sequence: $(pin_dialogs)"
 grep -q 'PIN is now blocked' "$TMP/pin.stderr" || fail 'blocked PIN not reported'
+grep -qF 'admin, passwd, 2' "$TMP/pin.stderr" || fail 'blocked PIN message lacks the Admin PIN steps'
 pass 'wrong PINs stop when the key reports its PIN blocked'
 unset FAKE_GPG_PIN FAKE_PIN_ENTRIES
 
@@ -552,6 +553,106 @@ assert_key_path 'a second key named with --default-key' pinentry TEST --default-
 assert_key_path 'the caller'"'"'s own home directory' pinentry TEST --homedir "$TMP/elsewhere"
 unset FAKE_SECRET_KEYS
 pass 'only the key GPG will sign with decides the PIN window'
+
+# GPG signs only the whole previewed standard input. Anything that would change
+# that is refused before any preview or GPG, while option values are not.
+printf 'other content\n' > "$TMP/other"
+ln -s /dev/stdin "$TMP/stdin-link"
+run_input_case() {
+    : > "$TMP/audit.log"
+    : > "$FAKE_DIALOG_LOG"
+    input_calls=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
+    set +e
+    input_output=$("$ROOT/git-gpg-preview" "$@" < "$TMP/commit.payload" 2>"$TMP/input.stderr")
+    input_status=$?
+    set -e
+}
+assert_input_refused() {
+    local label="$1"
+    shift
+    run_input_case "$@"
+    [[ "$input_status" -eq 65 && -z "$input_output" ]] || fail "$label: not refused ($input_status)"
+    [[ $(wc -l < "$FAKE_GPG_CALL_DIR/calls") -eq "$input_calls" ]] || fail "$label: GPG ran"
+    ! grep -q '^start ' "$FAKE_DIALOG_LOG" || fail "$label: preview shown"
+    grep -q 'other than the previewed standard input' "$TMP/input.stderr" || fail "$label: refusal message"
+    grep -q 'decision=input-reject' "$TMP/audit.log" || fail "$label: refusal not audited"
+}
+assert_input_signed() {
+    local label="$1"
+    shift
+    run_input_case "$@"
+    [[ "$input_status" -eq 0 && "$input_output" == 'signature-input' ]] || fail "$label: not signed ($input_status)"
+    grep -q '^start ' "$FAKE_DIALOG_LOG" || fail "$label: no preview"
+    cmp -s "$TMP/commit.payload" "$FAKE_GPG_CALL_DIR/$(latest_call).stdin" || fail "$label: stdin changed before GPG"
+}
+export FAKE_GPG_STDOUT='signature-input'
+# Files, however they are reached.
+assert_input_refused 'file after the options' --status-fd=2 -bsau TEST "$TMP/other"
+assert_input_refused 'file after --' --status-fd=2 -bsau TEST -- "$TMP/other"
+assert_input_refused 'lone -' --status-fd=2 -bsau TEST -
+assert_input_refused 'lone - as an unlisted option value' --status-fd=2 -bsau TEST --passphrase-fi -
+assert_input_refused 'option after -, which GPG reads as a file' --status-fd=2 -bsau TEST - --armor
+assert_input_refused 'file after a long option value' -bsau TEST --output "$TMP/sig" "$TMP/other"
+assert_input_refused 'file after a short option value' -bsau TEST -o "$TMP/sig" "$TMP/other"
+assert_input_refused 'file after -- taken as a value' -bsa -u -- "$TMP/other"
+assert_input_refused 'file after an attached value' -bsauTEST "$TMP/other"
+assert_input_refused 'abbreviated value option' --local TEST -bsa
+assert_input_refused 'unlisted option with a separate value' --status-fd=2 -bsau TEST --keyserver-options value
+grep -qF 'argument 5 would make GPG' "$TMP/input.stderr" || fail 'refusal does not locate the argument'
+assert_input_refused 'unlisted option holding a secret' --passphrase hunter2 -bsau TEST
+grep -qF 'argument 2 would make GPG' "$TMP/input.stderr" || fail 'refusal does not locate the secret-holding argument'
+! grep -q hunter2 "$TMP/input.stderr" || fail 'refusal printed an argument value'
+assert_input_refused 'arguments joined to look like two listed options' -bsau TEST '--local-user logger-fd' "$TMP/other"
+# Options that read part of standard input first, leaving the rest to be signed.
+assert_input_refused 'passphrase from stdin' --pinentry-mode loopback --passphrase-fd=0 -bsau TEST
+assert_input_refused 'passphrase from stdin, separate value' --passphrase-fd 0 -bsau TEST
+assert_input_refused 'passphrase from stdin, leading zero' --passphrase-fd=00 -bsau TEST
+assert_input_refused 'passphrase from an fd that wraps to 0' --passphrase-fd=4294967296 -bsau TEST
+assert_input_refused 'commands from stdin' --command-fd 0 -bsau TEST
+assert_input_refused 'session key from stdin' --override-session-key-fd=0 -bsau TEST
+assert_input_refused 'session key from stdin, abbreviated' --override-session-key-f=0 -bsau TEST
+assert_input_refused 'file that is stdin' --passphrase-file=/dev/stdin -bsau TEST
+assert_input_refused 'link to stdin' --passphrase-file="$TMP/stdin-link" -bsau TEST
+assert_input_refused 'attached stdin value' -f/dev/stdin -bsau TEST
+assert_input_refused 'recipients from stdin' -se -f - -u TEST
+assert_input_refused 'recipients from stdin, long option' --recipient-file=- -se -u TEST
+assert_input_refused 'recipients from stdin, separate value' -se -u TEST --recipient-file -
+assert_input_refused 'recipients from stdin, attached' -se -F- -u TEST
+assert_input_refused 'recipients from a descriptor' --enable-special-filenames -se -f '-&0' -u TEST
+# Requests that once skipped both this check and the preview.
+assert_input_refused 'abbreviated command with a file' --detach -u TEST "$TMP/other"
+assert_input_refused '--verify as an option value' --comment --verify -bsau TEST "$TMP/other"
+# Clean requests still sign, previewed, on the same standard input.
+assert_input_signed 'separate and attached values' --status-fd 2 -bsa -u TEST --output "$TMP/sig" -o "$TMP/sig" -z 6 --keyserver-options=value
+assert_input_signed 'value joined to its option' --status-fd=2 -bsauTEST --local-user=TEST
+assert_input_signed 'output to standard output' -bsau TEST -o - --output=-
+assert_input_signed 'a passphrase value' --passphrase=not-a-file -bsau TEST
+assert_input_signed 'another descriptor' --pinentry-mode=loopback --passphrase-fd=5 -bsau TEST
+assert_input_signed 'abbreviated command' --detach -u TEST
+assert_input_signed 'hyphen-leading value' -bsa -u -odd
+# A value is not a command: these verify, and go straight to GPG.
+run_input_case -ubob --verify "$TMP/fake.sig" -
+[[ "$input_status" -eq 0 ]] && ! grep -q '^start ' "$FAKE_DIALOG_LOG" || fail "attached value read as a signing command ($input_status)"
+run_input_case -ostatus --verify "$TMP/fake.sig" -
+[[ "$input_status" -eq 0 ]] && ! grep -q '^start ' "$FAKE_DIALOG_LOG" || fail "attached output read as a signing command ($input_status)"
+pass 'only the whole previewed standard input can be signed'
+
+# A listed option that took no value would let the file after it through, so
+# hold the list to the GnuPG on this machine.
+if real_gpg=$(command -v gpg); then
+    mkdir -p "$TMP/gnupg"
+    long_options=$(sed -n 's/^GPG_VALUE_OPTIONS=" \(.*\) "$/\1/p' "$ROOT/git-gpg-preview")
+    short_options=$(sed -n 's/^GPG_VALUE_SHORT_OPTIONS=//p' "$ROOT/git-gpg-preview" | sed 's/./& /g')
+    [[ $(printf '%s\n' $long_options | wc -l) -gt 50 && -n "$short_options" ]] || fail 'could not read the value option lists'
+    for option in $long_options $short_options; do
+        [[ "${#option}" -eq 1 ]] && flag="-$option" || flag="--$option"
+        missing=$(LC_ALL=C GNUPGHOME="$TMP/gnupg" "$real_gpg" --batch --no-options "$flag" < /dev/null 2>&1 || true)
+        [[ "$missing" == *'missing argument'* ]] || fail "$real_gpg does not require a value for $flag: $missing"
+    done
+    pass "every option read as taking a value requires one in $($real_gpg --version | head -n 1)"
+else
+    pass 'no gpg installed to check the value option list against'
+fi
 
 export FAKE_GPG_STDOUT=''
 export FAKE_GPG_SIGNAL=TERM
