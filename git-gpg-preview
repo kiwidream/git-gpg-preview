@@ -581,10 +581,14 @@ card_touch_policy() {
 # signs without any touch, and cached lets a request queued behind a touch sign
 # without its own. On already asks for a touch on every signature, and fixed and
 # cached-fixed cannot be changed without replacing the key, so they get nothing.
+# Two lines of at most 80 characters, the policy and then the command, so both
+# fit the width of the preview's facts pane, which does not wrap.
 touch_policy_notice() {
     case "$1" in
-        off) printf '%s' "Touch policy is off: this key signs with no touch. To require one, run: ykman openpgp keys set-touch sig on" ;;
-        cached) printf '%s' "Touch policy is cached: a request queued within 15 seconds of a touch signs without its own touch. To require one every time, run: ykman openpgp keys set-touch sig on" ;;
+        off) printf '%s\n%s' "Touch policy is off: this key signs with no touch." \
+            "To require one, run: ykman openpgp keys set-touch sig on" ;;
+        cached) printf '%s\n%s' "Touch policy is cached: a touch also signs what arrives in the next 15 seconds." \
+            "To require a touch for every signature, run: ykman openpgp keys set-touch sig on" ;;
         *) return 1 ;;
     esac
 }
@@ -1082,14 +1086,17 @@ if uses_builtin_pin_entry "$@"; then
     GPG_ARGS=(--pinentry-mode loopback --command-fd 3 "$@")
 fi
 # Read under the lock, like the PIN counter: the card is busy while another
-# request waits for its touch. The notice is one line above the facts in every
-# preview of this request, and goes to stderr too, which Git shows only when
-# signing fails. Advisory: signing goes ahead under the key's current policy.
+# request waits for its touch. The notice is two lines above the facts in every
+# preview of this request, and one on stderr, which Git shows only when signing
+# fails. Advisory: signing goes ahead under the key's current policy.
 names_own_gnupg_files "$@" || card_touch_policy
 if TOUCH_NOTICE=$(touch_policy_notice "$TOUCH_POLICY"); then
     { printf '%s\n\n' "$TOUCH_NOTICE"; /bin/cat "$SUMMARY"; } > "$SUMMARY.touch" &&
         /bin/mv -f "$SUMMARY.touch" "$SUMMARY"
-    error "note: $TOUCH_NOTICE"
+    # The newline goes through a variable, which keeps the pattern plain for
+    # macOS's bash 3.2: no $'...' quoting inside a double-quoted expansion.
+    NEWLINE=$'\n'
+    error "note: ${TOUCH_NOTICE//$NEWLINE/ }"
 fi
 ATTEMPT=1
 while :; do

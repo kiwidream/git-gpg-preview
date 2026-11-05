@@ -656,11 +656,18 @@ fi
 
 # Before the first preview, the touch policy of the key GPG will sign with is
 # read through gpg-agent with the gpg-connect-agent beside real GPG, and only
-# when that key is the card's signature key. Off and cached put the ykman command
-# above the facts and repeat it on stderr. The preview is the only window, and
+# when that key is the card's signature key. Off and cached put two lines above
+# the facts, the policy and the ykman command, and one note on stderr. Nothing
+# anywhere suggests the cached policy, the preview is the only window, and
 # signing goes ahead either way.
-TOUCH_OFF="Touch policy is off: this key signs with no touch. To require one, run: ykman openpgp keys set-touch sig on"
-TOUCH_CACHED="Touch policy is cached: a request queued within 15 seconds of a touch signs without its own touch. To require one every time, run: ykman openpgp keys set-touch sig on"
+TOUCH_OFF=$'Touch policy is off: this key signs with no touch.\nTo require one, run: ykman openpgp keys set-touch sig on'
+TOUCH_CACHED=$'Touch policy is cached: a touch also signs what arrives in the next 15 seconds.\nTo require a touch for every signature, run: ykman openpgp keys set-touch sig on'
+CACHED_HINT='set-touch[[:space:]]+sig[[:space:]]+cached|use cached'
+# note_line NOTICE: the one stderr line that carries NOTICE.
+note_line() {
+    local newline=$'\n'
+    printf 'git-gpg-preview: note: %s\n' "${1//$newline/ }"
+}
 mkdir -p "$TMP/gnupg-bin" "$TMP/linked-bin"
 ln -s "$ROOT/tests/helpers/fake-gpg" "$TMP/gnupg-bin/gpg"
 ln -s "$ROOT/tests/helpers/fake-gpg-connect-agent" "$TMP/gnupg-bin/gpg-connect-agent"
@@ -685,12 +692,18 @@ assert_touch_notice() {
     ls -A "$XDG_CONFIG_HOME/git-gpg-preview" | cmp -s - "$TMP/config-files.before" || fail "$label: a file was written beside the configuration"
     [[ $(grep -c '^start ' "$FAKE_DIALOG_LOG") -eq 1 ]] && ! grep -q '^touch-' "$FAKE_DIALOG_LOG" || fail "$label: a window other than the preview opened"
     summary=$(latest_capture)
+    ! grep -qiE "$CACHED_HINT" "$summary" "$(details_of "$summary")" "$TMP/pin.stderr" ||
+        fail "$label: suggests the cached touch policy"
     if [[ -n "$expected" ]]; then
-        [[ $(head -n 1 "$summary") == "$expected" ]] || fail "$label: the notice is not above the facts"
-        [[ $(sed -n 3p "$summary") == 'Request type: commit' ]] || fail "$label: the notice displaced the facts"
-        [[ $(sed -n 9p "$summary") == 'Message:' ]] || fail "$label: the notice moved the Message: line"
-        grep -qxF "git-gpg-preview: note: $expected" "$TMP/pin.stderr" || fail "$label: notice missing from stderr"
+        [[ $(head -n 2 "$summary") == "$expected" ]] || fail "$label: the notice is not above the facts"
+        [[ -z $(head -n 2 "$summary" | awk 'length > 80') ]] || fail "$label: a notice line is wider than the facts pane"
+        [[ -z $(sed -n 3p "$summary") && $(sed -n 4p "$summary") == 'Request type: commit' ]] || fail "$label: the notice displaced the facts"
+        [[ $(sed -n 10p "$summary") == 'Message:' ]] || fail "$label: the notice moved the Message: line"
+        [[ $(grep '^git-gpg-preview: note: ' "$TMP/pin.stderr") == "$(note_line "$expected")" ]] ||
+            fail "$label: stderr does not carry exactly the notice"
     else
+        [[ $(head -n 1 "$summary") == 'Request type: commit' ]] || fail "$label: a line above the facts"
+        ! grep -q '^git-gpg-preview: note: ' "$TMP/pin.stderr" || fail "$label: a note on stderr"
         ! grep -qF 'ykman' "$summary" "$TMP/pin.stderr" || fail "$label: unexpected touch notice"
     fi
 }
@@ -754,7 +767,7 @@ export FAKE_CARD_UIF=%00+ FAKE_GPG_EXIT=42 FAKE_GPG_STDERR=$'gpg: signing failed
 run_pin_case --status-fd=2 -bsau TEST
 unset FAKE_GPG_EXIT FAKE_GPG_STDERR
 [[ "$pin_status" -eq 42 ]] || fail "the touch notice changed GPG's failure status ($pin_status)"
-grep -qxF "git-gpg-preview: note: $TOUCH_OFF" "$TMP/pin.stderr" || fail 'a failed signature lost the touch notice'
+grep -qxF "$(note_line "$TOUCH_OFF")" "$TMP/pin.stderr" || fail 'a failed signature lost the touch notice'
 grep -qxF 'gpg: signing failed: Card error' "$TMP/pin.stderr" || fail "a failed signature lost GPG's error"
 pass 'a failed signature reports the touch notice next to the GPG error'
 
@@ -767,7 +780,7 @@ export FAKE_PIN_ENTRIES=654321,123456 FAKE_PIN_ERROR_DECISION=retry
 run_pin_case --status-fd=2 -bsau TEST
 [[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "touch notice with a PIN retry ($pin_status)"
 retry_summary=$(grep -l '^PIN attempt 2: ' "$TMP/captures"/*.summary) || fail 'the retry preview was not shown'
-grep -qxF "$TOUCH_OFF" "$retry_summary" || fail 'the retry preview lost the touch notice'
+[[ $(sed -n 3,4p "$retry_summary") == "$TOUCH_OFF" ]] || fail 'the retry preview lost the touch notice'
 [[ $(connect_agent_calls) -eq 1 ]] || fail 'touch policy was read again for the retry'
 unset FAKE_CARD_UIF FAKE_CARD_SIG_KEY FAKE_PIN_RETRIES FAKE_GPG_PIN FAKE_PIN_ENTRIES FAKE_PIN_ERROR_DECISION FAKE_SECRET_KEYS
 cp "$TMP/config.saved" "$XDG_CONFIG_HOME/git-gpg-preview/config"

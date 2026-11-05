@@ -458,12 +458,14 @@ def resolve_signing_key(real_gpg: str, configured: str = '') -> tuple[str, str]:
 TOUCH_POLICIES = ('off', 'on', 'fixed', 'cached', 'cached-fixed')
 # Must match touch_policy_notice in the git-gpg-preview wrapper. On already asks
 # for a touch on every signature, and fixed and cached-fixed cannot be changed
-# without replacing the key, so they get no notice.
+# without replacing the key, so they get no notice. Two lines of at most 80
+# characters, the policy and then the command, so both fit the width of the
+# preview's facts pane, which does not wrap.
 TOUCH_NOTICES = {
-    'off': 'Touch policy is off: this key signs with no touch. '
+    'off': 'Touch policy is off: this key signs with no touch.\n'
            'To require one, run: ykman openpgp keys set-touch sig on',
-    'cached': 'Touch policy is cached: a request queued within 15 seconds of a touch signs without its own touch. '
-              'To require one every time, run: ykman openpgp keys set-touch sig on',
+    'cached': 'Touch policy is cached: a touch also signs what arrives in the next 15 seconds.\n'
+              'To require a touch for every signature, run: ykman openpgp keys set-touch sig on',
 }
 
 
@@ -871,7 +873,8 @@ class Service:
                     paths['summary.txt'].write_text(f'{notice}\n\n{summary}')
                 result = self._run_dialog_and_gpg(args, paths, info, digest, repo, peer)
                 if notice:
-                    result['stderr'] = f'git-gpg-preview: note from the signing Mac: {notice}\n{result["stderr"]}'
+                    note = notice.replace('\n', ' ')
+                    result['stderr'] = f'git-gpg-preview: note from the signing Mac: {note}\n{result["stderr"]}'
                 return result
 
     def _touch_notice(self) -> str:

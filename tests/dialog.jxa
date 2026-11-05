@@ -118,12 +118,24 @@ function run(argv) {
         if (!seen.messageOnTop || !seen.messageLarger) throw new Error('The message pane is not first and largest');
         if (!seen.messageWraps || !seen.factsUnwrapped) throw new Error('Wrong pane wrapping');
     });
+    // A touch policy notice is a fact: the facts pane shows it above the request,
+    // unwrapped, and the message pane does not. Without one (above), the facts
+    // pane starts with the request.
+    const notice = 'Touch policy is off: this key signs with no touch.\nTo require one, run: ykman openpgp keys set-touch sig on';
+    $.NSString.stringWithString(notice + '\n\nRequest type: commit\n\nMessage:\nNoisy subject').writeToFileAtomicallyEncodingError(summary, true, $.NSUTF8StringEncoding, null);
+    $.NSData.data.writeToFileAtomically(decision, true);
+    expectedSpam = false;
+    responses = [1001];
+    panesSeen = [];
+    runPreview([summary, details, decision, ready]);
+    if (panesSeen.length !== 1 || panesSeen[0].facts !== notice + '\n\nRequest type: commit' ||
+        panesSeen[0].message !== 'Noisy subject' || !panesSeen[0].factsUnwrapped) throw new Error('Wrong panes with a touch notice: ' + JSON.stringify(panesSeen));
     // The first marker ends the facts, whatever the message says.
     [
         {summary: 'Request type: commit\n\nMessage:\nSubject', facts: 'Request type: commit', message: 'Subject'},
         {summary: 'Request type: commit\n\nMessage:\nSubject\n\nMessage:\nForged', facts: 'Request type: commit', message: 'Subject\n\nMessage:\nForged'},
         {summary: 'PIN attempt 2: wrong\n\nRequest type: commit\n\nMessage:\n', facts: 'PIN attempt 2: wrong\n\nRequest type: commit', message: ''},
-        {summary: 'Touch policy is off\n\nRequest type: commit\n\nMessage:\nSubject', facts: 'Touch policy is off\n\nRequest type: commit', message: 'Subject'},
+        {summary: 'Touch policy is off\nTo require one\n\nRequest type: commit\n\nMessage:\nSubject', facts: 'Touch policy is off\nTo require one\n\nRequest type: commit', message: 'Subject'},
         {summary: 'Request type: commit\nMessage:\nNo blank line', facts: '', message: 'Request type: commit\nMessage:\nNo blank line'}
     ].forEach(function(test) {
         const parts = splitSummary(test.summary);
@@ -190,5 +202,5 @@ function run(argv) {
             if (!seen.secure) throw new Error(where + 'PIN field is not secure');
         });
     });
-    return 'Dialog actions passed (26 cases)';
+    return 'Dialog actions passed (27 cases)';
 }

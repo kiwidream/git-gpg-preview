@@ -625,6 +625,10 @@ SUBKEY_B = 'CCCC' * 9 + '0000000C'
 TWO_KEYS = f'{PRIMARY_A},{PRIMARY_B}/{SUBKEY_B}'
 
 
+# A suggestion of the cached touch policy, which nothing may show.
+CACHED_HINT = re.compile(r'set-touch\s+sig\s+cached|use cached', re.I)
+
+
 class TouchPolicyTests(unittest.TestCase):
     """A touch policy of off or cached on the card key the service signs with
     puts the ykman command above the facts, as in the wrapper; signing goes ahead
@@ -654,7 +658,8 @@ class TouchPolicyTests(unittest.TestCase):
     def sign(self, h: Harness, card: str) -> tuple[str, str]:
         """Signs through the client with CARD in the reader: its signature key
         and raw UIF-1 value, or '' for no card. Returns the preview summary
-        and the client's stderr."""
+        and the client's stderr, after checking that neither they nor the
+        details suggest the cached policy."""
         if card:
             self.card.write_text(card)
         else:
@@ -662,7 +667,15 @@ class TouchPolicyTests(unittest.TestCase):
         result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, b'signature:remote')
-        return h.latest_capture()[0], result.stderr.decode()
+        summary, details = h.latest_capture()
+        stderr = result.stderr.decode()
+        self.assertNotRegex(summary + details + stderr, CACHED_HINT)
+        return summary, stderr
+
+    @staticmethod
+    def note(policy: str) -> str:
+        """The one stderr line that carries POLICY's notice."""
+        return 'git-gpg-preview: note from the signing Mac: ' + remote.TOUCH_NOTICES[policy].replace('\n', ' ') + '\n'
 
     @staticmethod
     def agent_calls(h: Harness) -> int:
@@ -678,7 +691,8 @@ class TouchPolicyTests(unittest.TestCase):
                 facts, marker, message = summary.partition('\n\nMessage:\n')
                 self.assertIn('ykman openpgp keys set-touch sig on', facts)
                 self.assertTrue(marker and message.startswith('Second commit'), summary)
-                self.assertIn(f'git-gpg-preview: note from the signing Mac: {remote.TOUCH_NOTICES[policy]}\n', stderr)
+                self.assertIn(self.note(policy), stderr)
+                self.assertEqual(stderr.count('note from the signing Mac'), 1, stderr)
         self.assertEqual(self.agent_calls(h), 2, 'the policy is read once per request')
 
     def test_on_fixed_cached_fixed_and_unreadable_policies_get_no_notice(self):
@@ -689,6 +703,7 @@ class TouchPolicyTests(unittest.TestCase):
                 summary, stderr = self.sign(h, card)
                 self.assertTrue(summary.startswith('Request type: commit\n'), summary)
                 self.assertNotIn('ykman', stderr)
+                self.assertNotIn('note from the signing Mac', stderr)
 
     def test_a_software_key_or_no_gpg_connect_agent_gets_no_notice(self):
         for name, h in (('software key', self.harness('software', card_keys='')),
@@ -697,6 +712,7 @@ class TouchPolicyTests(unittest.TestCase):
                 summary, stderr = self.sign(h, f'{self.CARD_SUB} %00+')
                 self.assertTrue(summary.startswith('Request type: commit\n'), summary)
                 self.assertNotIn('ykman', stderr)
+                self.assertNotIn('note from the signing Mac', stderr)
                 self.assertEqual(self.agent_calls(h), 0)
 
     def test_the_note_reaches_git_beside_a_failure(self):
@@ -706,7 +722,8 @@ class TouchPolicyTests(unittest.TestCase):
         result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
         self.assertEqual((result.returncode, result.stdout), (1, b''))
         stderr = result.stderr.decode()
-        self.assertIn(f'git-gpg-preview: note from the signing Mac: {remote.TOUCH_NOTICES["off"]}\n', stderr)
+        self.assertIn(self.note('off'), stderr)
+        self.assertNotRegex(stderr, CACHED_HINT)
         self.assertIn('signing cancelled by operator', stderr)
 
     def test_the_preview_is_the_only_window_and_nothing_is_recorded(self):
@@ -729,7 +746,7 @@ class TouchPolicyTests(unittest.TestCase):
             with self.subTest(policy=policy):
                 summary, stderr = self.sign(h, f'{self.CARD_SUB} {uif}')
                 self.assertTrue(summary.startswith(remote.TOUCH_NOTICES[policy]), summary)
-                self.assertIn(remote.TOUCH_NOTICES[policy], stderr)
+                self.assertIn(self.note(policy), stderr)
                 self.assertEqual(record.read_text(), old)
                 self.assertEqual(record.stat().st_mtime, 1)
 
@@ -785,10 +802,16 @@ class TouchPolicyTests(unittest.TestCase):
                     self.card.write_text(card)
                     self.assertEqual(remote.card_touch_policy(agent, self.CARD_SUB), policy)
 
-    def test_only_off_and_cached_get_a_notice_and_both_suggest_on(self):
+    def test_only_off_and_cached_get_a_notice_of_two_short_lines_suggesting_on(self):
         self.assertEqual(sorted(remote.TOUCH_NOTICES), ['cached', 'off'])
-        for notice in remote.TOUCH_NOTICES.values():
-            self.assertTrue(notice.endswith('run: ykman openpgp keys set-touch sig on'), notice)
+        for policy, notice in remote.TOUCH_NOTICES.items():
+            with self.subTest(policy=policy):
+                lines = notice.split('\n')
+                self.assertEqual(len(lines), 2, notice)
+                self.assertTrue(lines[0].startswith(f'Touch policy is {policy}: '), notice)
+                self.assertTrue(lines[1].endswith('run: ykman openpgp keys set-touch sig on'), notice)
+                self.assertTrue(all(len(line) <= 80 for line in lines), 'the facts pane does not wrap')
+                self.assertNotRegex(notice, CACHED_HINT)
 
     def test_touch_notices_match_the_wrapper(self):
         wrapper = (ROOT.parent / 'git-gpg-preview').read_text()

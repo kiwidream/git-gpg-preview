@@ -92,7 +92,9 @@ function splitSummary(summary) {
 
 const PREVIEW_WIDTH = 560;
 const MESSAGE_PANE_HEIGHT = 240;
-const FACTS_PANE_HEIGHT = 112;
+// Nine lines at 11 points: the remote service's six facts, below a blank line
+// and a two-line touch policy notice.
+const FACTS_PANE_HEIGHT = 128;
 const PANE_GAP = 8;
 
 // The message is what the reader came to check, so it comes first, gets the
