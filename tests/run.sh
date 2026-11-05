@@ -656,12 +656,11 @@ fi
 
 # Before the first preview, the touch policy of the key GPG will sign with is
 # read through gpg-agent with the gpg-connect-agent beside real GPG, and only
-# when that key is the card's signature key. Off and on get a window of their
-# own, and the ykman command on stderr; the preview stays about the message, and
+# when that key is the card's signature key. Off and cached put the ykman command
+# above the facts and repeat it on stderr. The preview is the only window, and
 # signing goes ahead either way.
-TOUCH_ON="Touch policy is on: a touch for every signature. To let a touch cover 15 seconds, run: ykman openpgp keys set-touch sig cached"
-TOUCH_OFF="Touch policy is off: this key signs with no touch. To require one, run: ykman openpgp keys set-touch sig cached"
-TOUCH_OFFERS="$XDG_CONFIG_HOME/git-gpg-preview/touch-offers"
+TOUCH_OFF="Touch policy is off: this key signs with no touch. To require one, run: ykman openpgp keys set-touch sig on"
+TOUCH_CACHED="Touch policy is cached: a request queued within 15 seconds of a touch signs without its own touch. To require one every time, run: ykman openpgp keys set-touch sig on"
 mkdir -p "$TMP/gnupg-bin" "$TMP/linked-bin"
 ln -s "$ROOT/tests/helpers/fake-gpg" "$TMP/gnupg-bin/gpg"
 ln -s "$ROOT/tests/helpers/fake-gpg-connect-agent" "$TMP/gnupg-bin/gpg-connect-agent"
@@ -673,244 +672,106 @@ use_real_gpg() {
 connect_agent_calls() {
     [[ -f "$FAKE_GPG_CALL_DIR/connect-agent-calls" ]] && wc -l < "$FAKE_GPG_CALL_DIR/connect-agent-calls" | tr -d ' ' || echo 0
 }
-touch_dialogs() {
-    grep -E '^touch-' "$FAKE_DIALOG_LOG" || true
-}
-# assert_touch_offer LABEL UIF EXPECTED-NOTICE GPG-ARGS...; an empty notice means no offer.
-assert_touch_offer() {
-    local label="$1" expected="$3" policy=on summary
+# assert_touch_notice LABEL UIF EXPECTED-NOTICE GPG-ARGS...; an empty notice means none.
+assert_touch_notice() {
+    local label="$1" expected="$3" summary
     export FAKE_CARD_UIF="$2"
     shift 3
     reset_pin_state
-    rm -f "$TOUCH_OFFERS" "$FAKE_GPG_CALL_DIR/connect-agent-calls" "$FAKE_GPG_CALL_DIR/secret-key-listings"
+    rm -f "$FAKE_GPG_CALL_DIR/connect-agent-calls" "$FAKE_GPG_CALL_DIR/secret-key-listings"
+    ls -A "$XDG_CONFIG_HOME/git-gpg-preview" > "$TMP/config-files.before"
     run_pin_case "$@"
     [[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "$label: signing ($pin_status)"
+    ls -A "$XDG_CONFIG_HOME/git-gpg-preview" | cmp -s - "$TMP/config-files.before" || fail "$label: a file was written beside the configuration"
+    [[ $(grep -c '^start ' "$FAKE_DIALOG_LOG") -eq 1 ]] && ! grep -q '^touch-' "$FAKE_DIALOG_LOG" || fail "$label: a window other than the preview opened"
     summary=$(latest_capture)
-    [[ $(head -n 1 "$summary") == 'Request type: commit' ]] || fail "$label: the preview does not lead with the request"
-    ! grep -qF 'ykman' "$summary" || fail "$label: touch notice in the preview"
     if [[ -n "$expected" ]]; then
-        [[ "$expected" == "$TOUCH_OFF" ]] && policy=off
-        [[ $(touch_dialogs) == "touch-offer $policy 3" ]] || fail "$label: no offer: $(touch_dialogs)"
+        [[ $(head -n 1 "$summary") == "$expected" ]] || fail "$label: the notice is not above the facts"
+        [[ $(sed -n 3p "$summary") == 'Request type: commit' ]] || fail "$label: the notice displaced the facts"
+        [[ $(sed -n 9p "$summary") == 'Message:' ]] || fail "$label: the notice moved the Message: line"
         grep -qxF "git-gpg-preview: note: $expected" "$TMP/pin.stderr" || fail "$label: notice missing from stderr"
     else
-        [[ -z $(touch_dialogs) ]] || fail "$label: unexpected offer: $(touch_dialogs)"
-        ! grep -qF 'ykman' "$TMP/pin.stderr" || fail "$label: unexpected touch notice"
-        [[ ! -e "$TOUCH_OFFERS" ]] || fail "$label: offer recorded"
+        ! grep -qF 'ykman' "$summary" "$TMP/pin.stderr" || fail "$label: unexpected touch notice"
     fi
 }
 use_real_gpg "$TMP/gnupg-bin/gpg"
 export FAKE_SECRET_KEYS="$TMP/secret-keys" FAKE_GPG_STDOUT='signature-touch-policy' FAKE_CARD_SIG_KEY=$CARD_SUB
 secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" > "$FAKE_SECRET_KEYS"
-assert_touch_offer 'touch policy on' '%01+' "$TOUCH_ON" --status-fd=2 -bsau TEST
+assert_touch_notice 'touch policy off' '%00+' "$TOUCH_OFF" --status-fd=2 -bsau TEST
 [[ $(connect_agent_calls) -eq 1 ]] || fail 'touch policy was not read once'
 [[ $(wc -l < "$FAKE_GPG_CALL_DIR/secret-key-listings") -eq 1 ]] || fail 'the signing key was looked up more than once'
-assert_touch_offer 'touch policy off' '%00+' "$TOUCH_OFF" --status-fd=2 -bsau TEST
-assert_touch_offer 'touch policy on, pinentry path' '%01+' "$TOUCH_ON" -bsau TEST
-assert_touch_offer 'touch policy cached' '%03+' '' --status-fd=2 -bsau TEST
-assert_touch_offer 'touch policy cached-fixed' '%04+' '' --status-fd=2 -bsau TEST
-assert_touch_offer 'touch policy fixed' '%02+' '' --status-fd=2 -bsau TEST
-assert_touch_offer 'unknown touch policy byte' '%05+' '' --status-fd=2 -bsau TEST
-assert_touch_offer 'card without a touch setting' '' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'touch policy cached' '%03+' "$TOUCH_CACHED" --status-fd=2 -bsau TEST
+assert_touch_notice 'touch policy off, pinentry path' '%00+' "$TOUCH_OFF" -bsau TEST
+assert_touch_notice 'touch policy on' '%01+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'touch policy cached-fixed' '%04+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'touch policy fixed' '%02+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'unknown touch policy byte' '%05+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'card without a touch setting' '' '' --status-fd=2 -bsau TEST
 export FAKE_CARD_SIG_KEY=$OTHER_CARD
-assert_touch_offer 'another key in the card signature slot' '%01+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'another key in the card signature slot' '%00+' '' --status-fd=2 -bsau TEST
 unset FAKE_CARD_SIG_KEY
-assert_touch_offer 'no card in the reader' '%01+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'no card in the reader' '%00+' '' --status-fd=2 -bsau TEST
 export FAKE_CARD_SIG_KEY=$CARD_SUB
-assert_touch_offer 'the caller'"'"'s own home directory' '%01+' '' --status-fd=2 -bsau TEST --homedir "$TMP/elsewhere"
+assert_touch_notice 'the caller'"'"'s own home directory' '%00+' '' --status-fd=2 -bsau TEST --homedir "$TMP/elsewhere"
 [[ $(connect_agent_calls) -eq 0 ]] || fail 'touch policy read for the caller'"'"'s own home directory'
-assert_touch_offer 'the caller'"'"'s own keyring' '%01+' '' --status-fd=2 -bsau TEST --keyring "$TMP/elsewhere.kbx"
-assert_touch_offer 'a second key named with --default-key' '%01+' '' --status-fd=2 -bsau TEST --default-key OTHER
+assert_touch_notice 'the caller'"'"'s own keyring' '%00+' '' --status-fd=2 -bsau TEST --keyring "$TMP/elsewhere.kbx"
+assert_touch_notice 'a second key named with --default-key' '%00+' '' --status-fd=2 -bsau TEST --default-key OTHER
 export FAKE_SECRET_KEYS_STATUS=2
-assert_touch_offer 'listing that failed' '%01+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'listing that failed' '%00+' '' --status-fd=2 -bsau TEST
 unset FAKE_SECRET_KEYS_STATUS
 export FAKE_CONNECT_AGENT_EXIT=2
-assert_touch_offer 'gpg-connect-agent that failed' '%01+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'gpg-connect-agent that failed' '%00+' '' --status-fd=2 -bsau TEST
 unset FAKE_CONNECT_AGENT_EXIT
 secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 200 "$CARD" "$SOFT_SUB" u 300 + > "$FAKE_SECRET_KEYS"
-assert_touch_offer 'software key signs' '%01+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'software key signs' '%00+' '' --status-fd=2 -bsau TEST
 [[ $(connect_agent_calls) -eq 0 ]] || fail 'touch policy read for a software key'
 secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" > "$FAKE_SECRET_KEYS"
 use_real_gpg "$TMP/linked-bin/gpg"
-assert_touch_offer 'gpg-connect-agent beside the linked real GPG' '%01+' "$TOUCH_ON" --status-fd=2 -bsau TEST
+assert_touch_notice 'gpg-connect-agent beside the linked real GPG' '%00+' "$TOUCH_OFF" --status-fd=2 -bsau TEST
 use_real_gpg "$ROOT/tests/helpers/fake-gpg"
-assert_touch_offer 'no gpg-connect-agent beside real GPG' '%01+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'no gpg-connect-agent beside real GPG' '%00+' '' --status-fd=2 -bsau TEST
 [[ $(connect_agent_calls) -eq 0 ]] || fail 'a gpg-connect-agent not beside real GPG was used'
-pass 'a touch policy other than cached gets a window of its own, and signing goes ahead'
+pass 'touch policy off or cached puts the ykman command above the facts, no other window opens, and signing goes ahead'
 
-# touch_case [GPG-ARGS...]: sign once with the key's policy on, keeping the record.
-touch_case() {
-    reset_pin_state
-    rm -f "$FAKE_GPG_CALL_DIR/connect-agent-calls"
-    run_pin_case --status-fd=2 -bsau TEST "$@"
-    [[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "signing with a touch policy offer ($pin_status)"
-}
-# The record says when the offer was last shown; make that long ago.
-offer_shown_long_ago() {
-    awk -v key="$CARD_SUB" '$1 == key { $3 = 1 } { print }' "$TOUCH_OFFERS" > "$TOUCH_OFFERS.new"
-    mv -f "$TOUCH_OFFERS.new" "$TOUCH_OFFERS"
-}
-offer_dismissals() {
-    awk -v key="$CARD_SUB" '$1 == key { print $2 }' "$TOUCH_OFFERS"
-}
+# An install from before the offer was removed keeps its record, which is neither
+# read nor written: a key with every dismissal used still gets the notice.
 use_real_gpg "$TMP/gnupg-bin/gpg"
-export FAKE_CARD_UIF=%01+
-TOUCH_OFFER_DISMISSALS=$(sed -n 's/^TOUCH_OFFER_DISMISSALS=//p' "$ROOT/git-gpg-preview")
-TOUCH_OFFER_INTERVAL=$(sed -n 's/^TOUCH_OFFER_INTERVAL=//p' "$ROOT/git-gpg-preview")
-[[ "$TOUCH_OFFER_DISMISSALS" -eq 3 && "$TOUCH_OFFER_INTERVAL" -eq 86400 ]] || fail 'could not read the offer limits'
-
-# Not Now: once a day, three times in all, then never again, notice included.
-rm -f "$TOUCH_OFFERS"
-touch_case
-[[ $(touch_dialogs) == 'touch-offer on 3' ]] || fail "first offer: $(touch_dialogs)"
-[[ $(offer_dismissals) == 1 ]] || fail 'first dismissal not recorded'
-[[ $(stat -f '%Lp' "$TOUCH_OFFERS") == 600 ]] || fail 'touch offer record is not private'
-touch_case
-[[ -z $(touch_dialogs) ]] || fail 'offered again within a day'
-! grep -qF 'ykman' "$TMP/pin.stderr" || fail 'notice repeated within a day'
-offer_shown_long_ago
-touch_case
-[[ $(touch_dialogs) == 'touch-offer on 2' ]] || fail "second offer: $(touch_dialogs)"
-offer_shown_long_ago
-touch_case
-[[ $(touch_dialogs) == 'touch-offer on 1' ]] || fail "third offer: $(touch_dialogs)"
-[[ $(offer_dismissals) == 3 ]] || fail 'third dismissal not recorded'
-offer_shown_long_ago
-touch_case
-[[ -z $(touch_dialogs) ]] || fail 'offered after the last dismissal'
-! grep -qF 'ykman' "$TMP/pin.stderr" || fail 'notice repeated after the last dismissal'
-pass 'Not Now asks again a day later, three times at most, then never again'
-
-# The record is per key and only advice: bad lines count as no line, and a file
-# that cannot be kept means no window, since it would open on every signature.
-printf '%s 2 %d\n' "$CARD_SUB" "$(($(date +%s) + 100000))" > "$TOUCH_OFFERS"
-touch_case
-[[ $(touch_dialogs) == 'touch-offer on 1' ]] || fail "a time in the future silenced the offer: $(touch_dialogs)"
-for line in "$CARD_SUB" "$CARD_SUB x 1" "$CARD_SUB 3" "$CARD_SUB 3 x" "$CARD_SUB -3 1" "$CARD_SUB 03 1" "$CARD_SUB 3 1 extra" \
-    "$CARD_SUB 9999999999999999999 1" "$CARD_SUB 3 9999999999999999999" "$OTHER_CARD 3 1" 'garbage'; do
-    printf '%s\n' "$line" > "$TOUCH_OFFERS"
-    touch_case
-    [[ $(touch_dialogs) == 'touch-offer on 3' ]] || fail "malformed record '$line': $(touch_dialogs)"
-    grep -qxF "$line" "$TOUCH_OFFERS" && [[ "$line" == "$CARD_SUB"* ]] && fail "record '$line' for this key was kept beside the new one"
-done
-printf '%s 3 7\n' "$OTHER_CARD" > "$TOUCH_OFFERS"
-touch_case
-grep -qxF "$OTHER_CARD 3 7" "$TOUCH_OFFERS" || fail 'another key lost its record'
-rm -f "$TOUCH_OFFERS"
-mkdir "$TOUCH_OFFERS"
-touch_case
-[[ -z $(touch_dialogs) ]] || fail 'offered although the record cannot be kept'
-grep -qF "could not save $TOUCH_OFFERS" "$TMP/pin.stderr" || fail 'an unusable record was not reported'
-grep -qxF "git-gpg-preview: note: $TOUCH_ON" "$TMP/pin.stderr" || fail 'an unusable record lost the notice'
-rmdir "$TOUCH_OFFERS"
-printf '%s 0 1\n' "$CARD_SUB" > "$TMP/offers-target"
-ln -s "$TMP/offers-target" "$TOUCH_OFFERS"
-touch_case
-[[ -z $(touch_dialogs) ]] || fail 'offered through a symbolic link'
-[[ -L "$TOUCH_OFFERS" && $(cat "$TMP/offers-target") == "$CARD_SUB 0 1" ]] || fail 'the record followed a symbolic link'
-rm -f "$TOUCH_OFFERS"
-pass 'the offer record is per key, private, and bad or unusable records cannot silence or repeat it'
-
-# Use Cached writes UIF-1 through gpg-agent, under the same lock and before GPG;
-# only the value the card reads back counts. scdaemon is stopped after it.
-export FAKE_TOUCH_OFFER_DECISION=apply
-touch_case
-summary=$(latest_capture)
-[[ $(touch_dialogs) == 'touch-offer on 3' ]] || fail "Use Cached windows: $(touch_dialogs)"
-[[ $(sed -n 2p "$FAKE_GPG_CALL_DIR/connect-agent-calls") == 'SCD SERIALNO openpgp SCD SETATTR UIF-1 %03+ SCD GETATTR UIF-1 SCD KILLSCD /bye' ]] \
-    || fail "Use Cached agent commands: $(sed -n 2p "$FAKE_GPG_CALL_DIR/connect-agent-calls")"
-[[ $(sed -n 1p "$summary") == 'Touch policy is now cached.' && $(sed -n 3p "$summary") == 'Request type: commit' ]] \
-    || fail 'the preview does not say the policy changed'
-grep -qxF 'git-gpg-preview: note: touch policy is now cached' "$TMP/pin.stderr" || fail 'stderr does not say the policy changed'
-grep -qF 'decision=touch-policy-cached' "$TMP/audit.log" || fail 'the policy change was not audited'
-[[ $(offer_dismissals) == 0 ]] || fail 'Use Cached counted as a dismissal'
-[[ $(grep -c '^start ' "$FAKE_DIALOG_LOG") -eq 1 ]] || fail 'no preview after Use Cached'
-pass 'Use Cached sets the cached policy through gpg-agent before the preview, and audits it'
-
-# Use Cached that fails counts as a dismissal, says why, and signing goes ahead;
-# a Cancel in pinentry needs no second window.
-assert_touch_failure() {
-    local label="$1" answer="$2" dialogs="$3" audited="$4" noted="$5"
-    export FAKE_CARD_SETATTR="$answer"
-    rm -f "$TOUCH_OFFERS"
-    touch_case
-    [[ $(touch_dialogs) == "$dialogs" ]] || fail "$label windows: $(touch_dialogs)"
-    [[ $(offer_dismissals) == 1 ]] || fail "$label was not counted as a dismissal"
-    if [[ "$audited" -eq 1 ]]; then
-        grep -qF 'decision=touch-policy-unchanged' "$TMP/audit.log" || fail "$label was not audited"
-    else
-        ! grep -qF 'decision=touch-policy-unchanged' "$TMP/audit.log" || fail "$label was audited"
-    fi
-    if [[ -n "$noted" ]]; then
-        grep -qxF "git-gpg-preview: note: could not set the cached touch policy: $noted" "$TMP/pin.stderr" || fail "$label note"
-    else
-        ! grep -qF 'could not set' "$TMP/pin.stderr" || fail "$label noted a failure"
-    fi
-    ! grep -q '^Touch policy is now cached' "$(latest_capture)" || fail "$label claimed a change"
-    unset FAKE_CARD_SETATTR
-}
-assert_touch_failure 'a wrong Admin PIN' 'ERR 100663404 Bad PIN <SCD>' $'touch-offer on 3\ntouch-unchanged Bad PIN <SCD>' 1 'Bad PIN <SCD>'
-assert_touch_failure 'a key that refuses cached' 'ERR 100663435 Conditions of use not satisfied <SCD>' \
-    $'touch-offer on 3\ntouch-unchanged Conditions of use not satisfied <SCD>' 1 'Conditions of use not satisfied <SCD>'
-assert_touch_failure 'a Cancel in pinentry' 'ERR 83886179 Operation cancelled <Pinentry>' 'touch-offer on 3' 0 ''
-assert_touch_failure 'a write the card did not keep' ignored $'touch-offer on 3\ntouch-unchanged ' 1 'the key did not confirm the change'
-unset FAKE_TOUCH_OFFER_DECISION
-pass 'Use Cached that fails says why, counts as a dismissal, and signing goes ahead'
-
-# The windows and the Admin PIN prompt cannot hold the lock for long. A window
-# nobody answers is not a dismissal, and waits a day like any other.
-sed -E 's/^TOUCH_OFFER_TICKS=.*/TOUCH_OFFER_TICKS=4/; s/^TOUCH_PIN_TICKS=.*/TOUCH_PIN_TICKS=4/' "$ROOT/git-gpg-preview" > "$TMP/fast-wrapper"
-chmod 700 "$TMP/fast-wrapper"
-reset_pin_state
-rm -f "$TOUCH_OFFERS"
-export FAKE_TOUCH_OFFER_DECISION=hang
-set +e
-pin_output=$("$TMP/fast-wrapper" --status-fd=2 -bsau TEST < "$TMP/commit.payload" 2>"$TMP/pin.stderr")
-pin_status=$?
-set -e
-[[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "unanswered offer stopped signing ($pin_status)"
-[[ $(offer_dismissals) == 0 ]] || fail 'an unanswered offer counted as a dismissal'
-touch_case
-[[ -z $(touch_dialogs) ]] || fail 'an unanswered offer repeated within a day'
-reset_pin_state
-rm -f "$TOUCH_OFFERS"
-export FAKE_TOUCH_OFFER_DECISION=apply FAKE_CARD_SETATTR=hang
-set +e
-pin_output=$("$TMP/fast-wrapper" --status-fd=2 -bsau TEST < "$TMP/commit.payload" 2>"$TMP/pin.stderr")
-pin_status=$?
-set -e
-[[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "unanswered Admin PIN prompt stopped signing ($pin_status)"
-[[ $(touch_dialogs) == $'touch-offer on 3\ntouch-unchanged ' ]] || fail "unanswered Admin PIN prompt windows: $(touch_dialogs)"
-[[ $(offer_dismissals) == 1 ]] || fail 'an unanswered Admin PIN prompt was not counted'
-unset FAKE_TOUCH_OFFER_DECISION FAKE_CARD_SETATTR
-pass 'an unanswered window or Admin PIN prompt cannot stop signing or hold the lock'
+OLD_OFFER_RECORD="$XDG_CONFIG_HOME/git-gpg-preview/touch-offers"
+printf '%s 3 %d\n' "$CARD_SUB" "$(date +%s)" > "$OLD_OFFER_RECORD"
+cp "$OLD_OFFER_RECORD" "$TMP/touch-offers.before"
+touch -t 202001010000 "$OLD_OFFER_RECORD" "$TMP/touch-offers.before"
+assert_touch_notice 'an old record, key set to off' '%00+' "$TOUCH_OFF" --status-fd=2 -bsau TEST
+assert_touch_notice 'an old record, key set to cached' '%03+' "$TOUCH_CACHED" --status-fd=2 -bsau TEST
+cmp -s "$OLD_OFFER_RECORD" "$TMP/touch-offers.before" || fail 'the old offer record was changed'
+[[ ! "$OLD_OFFER_RECORD" -nt "$TMP/touch-offers.before" ]] || fail 'the old offer record was rewritten'
+rm -f "$OLD_OFFER_RECORD"
+pass 'an old offer record is neither read nor written'
 
 # Git shows the stderr copy only when signing fails, so check it there.
 use_real_gpg "$TMP/gnupg-bin/gpg"
 reset_pin_state
-rm -f "$TOUCH_OFFERS"
-export FAKE_CARD_UIF=%01+ FAKE_GPG_EXIT=42 FAKE_GPG_STDERR=$'gpg: signing failed: Card error\n'
+export FAKE_CARD_UIF=%00+ FAKE_GPG_EXIT=42 FAKE_GPG_STDERR=$'gpg: signing failed: Card error\n'
 run_pin_case --status-fd=2 -bsau TEST
 unset FAKE_GPG_EXIT FAKE_GPG_STDERR
 [[ "$pin_status" -eq 42 ]] || fail "the touch notice changed GPG's failure status ($pin_status)"
-grep -qxF "git-gpg-preview: note: $TOUCH_ON" "$TMP/pin.stderr" || fail 'a failed signature lost the touch notice'
+grep -qxF "git-gpg-preview: note: $TOUCH_OFF" "$TMP/pin.stderr" || fail 'a failed signature lost the touch notice'
 grep -qxF 'gpg: signing failed: Card error' "$TMP/pin.stderr" || fail "a failed signature lost GPG's error"
 pass 'a failed signature reports the touch notice next to the GPG error'
 
-# A wrong PIN repeats the preview, not the offer, and the policy is read once.
+# A wrong PIN repeats the preview: the notice stays, and the policy is read once.
 use_real_gpg "$TMP/gnupg-bin/gpg"
 reset_pin_state
-rm -f "$TOUCH_OFFERS" "$FAKE_GPG_CALL_DIR/connect-agent-calls"
-export FAKE_CARD_UIF=%01+ FAKE_PIN_RETRIES=3 FAKE_GPG_PIN=123456
+rm -f "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+export FAKE_CARD_UIF=%00+ FAKE_PIN_RETRIES=3 FAKE_GPG_PIN=123456
 export FAKE_PIN_ENTRIES=654321,123456 FAKE_PIN_ERROR_DECISION=retry
 run_pin_case --status-fd=2 -bsau TEST
-[[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "touch offer with a PIN retry ($pin_status)"
-grep -l '^PIN attempt 2: ' "$TMP/captures"/*.summary >/dev/null || fail 'the retry preview was not shown'
-[[ $(touch_dialogs) == 'touch-offer on 3' ]] || fail "the retry repeated the offer: $(touch_dialogs)"
+[[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "touch notice with a PIN retry ($pin_status)"
+retry_summary=$(grep -l '^PIN attempt 2: ' "$TMP/captures"/*.summary) || fail 'the retry preview was not shown'
+grep -qxF "$TOUCH_OFF" "$retry_summary" || fail 'the retry preview lost the touch notice'
 [[ $(connect_agent_calls) -eq 1 ]] || fail 'touch policy was read again for the retry'
 unset FAKE_CARD_UIF FAKE_CARD_SIG_KEY FAKE_PIN_RETRIES FAKE_GPG_PIN FAKE_PIN_ENTRIES FAKE_PIN_ERROR_DECISION FAKE_SECRET_KEYS
-rm -f "$TOUCH_OFFERS"
 cp "$TMP/config.saved" "$XDG_CONFIG_HOME/git-gpg-preview/config"
-pass 'a PIN retry does not repeat the offer or read the policy again'
+pass 'a PIN retry keeps the touch notice without reading the policy again'
 
 # dialog.jxa splits the preview at the first Message: line, so no fact may hold
 # a line break, and the message itself gets a long allowance.

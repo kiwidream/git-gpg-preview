@@ -3,11 +3,9 @@
 scdaemon does for the card in the reader. FAKE_CARD_FILE holds that card's
 signature-key fingerprint and its raw UIF-1 value as scdaemon escapes it
 ("%01+" is touch policy on); no file means no card. Until SERIALNO selects
-the OpenPGP application, another one (PIV, say) answers for it.
-FAKE_CARD_SETATTR answers SETATTR: empty writes the value to the card file,
-ignored says OK without writing, hang never answers, and anything else is
-printed as it stands. FAKE_CONNECT_AGENT_SLEEP delays the answer (a wedged
-agent) and FAKE_CONNECT_AGENT_EXIT is the exit status after it."""
+the OpenPGP application, another one (PIV, say) answers GETATTR.
+FAKE_CONNECT_AGENT_SLEEP delays the answer (a wedged agent) and
+FAKE_CONNECT_AGENT_EXIT is the exit status after it."""
 import os, sys, time
 from pathlib import Path
 
@@ -29,25 +27,12 @@ for command in sys.argv[1:]:
     elif command == 'SCD SERIALNO openpgp':
         openpgp = True
         print('S SERIALNO D2760001240100000006000000010000 0\nOK')
-    elif command.startswith(('SCD GETATTR ', 'SCD SETATTR ')) and not openpgp:
+    elif command.startswith('SCD GETATTR ') and not openpgp:
         print('ERR 100663423 Not supported <SCD>')
     elif command == 'SCD GETATTR KEY-FPR':
         print(f'S KEY-FPR 1 {card}\nS KEY-FPR 2 DDDD000000000000000000000000000000000002\nOK')
     elif command == 'SCD GETATTR UIF-1':
         print(f'S UIF-1 {uif}\nOK' if uif else 'ERR 100663354 No such object <SCD>')
-    elif command == 'SCD SETATTR UIF-1 %03+':
-        answer = os.environ.get('FAKE_CARD_SETATTR', '')
-        if answer == 'hang':
-            time.sleep(30)
-        elif answer in ('', 'ignored'):
-            if not answer:
-                uif = '%03+'
-                Path(os.environ['FAKE_CARD_FILE']).write_text(f'{card} {uif}')
-            print('OK')
-        else:
-            print(answer)
-    elif command == 'SCD KILLSCD':
-        print('OK')
     else:
         print('ERR 69 Unknown IPC command <User defined source 1>')
 sys.exit(int(os.environ.get('FAKE_CONNECT_AGENT_EXIT', '0')))

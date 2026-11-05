@@ -4,10 +4,7 @@
 # reader the way scdaemon does. FAKE_CARD_SIG_KEY is the fingerprint in its
 # signature slot (unset: no card) and FAKE_CARD_UIF the raw UIF-1 value as
 # scdaemon escapes it, such as "%01+" for touch policy on. Until SERIALNO
-# selects the OpenPGP application, another one (PIV, say) answers for it.
-# FAKE_CARD_SETATTR answers SETATTR: empty writes the value (for the rest of
-# this run; the next one reads FAKE_CARD_UIF again), ignored says OK without
-# writing, hang never answers, and anything else is printed as it stands.
+# selects the OpenPGP application, another one (PIV, say) answers GETATTR.
 # FAKE_CONNECT_AGENT_EXIT is the exit status after answering.
 
 set -u
@@ -21,7 +18,7 @@ for command in "$@"; do
         printf 'ERR 100696144 No such device <SCD>\n'
         continue
     fi
-    if [[ ( "$command" == 'SCD GETATTR '* || "$command" == 'SCD SETATTR '* ) && "$openpgp" -eq 0 ]]; then
+    if [[ "$command" == 'SCD GETATTR '* && "$openpgp" -eq 0 ]]; then
         printf 'ERR 100663423 Not supported <SCD>\n'
         continue
     fi
@@ -40,15 +37,6 @@ for command in "$@"; do
                 printf 'ERR 100663354 No such object <SCD>\n'
             fi
             ;;
-        'SCD SETATTR UIF-1 %03+')
-            case "${FAKE_CARD_SETATTR-}" in
-                '') FAKE_CARD_UIF='%03+'; printf 'OK\n' ;;
-                ignored) printf 'OK\n' ;;
-                hang) sleep 30 ;;
-                *) printf '%s\n' "$FAKE_CARD_SETATTR" ;;
-            esac
-            ;;
-        'SCD KILLSCD') printf 'OK\n' ;;
         *) printf 'ERR 69 Unknown IPC command <User defined source 1>\n' ;;
     esac
 done

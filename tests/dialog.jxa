@@ -34,16 +34,6 @@ function previewModalResponse(alert) {
     return modalResponse(alert);
 }
 
-var touchResponses = [];
-var touchSeen = [];
-function touchModalResponse(alert) {
-    const titles = [];
-    for (let i = 0; i < Number(alert.buttons.count); i++) titles.push(ObjC.unwrap(alert.buttons.objectAtIndex(i).title));
-    touchSeen.push({buttons: titles.join('|'), title: ObjC.unwrap(alert.messageText), info: ObjC.unwrap(alert.informativeText)});
-    if (!touchResponses.length) throw new Error('Unexpected extra touch policy window');
-    return touchResponses.shift();
-}
-
 var pinResponses = [];
 var expectedPinButtons = [];
 function pinModalResponse(alert) {
@@ -87,11 +77,7 @@ function run(argv) {
         ['pinApp.activateIgnoringOtherApps(true);', ''],
         ['Number(pinAlert.runModal)', 'pinModalResponse(pinAlert)'],
         ['pinEntryApp.activateIgnoringOtherApps(true);', ''],
-        ['Number(pinEntryAlert.runModal)', 'pinEntryModalResponse(pinEntryAlert)'],
-        ['offerApp.activateIgnoringOtherApps(true);', ''],
-        ['Number(offerAlert.runModal)', 'touchModalResponse(offerAlert)'],
-        ['unchangedApp.activateIgnoringOtherApps(true);', ''],
-        ['Number(unchangedAlert.runModal)', 'touchModalResponse(unchangedAlert)']
+        ['Number(pinEntryAlert.runModal)', 'pinEntryModalResponse(pinEntryAlert)']
     ];
     let instrumented = source;
     substitutions.forEach(function(pair) {
@@ -137,40 +123,23 @@ function run(argv) {
         {summary: 'Request type: commit\n\nMessage:\nSubject', facts: 'Request type: commit', message: 'Subject'},
         {summary: 'Request type: commit\n\nMessage:\nSubject\n\nMessage:\nForged', facts: 'Request type: commit', message: 'Subject\n\nMessage:\nForged'},
         {summary: 'PIN attempt 2: wrong\n\nRequest type: commit\n\nMessage:\n', facts: 'PIN attempt 2: wrong\n\nRequest type: commit', message: ''},
+        {summary: 'Touch policy is off\n\nRequest type: commit\n\nMessage:\nSubject', facts: 'Touch policy is off\n\nRequest type: commit', message: 'Subject'},
         {summary: 'Request type: commit\nMessage:\nNo blank line', facts: '', message: 'Request type: commit\nMessage:\nNo blank line'}
     ].forEach(function(test) {
         const parts = splitSummary(test.summary);
         if (parts.facts !== test.facts || parts.message !== test.message) throw new Error('Wrong split of: ' + test.summary);
     });
-    // Touch policy windows: 'apply' only from Use Cached, and the countdown is honest.
-    [
-        {policy: 'on', left: '3', response: 1000, result: 'apply', title: 'Let one touch cover 15 seconds?', text: '2 more times at most'},
-        {policy: 'on', left: '3', response: 1001, result: 'dismiss', title: 'Let one touch cover 15 seconds?', text: 'covers every signature in the next 15 seconds'},
-        {policy: 'off', left: '2', response: 1001, result: 'dismiss', title: 'This key signs without a touch', text: 'one more time at most'},
-        {policy: 'off', left: '1', response: 1000, result: 'apply', title: 'This key signs without a touch', text: 'Not Now stops asking about this key'}
-    ].forEach(function(test) {
-        $.NSData.data.writeToFileAtomically(decision, true);
-        touchResponses = [test.response];
-        touchSeen = [];
-        runPreview(['--touch-offer', decision, test.policy, test.left]);
-        const seen = touchSeen[0];
-        if (readText(decision) !== test.result) throw new Error('Wrong touch offer result for ' + test.policy + ' ' + test.left);
-        if (seen.buttons !== 'Use Cached|Not Now' || seen.title !== test.title) throw new Error('Wrong touch offer: ' + JSON.stringify(seen));
-        if (seen.info.indexOf(test.text) < 0) throw new Error('Touch offer text missing "' + test.text + '": ' + seen.info);
-        if (seen.info.indexOf('Admin PIN') < 0) throw new Error('Touch offer does not mention the Admin PIN');
-    });
-    [
-        {reason: 'Bad PIN <SCD>', text: 'gpg-agent reported: Bad PIN <SCD>.'},
-        {reason: '', text: 'The key did not confirm the change.'}
-    ].forEach(function(test) {
-        touchResponses = [1000];
-        touchSeen = [];
-        runPreview(['--touch-unchanged', test.reason]);
-        const seen = touchSeen[0];
-        if (seen.buttons !== 'OK') throw new Error('Wrong buttons on the unchanged window: ' + seen.buttons);
-        if (seen.info.indexOf(test.text) < 0) throw new Error('Unchanged window missing "' + test.text + '": ' + seen.info);
-        if (seen.info.indexOf('ykman openpgp keys set-touch sig cached') < 0) throw new Error('Unchanged window lost the ykman command');
-    });
+    // The touch policy offer is gone. A remote service still running a version
+    // that asks for it gets no window and no answer, and goes on to the preview.
+    $.NSData.data.writeToFileAtomically(decision, true);
+    modalCount = 0;
+    let refused = '';
+    try {
+        runPreview(['--touch-offer', decision, 'on', '3']);
+    } catch (error) {
+        refused = error.message;
+    }
+    if (refused !== 'Unable to read review data.' || modalCount !== 0 || readText(decision) !== '') throw new Error('The touch offer was answered: ' + refused);
     // Wrong-PIN dialog: Try Again only while attempts remain and the signer allows it.
     [
         {args: ['2', 'retry'], buttons: ['Try Again', 'Cancel'], response: 1000, decision: 'retry', text: '2 attempts remaining'},
@@ -221,5 +190,5 @@ function run(argv) {
             if (!seen.secure) throw new Error(where + 'PIN field is not secure');
         });
     });
-    return 'Dialog actions passed (29 cases)';
+    return 'Dialog actions passed (26 cases)';
 }

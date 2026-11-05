@@ -265,69 +265,6 @@ function runPinEntry(argv) {
     }
 }
 
-// Wording for the offer of the cached touch policy. `left` counts this window
-// among the dismissals the key has left.
-function touchOfferText(policy, left) {
-    const more = left === 2 ? 'one more time' : (left - 1) + ' more times';
-    const notNow = left > 1 ? 'Not Now asks again in a day, ' + more + ' at most.' : 'Not Now stops asking about this key.';
-    const next = '\n\nUse Cached asks for your Admin PIN, then changes the setting on the key. ' + notNow +
-        ' Signing continues once you answer, or after 30 seconds.';
-    if (policy === 'off') {
-        return {
-            title: 'This key signs without a touch',
-            info: 'Its touch policy is off, so it signs as soon as a request arrives, before you can review it in the preview. ' +
-                'With the cached policy it needs a touch, and that touch also covers every signature in the next 15 seconds.' + next
-        };
-    }
-    return {
-        title: 'Let one touch cover 15 seconds?',
-        info: 'Its touch policy is on, so every signature waits for its own touch. With the cached policy, a touch also covers ' +
-            'every signature in the next 15 seconds: a rebase signs all its commits on one touch, and a request queued behind ' +
-            'one you touched signs as soon as its preview opens.' + next
-    };
-}
-
-// Shown by the signer before the preview. Writes 'apply' only when the user
-// picks Use Cached; the signer changes the key, never this window.
-function runTouchOffer(argv) {
-    if (argv.length < 3) {
-        throw new Error('Expected result path, touch policy and dismissals left.');
-    }
-    const policy = String(argv[1]);
-    const text = touchOfferText(policy, Number(argv[2]) || 1);
-
-    const offerApp = $.NSApplication.sharedApplication;
-    offerApp.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
-    offerApp.activateIgnoringOtherApps(true);
-
-    const offerAlert = $.NSAlert.alloc.init;
-    offerAlert.alertStyle = policy === 'off' ? $.NSAlertStyleWarning : $.NSAlertStyleInformational;
-    offerAlert.messageText = text.title;
-    offerAlert.informativeText = text.info;
-    offerAlert.addButtonWithTitle('Use Cached');
-    offerAlert.addButtonWithTitle('Not Now');
-    const response = Number(offerAlert.runModal);
-    writeDecision(argv[0], response === Number($.NSAlertFirstButtonReturn) ? 'apply' : 'dismiss');
-}
-
-// Shown by the signer when Use Cached did not take effect.
-function runTouchUnchanged(argv) {
-    const reason = argv.length > 0 ? String(argv[0]) : '';
-
-    const unchangedApp = $.NSApplication.sharedApplication;
-    unchangedApp.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
-    unchangedApp.activateIgnoringOtherApps(true);
-
-    const unchangedAlert = $.NSAlert.alloc.init;
-    unchangedAlert.alertStyle = $.NSAlertStyleWarning;
-    unchangedAlert.messageText = 'Could not set the cached touch policy';
-    unchangedAlert.informativeText = (reason ? 'gpg-agent reported: ' + reason + '.' : 'The key did not confirm the change.') +
-        ' Signing continues under the policy the key has now.\n\nTo change it yourself, run: ykman openpgp keys set-touch sig cached. ' +
-        'Cached needs YubiKey firmware 5.2.1 or later. On an older key, ykman openpgp keys set-touch sig on turns touch on.';
-    unchangedAlert.addButtonWithTitle('OK');
-    Number(unchangedAlert.runModal);
-}
-
 function run(argv) {
     if (argv.length > 0 && argv[0] === '--pin-error') {
         runPinError(argv.slice(1));
@@ -335,14 +272,6 @@ function run(argv) {
     }
     if (argv.length > 0 && argv[0] === '--pin-entry') {
         runPinEntry(argv.slice(1));
-        return;
-    }
-    if (argv.length > 0 && argv[0] === '--touch-offer') {
-        runTouchOffer(argv.slice(1));
-        return;
-    }
-    if (argv.length > 0 && argv[0] === '--touch-unchanged') {
-        runTouchUnchanged(argv.slice(1));
         return;
     }
     if (argv.length < 3) {

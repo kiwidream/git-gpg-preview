@@ -19,20 +19,6 @@ CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 CONFIG_FILE="$CONFIG_HOME/git-gpg-preview/config"
 SPAM_FILE="$CONFIG_HOME/git-gpg-preview/spam-subjects"
 SPAM_TEMP=""
-# When a key was last offered the cached touch policy, and how often that offer
-# was dismissed: one "<fingerprint> <dismissals> <epoch seconds>" line per key,
-# shared with the remote service. Three dismissals end the offer for that key.
-# One a day, so a rebase cannot use them all up at once. Tests read these lines;
-# keep the format.
-TOUCH_OFFERS_FILE="$CONFIG_HOME/git-gpg-preview/touch-offers"
-TOUCH_OFFER_DISMISSALS=3
-TOUCH_OFFER_INTERVAL=86400
-# How long, in ticks of 0.05s, the offer's windows and the Admin PIN prompt may
-# hold the dialog lock. Tests read these lines; keep the format.
-TOUCH_OFFER_TICKS=600
-TOUCH_PIN_TICKS=1200
-TOUCH_OFFERS_TEMP=""
-TOUCH_SET_ERROR=""
 REAL_GPG=""
 UI_HELPER=""
 LOCK_ROOT=""
@@ -59,7 +45,6 @@ error() {
 
 cleanup() {
     [[ -z "$SPAM_TEMP" ]] || /bin/rm -f "$SPAM_TEMP"
-    [[ -z "$TOUCH_OFFERS_TEMP" ]] || /bin/rm -f "$TOUCH_OFFERS_TEMP"
     flush_gpg_stderr
     if [[ -n "$DIALOG_PID" ]] && /bin/kill -0 "$DIALOG_PID" 2>/dev/null; then
         /bin/kill -s TERM "$DIALOG_PID" 2>/dev/null || true
@@ -435,20 +420,15 @@ bad_pin_failure() {
 # Runs a read-only query into a file. Bounded, so a wedged card or agent
 # cannot hold the dialog lock forever. Fails when the query fails or is cut off.
 run_query() {
-    run_bounded 200 "$@"
-}
-
-# Runs a command into a file for at most LIMIT ticks of 0.05s, then stops it.
-run_bounded() {
-    local limit="$1" output="$2" pid waited=0 status=0
-    shift 2
+    local output="$1" pid waited=0 status=0
+    shift
     "$@" < /dev/null > "$output" 2>/dev/null 4>&- &
     pid=$!
     CHILD_PID=$pid
     while /bin/kill -0 "$pid" 2>/dev/null; do
         /bin/sleep 0.05
         waited=$((waited + 1))
-        if [[ "$waited" -ge "$limit" ]]; then
+        if [[ "$waited" -ge 200 ]]; then   # 10s
             /bin/kill -s TERM "$pid" 2>/dev/null || true
             break
         fi
@@ -597,122 +577,16 @@ card_touch_policy() {
     ' "$REQUEST_DIR/card-touch" 2>/dev/null)
 }
 
-# What to tell the operator about a touch policy that is worth changing:
-# off signs without any touch, and on asks for one on every signature.
-# Fixed cannot be changed without replacing the key, so it gets nothing.
+# What to tell the operator about a touch policy that is worth changing: off
+# signs without any touch, and cached lets a request queued behind a touch sign
+# without its own. On already asks for a touch on every signature, and fixed and
+# cached-fixed cannot be changed without replacing the key, so they get nothing.
 touch_policy_notice() {
     case "$1" in
-        off) printf '%s' "Touch policy is off: this key signs with no touch. To require one, run: ykman openpgp keys set-touch sig cached" ;;
-        on) printf '%s' "Touch policy is on: a touch for every signature. To let a touch cover 15 seconds, run: ykman openpgp keys set-touch sig cached" ;;
+        off) printf '%s' "Touch policy is off: this key signs with no touch. To require one, run: ykman openpgp keys set-touch sig on" ;;
+        cached) printf '%s' "Touch policy is cached: a request queued within 15 seconds of a touch signs without its own touch. To require one every time, run: ykman openpgp keys set-touch sig on" ;;
         *) return 1 ;;
     esac
-}
-
-# "<dismissals> <last shown>" for a key. A malformed line counts as no line: the
-# offer is advice, so the worst outcome is seeing it again.
-touch_offer_state() {
-    if [[ ! -f "$TOUCH_OFFERS_FILE" || -L "$TOUCH_OFFERS_FILE" ]]; then
-        printf '0 0\n'
-        return 0
-    fi
-    /usr/bin/awk -v key="$1" '
-        function plain(n) { return n ~ /^(0|[1-9][0-9]*)$/ && length(n) <= 18 }
-        BEGIN { dismissals = 0; shown = 0 }
-        $1 == key && NF == 3 && plain($2) && plain($3) { dismissals = $2; shown = $3; exit }
-        END { print dismissals, shown }
-    ' "$TOUCH_OFFERS_FILE" 2>/dev/null || printf '0 0\n'
-}
-
-# A time in the future is a clock that moved, not a recent offer.
-touch_offer_due() {
-    local dismissals="$1" shown="$2" now="$3"
-    [[ "$dismissals" -lt "$TOUCH_OFFER_DISMISSALS" ]] || return 1
-    [[ "$shown" -gt "$now" || $((now - shown)) -ge "$TOUCH_OFFER_INTERVAL" ]]
-}
-
-remember_touch_offer() {
-    # Caller holds dialog.lock, shared by local wrappers and the remote service.
-    local key="$1" dismissals="$2" now="$3"
-    if [[ -L "$TOUCH_OFFERS_FILE" || ( -e "$TOUCH_OFFERS_FILE" && ! -f "$TOUCH_OFFERS_FILE" ) ]]; then
-        return 1
-    fi
-    TOUCH_OFFERS_TEMP=$(/usr/bin/mktemp "$TOUCH_OFFERS_FILE.XXXXXX") || return 1
-    if { [[ ! -e "$TOUCH_OFFERS_FILE" ]] || /usr/bin/awk -v key="$key" '$1 != key' "$TOUCH_OFFERS_FILE" > "$TOUCH_OFFERS_TEMP"; } &&
-       printf '%s %d %d\n' "$key" "$dismissals" "$now" >> "$TOUCH_OFFERS_TEMP" &&
-       /bin/chmod 600 "$TOUCH_OFFERS_TEMP" && /bin/mv -f "$TOUCH_OFFERS_TEMP" "$TOUCH_OFFERS_FILE"; then
-        TOUCH_OFFERS_TEMP=""
-        return 0
-    fi
-    /bin/rm -f "$TOUCH_OFFERS_TEMP"
-    TOUCH_OFFERS_TEMP=""
-    return 1
-}
-
-# Sets the signature slot of the card to touch policy cached: the same write as
-# ykman openpgp keys set-touch sig cached, the policy byte and then 0x20, with
-# gpg-agent's pinentry asking for the Admin PIN. Never a fixed policy, which
-# could not be changed back. Only what the card reads back counts as success.
-# scdaemon is stopped after it, as gpgconf --kill scdaemon does, because it
-# would otherwise stay verified for Admin PIN operations such as turning touch
-# off. The dialog lock is held, so no signature here is waiting on it.
-set_cached_touch() {
-    local agent output="$REQUEST_DIR/card-touch-set"
-    TOUCH_SET_ERROR=""
-    agent=$(gpg_connect_agent) || return 1
-    run_bounded "$TOUCH_PIN_TICKS" "$output" "$agent" 'SCD SERIALNO openpgp' 'SCD SETATTR UIF-1 %03+' \
-        'SCD GETATTR UIF-1' 'SCD KILLSCD' /bye
-    if /usr/bin/awk '$1 == "S" && $2 == "UIF-1" { uif = $3 } END { exit uif ~ /^%03/ ? 0 : 1 }' "$output" 2>/dev/null; then
-        return 0
-    fi
-    TOUCH_SET_ERROR=$(/usr/bin/awk '$1 == "ERR" { $1 = ""; $2 = ""; sub(/^ +/, ""); printf "%s", $0; exit }' "$output" 2>/dev/null | sanitize_one_line)
-    return 1
-}
-
-# A key whose touch policy is worth changing gets a window of its own, before
-# the first preview and before GPG starts, so the preview stays about the
-# message and the card is free for Use Cached. Advisory and bounded: signing
-# goes ahead under whatever policy the key has afterwards. The notice goes to
-# stderr too, which Git shows only when signing fails.
-offer_cached_touch() {
-    local notice key dismissals shown now choice
-    card_touch_policy
-    notice=$(touch_policy_notice "$TOUCH_POLICY") || return 0
-    key=${SIGNING_KEY%% *}
-    read -r dismissals shown <<< "$(touch_offer_state "$key")"
-    now=$(/bin/date +%s)
-    touch_offer_due "$dismissals" "$shown" "$now" || return 0
-    error "note: $notice"
-    # Recorded first, so a window nobody answers waits a day like any other.
-    # An offer that cannot be remembered would open on every signature.
-    if ! remember_touch_offer "$key" "$dismissals" "$now"; then
-        error "note: could not save $TOUCH_OFFERS_FILE, so the touch policy offer was not shown"
-        return 0
-    fi
-    choice="$REQUEST_DIR/touch-choice"
-    : > "$choice"
-    run_bounded "$TOUCH_OFFER_TICKS" /dev/null /usr/bin/osascript -l JavaScript "$UI_HELPER" --touch-offer "$choice" \
-        "$TOUCH_POLICY" "$((TOUCH_OFFER_DISMISSALS - dismissals))" || true
-    case "$(/bin/cat "$choice" 2>/dev/null)" in
-        apply) ;;
-        dismiss)
-            remember_touch_offer "$key" "$((dismissals + 1))" "$now" || error "note: could not save $TOUCH_OFFERS_FILE"
-            return 0
-            ;;
-        *) return 0 ;;
-    esac
-    if set_cached_touch; then
-        audit_decision "touch-policy-cached" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
-        error "note: touch policy is now cached"
-        { printf 'Touch policy is now cached.\n\n'; /bin/cat "$SUMMARY"; } > "$SUMMARY.touch" &&
-            /bin/mv -f "$SUMMARY.touch" "$SUMMARY"
-        return 0
-    fi
-    # Counted like a dismissal, so a key that refuses cached stops being asked.
-    remember_touch_offer "$key" "$((dismissals + 1))" "$now" || error "note: could not save $TOUCH_OFFERS_FILE"
-    [[ "$TOUCH_SET_ERROR" != *cancel* ]] || return 0
-    audit_decision "touch-policy-unchanged" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
-    error "note: could not set the cached touch policy: ${TOUCH_SET_ERROR:-the key did not confirm the change}"
-    run_bounded "$TOUCH_OFFER_TICKS" /dev/null /usr/bin/osascript -l JavaScript "$UI_HELPER" --touch-unchanged "$TOUCH_SET_ERROR" || true
 }
 
 # Whether the request names its own home directory, keyring or options file.
@@ -1207,9 +1081,16 @@ if uses_builtin_pin_entry "$@"; then
     PIN_RESULT="$REQUEST_DIR/pin-result"
     GPG_ARGS=(--pinentry-mode loopback --command-fd 3 "$@")
 fi
-# Under the lock, like the PIN counter: the card is busy while another request
-# waits for its touch.
-names_own_gnupg_files "$@" || offer_cached_touch
+# Read under the lock, like the PIN counter: the card is busy while another
+# request waits for its touch. The notice is one line above the facts in every
+# preview of this request, and goes to stderr too, which Git shows only when
+# signing fails. Advisory: signing goes ahead under the key's current policy.
+names_own_gnupg_files "$@" || card_touch_policy
+if TOUCH_NOTICE=$(touch_policy_notice "$TOUCH_POLICY"); then
+    { printf '%s\n\n' "$TOUCH_NOTICE"; /bin/cat "$SUMMARY"; } > "$SUMMARY.touch" &&
+        /bin/mv -f "$SUMMARY.touch" "$SUMMARY"
+    error "note: $TOUCH_NOTICE"
+fi
 ATTEMPT=1
 while :; do
     # Each attempt starts with a fresh, unanswered preview.
