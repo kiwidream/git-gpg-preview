@@ -797,36 +797,59 @@ grep -qxF "$(note_line "$TOUCH_OFF")" "$TMP/pin.stderr" || fail 'a failed signat
 grep -qxF 'gpg: signing failed: Card error' "$TMP/pin.stderr" || fail "a failed signature lost GPG's error"
 pass 'a failed signature reports the touch notice next to the GPG error'
 
-# A notice that cannot be added is reported on stderr. The file keeps its text,
-# no partial copy is left beside it, and signing goes ahead without the notice.
+# The notice goes into the summary and the details together or into neither,
+# and both stay 0600 like the rest of the request, whatever the umask. A failure
+# is reported, leaves both files as they were and no temporary file behind, and
+# signing goes ahead. Permissions are restored before anything is checked.
+PREPEND_FUNCTION=$(awk '/^error\(\) \{/,/^}/; /^prepend_touch_notice\(\) \{/,/^}/' "$ROOT/git-gpg-preview")
+NOTICE_FAILED='git-gpg-preview: note: could not add the touch policy notice to the preview or its details'
+# prepend_notice FUNCTION: runs it on fresh 0600 files in $TMP/notice, umask 022.
 prepend_notice() {
-    PROGRAM_NAME=git-gpg-preview bash -c "$(awk '/^error\(\) \{/,/^}/; /^prepend_touch_notice\(\) \{/,/^}/' "$ROOT/git-gpg-preview")"$'\n''prepend_touch_notice "$@"' \
-        bash "$@" 2> "$TMP/prepend.stderr"
+    rm -rf "$TMP/notice"
+    mkdir -p "$TMP/notice"
+    printf 'facts\n' > "$TMP/notice/summary"
+    printf 'report\n' > "$TMP/notice/details"
+    chmod 600 "$TMP/notice/summary" "$TMP/notice/details"
+    PROGRAM_NAME=git-gpg-preview bash -c 'umask 022'$'\n'"$1"$'\n''prepend_touch_notice "$@"' \
+        bash "$TOUCH_OFF" "$TMP/notice/summary" "$TMP/notice/details" 2> "$TMP/prepend.stderr"
 }
-NOTICE_FAILED='git-gpg-preview: note: could not add the touch policy notice to the preview; signing goes ahead without it'
-mkdir -p "$TMP/notice/locked"
-printf 'facts\n' > "$TMP/notice/summary"
-printf 'report\n' > "$TMP/notice/details"
-prepend_notice "$TOUCH_OFF" "$TMP/notice/summary" "$TMP/notice/details" || fail 'adding the notice failed'
-[[ $(cat "$TMP/notice/summary") == "$TOUCH_OFF"$'\n\nfacts' && $(cat "$TMP/notice/details") == "$TOUCH_OFF"$'\n\nreport' ]] ||
-    fail 'the notice was not put above both files'
+notice_files() {
+    printf '%s|%s|%s|%s|%s' "$(cat "$TMP/notice/summary")" "$(cat "$TMP/notice/details")" \
+        "$(stat -f '%Lp' "$TMP/notice/summary")" "$(stat -f '%Lp' "$TMP/notice/details")" "$(ls -A "$TMP/notice" | tr '\n' ' ')"
+}
+UNCHANGED='facts|report|600|600|details summary '
+prepend_notice "$PREPEND_FUNCTION" || fail 'adding the notice failed'
+[[ $(notice_files) == "$TOUCH_OFF"$'\n\nfacts|'"$TOUCH_OFF"$'\n\nreport|600|600|details summary ' ]] ||
+    fail "the notice was not put above both files, 0600, alone: $(notice_files)"
 [[ ! -s "$TMP/prepend.stderr" ]] || fail "adding the notice reported a failure: $(cat "$TMP/prepend.stderr")"
-# An unreadable file leaves a partial copy to clean up; an unwritable directory
-# allows none. Permissions are restored before anything is checked.
-for target in unreadable:summary unwritable:locked/summary; do
-    label=${target%%:*} file="$TMP/notice/${target#*:}"
-    printf 'facts\n' > "$file"
-    [[ "$label" == unreadable ]] && chmod 000 "$file" || chmod 500 "${file%/*}"
-    prepend_status=0
-    prepend_notice "$TOUCH_OFF" "$file" || prepend_status=$?
-    chmod 600 "$file" 2>/dev/null || true
-    chmod 700 "${file%/*}"
-    [[ "$prepend_status" -eq 0 ]] || fail "$label case: the failure stopped the request ($prepend_status)"
-    [[ $(cat "$TMP/prepend.stderr") == "$NOTICE_FAILED" ]] || fail "$label case: not reported: $(cat "$TMP/prepend.stderr")"
-    [[ $(cat "$file") == facts ]] || fail "$label case: the file changed"
-    [[ ! -e "$file.touch" ]] || fail "$label case: a partial copy was left"
-done
-sed '/^prepend_touch_notice() {/,/^}/ s|/bin/cat "\$file"|/bin/cat "$file.missing"|' "$ROOT/git-gpg-preview" > "$TMP/notice-failing-wrapper"
+# An unreadable details file: the summary would have worked, but must not change.
+prepend_status=0
+PREPEND_UNREADABLE=$(printf '%s' "$PREPEND_FUNCTION" | sed 's/^prepend_touch_notice() {$/prepend_touch_notice() { chmod 000 "$3"/')
+prepend_notice "$PREPEND_UNREADABLE" || prepend_status=$?
+chmod 600 "$TMP/notice/details"
+[[ "$prepend_status" -eq 0 && $(cat "$TMP/prepend.stderr") == "$NOTICE_FAILED" && $(notice_files) == "$UNCHANGED" ]] ||
+    fail "an unreadable details file: $prepend_status, $(cat "$TMP/prepend.stderr"), $(notice_files)"
+# A directory that takes no new file.
+prepend_status=0
+PREPEND_LOCKED=$(printf '%s' "$PREPEND_FUNCTION" | sed 's/^prepend_touch_notice() {$/prepend_touch_notice() { chmod 500 "${2%\/*}"/')
+prepend_notice "$PREPEND_LOCKED" || prepend_status=$?
+chmod 700 "$TMP/notice"
+[[ "$prepend_status" -eq 0 && $(cat "$TMP/prepend.stderr") == "$NOTICE_FAILED" && $(notice_files) == "$UNCHANGED" ]] ||
+    fail "an unwritable directory: $prepend_status, $(cat "$TMP/prepend.stderr"), $(notice_files)"
+# The details cannot be replaced after the summary was: the summary goes back.
+prepend_status=0
+prepend_notice "$(printf '%s' "$PREPEND_FUNCTION" | sed 's|/bin/mv -f "\$new_details" "\$details"|false|')" || prepend_status=$?
+[[ "$prepend_status" -eq 0 && $(cat "$TMP/prepend.stderr") == "$NOTICE_FAILED" && $(notice_files) == "$UNCHANGED" ]] ||
+    fail "details that cannot be replaced: $prepend_status, $(cat "$TMP/prepend.stderr"), $(notice_files)"
+# ...and if even that fails, stderr says which file has the notice.
+prepend_status=0
+prepend_notice "$(printf '%s' "$PREPEND_FUNCTION" | sed 's|/bin/mv -f "\$new_details" "\$details"|false|; s|/bin/mv -f "\$old_summary" "\$summary"|false|')" ||
+    prepend_status=$?
+[[ "$prepend_status" -eq 0 && $(notice_files) == "$TOUCH_OFF"$'\n\nfacts|report|600|600|details summary ' ]] ||
+    fail "a summary that cannot go back: $prepend_status, $(notice_files)"
+[[ $(cat "$TMP/prepend.stderr") == 'git-gpg-preview: note: the touch policy notice is in the preview but not in its details' ]] ||
+    fail "a summary that cannot go back was not reported: $(cat "$TMP/prepend.stderr")"
+sed '/^prepend_touch_notice() {/,/^}/ s|/bin/cat "\$details"|/bin/cat "$details.missing"|' "$ROOT/git-gpg-preview" > "$TMP/notice-failing-wrapper"
 chmod 700 "$TMP/notice-failing-wrapper"
 ! cmp -s "$ROOT/git-gpg-preview" "$TMP/notice-failing-wrapper" || fail 'could not make the notice fail'
 reset_pin_state
@@ -840,7 +863,77 @@ grep -qxF "$NOTICE_FAILED" "$TMP/pin.stderr" || fail 'a failed notice was not re
 grep -qxF "$(note_line "$TOUCH_OFF")" "$TMP/pin.stderr" || fail 'a failed notice lost the stderr note'
 [[ $(head -n 1 "$(latest_capture)") == 'Request type: commit' && $(head -n 1 "$(details_of "$(latest_capture)")") == "$DETAILS_TITLE" ]] ||
     fail 'a failed notice changed the preview'
-pass 'a notice that cannot be added is reported and cleaned up, and signing goes ahead'
+pass 'the notice goes into both files or neither, 0600, and a failure is reported and cleaned up'
+
+# Touch policy off: the key signs without a touch, so GPG waits for Sign in the
+# preview, within SIGN_CLICK_SECONDS. The fake dialog answers after
+# FAKE_DIALOG_DELAY and, for sign, makes the "touch" only then; fake GPG records
+# whether that touch already existed when it started ("before" only when GPG
+# waited for the answer), and the dialog log shows the PIN window after it.
+gate_case() {
+    reset_pin_state
+    rm -f "$FAKE_GPG_CALL_DIR/touch-at-start"
+    set +e
+    pin_output=$("${GATE_WRAPPER:-$ROOT/git-gpg-preview}" "$@" < "$TMP/commit.payload" 2>"$TMP/pin.stderr")
+    pin_status=$?
+    set -e
+}
+touch_at_start() {
+    cat "$FAKE_GPG_CALL_DIR/touch-at-start" 2>/dev/null || true
+}
+dialog_order() {
+    grep -E '^(start|end|pin-entry) ' "$FAKE_DIALOG_LOG" | cut -d' ' -f1 | tr '\n' ' '
+}
+GATE_REFUSED='git-gpg-preview: not signed: touch policy is off and Sign was not clicked'
+use_real_gpg "$TMP/gnupg-bin/gpg"
+export FAKE_DIALOG_DELAY=1 FAKE_PIN_RETRIES=3 FAKE_GPG_PIN=123456 FAKE_PIN_ENTRIES=123456
+for uif in %00+ %01+ %03+ %05+; do
+    export FAKE_CARD_UIF=$uif
+    gate_case --status-fd=2 -bsau TEST
+    [[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "touch $uif: not signed ($pin_status)"
+    if [[ "$uif" == %00+ ]]; then
+        [[ $(touch_at_start) == before ]] || fail "touch off: GPG started before Sign ($(touch_at_start))"
+        [[ $(dialog_order) == 'start end pin-entry ' ]] || fail "touch off: the PIN window did not follow Sign: $(dialog_order)"
+    else
+        [[ $(touch_at_start) == after ]] || fail "touch $uif: GPG waited for a click ($(touch_at_start))"
+    fi
+done
+export FAKE_CARD_UIF=%00+
+gate_case -bsau TEST
+[[ "$pin_status" -eq 0 && $(touch_at_start) == before ]] || fail "touch off, pinentry path: GPG did not wait for Sign ($pin_status, $(touch_at_start))"
+# Cancel, a window closed without an answer, and no answer in time sign nothing:
+# GPG never starts.
+export FAKE_DIALOG_DECISION=cancel
+gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 1 && -z "$pin_output" && -z $(touch_at_start) ]] || fail "touch off, Cancel: $pin_status, GPG $(touch_at_start)"
+grep -qxF "$GATE_REFUSED" "$TMP/pin.stderr" && grep -qxF 'git-gpg-preview: signing cancelled by user' "$TMP/pin.stderr" ||
+    fail "touch off, Cancel: $(cat "$TMP/pin.stderr")"
+export FAKE_DIALOG_DECISION=garbage
+gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 70 && -z "$pin_output" && -z $(touch_at_start) ]] || fail "touch off, no answer: $pin_status, GPG $(touch_at_start)"
+grep -qxF "$GATE_REFUSED" "$TMP/pin.stderr" || fail "touch off, no answer: $(cat "$TMP/pin.stderr")"
+sed 's/^SIGN_CLICK_SECONDS=.*/SIGN_CLICK_SECONDS=1/' "$ROOT/git-gpg-preview" > "$TMP/fast-sign-wrapper"
+chmod 700 "$TMP/fast-sign-wrapper"
+! cmp -s "$ROOT/git-gpg-preview" "$TMP/fast-sign-wrapper" || fail 'could not shorten SIGN_CLICK_SECONDS'
+export FAKE_DIALOG_DECISION=sign FAKE_DIALOG_DELAY=30
+gate_started=$SECONDS
+GATE_WRAPPER="$TMP/fast-sign-wrapper" gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 70 && -z "$pin_output" && -z $(touch_at_start) && $((SECONDS - gate_started)) -lt 10 ]] ||
+    fail "touch off, no click in time: $pin_status after $((SECONDS - gate_started))s, GPG $(touch_at_start)"
+grep -qxF "$GATE_REFUSED" "$TMP/pin.stderr" || fail "touch off, no click in time: $(cat "$TMP/pin.stderr")"
+# The gate does not depend on the notice: with its files unwritable, Sign is
+# still needed, and Cancel still signs nothing.
+export FAKE_DIALOG_DELAY=1
+GATE_WRAPPER="$TMP/notice-failing-wrapper" gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 0 && $(touch_at_start) == before ]] || fail "touch off, notice not written: GPG did not wait for Sign ($pin_status, $(touch_at_start))"
+grep -qxF "$NOTICE_FAILED" "$TMP/pin.stderr" || fail 'touch off, notice not written: not reported'
+export FAKE_DIALOG_DECISION=cancel
+GATE_WRAPPER="$TMP/notice-failing-wrapper" gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 1 && -z $(touch_at_start) ]] && grep -qxF "$GATE_REFUSED" "$TMP/pin.stderr" ||
+    fail "touch off, notice not written, Cancel: $pin_status, GPG $(touch_at_start)"
+export FAKE_DIALOG_DECISION=sign FAKE_DIALOG_DELAY=0
+unset FAKE_PIN_RETRIES FAKE_GPG_PIN FAKE_PIN_ENTRIES
+pass 'touch off: GPG starts only after Sign, then the PIN window; Cancel, no answer or no click in time sign nothing'
 
 # A wrong PIN repeats the preview: the notice stays, and the policy is read once.
 use_real_gpg "$TMP/gnupg-bin/gpg"

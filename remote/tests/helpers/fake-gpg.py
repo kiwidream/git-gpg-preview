@@ -43,6 +43,10 @@ if '--export' in args:
 signing = any(a in ('--sign', '--detach-sign') or (a.startswith('-') and not a.startswith('--') and ('s' in a[1:] or 'b' in a[1:])) for a in args)
 if signing and '--verify' not in args and os.environ.get('FAKE_TOUCH_FILE'):
     touch = Path(os.environ['FAKE_TOUCH_FILE'] + '.' + hashlib.sha256(payload).hexdigest())
+    # Whether the fake dialog had already answered (and touched) when this
+    # call started: "before" means GPG was engaged only after the preview.
+    with (call_dir / 'touch-at-start').open('a') as f:
+        f.write('before\n' if touch.exists() else 'after\n')
     deadline = time.monotonic() + 10
     while not touch.exists():
         if time.monotonic() > deadline:

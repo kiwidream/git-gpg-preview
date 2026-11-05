@@ -14,11 +14,13 @@ summary=$1 details=$2 decision=$3 ready=${4:-} spam_action=${5:-}
 cp "$summary" "$capture/$$.summary"
 cp "$details" "$capture/$$.details"
 printf '%s' "$spam_action" > "$capture/$$.spam-action"
+# require-sign and the touch policy notice, when the service asks for Sign.
+printf '%s\n%s' "${6-}" "${7-}" > "$capture/$$.gate"
 [[ -n "$ready" ]] && : > "$ready"
 choice=$(cat "${FAKE_DIALOG_DECISION_FILE:?}" 2>/dev/null || echo sign)
-if [[ "$choice" == delayed-spam ]]; then
+if [[ "$choice" == delayed-spam || "$choice" == delayed-sign ]]; then
     sleep 0.5
-    choice=spam
+    choice=${choice#delayed-}
 fi
 case "$choice" in
     sign)

@@ -82,6 +82,14 @@ for arg in "$@"; do
             ;;
     esac
 done
+# Whether the fake dialog had already reported its answer (and so the touch)
+# when this signing call started: "before" means GPG was engaged only after the
+# preview was answered, as the Sign gate for touch off requires.
+if [[ "$signing" -eq 1 && "$verify" -eq 0 && -n "${FAKE_TOUCH_FILE-}" ]]; then
+    sha=$(shasum -a 256 "$payload" | awk '{print $1}')
+    [[ -e "$FAKE_TOUCH_FILE.$sha" ]] && touched=before || touched=after
+    printf '%s\n' "$touched" >> "$CALL_DIR/touch-at-start"
+fi
 # A wrong PIN fails before any touch, the way the card rejects VERIFY first.
 # pinentry path: the first FAKE_GPG_BAD_PINS signing calls get a wrong PIN.
 # Loopback path (--command-fd): when FAKE_GPG_PIN is set, ask for the PIN on

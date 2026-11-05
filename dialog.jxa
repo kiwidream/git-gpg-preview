@@ -99,13 +99,20 @@ const MESSAGE_PANE_HEIGHT = 240;
 const FACTS_LINE_HEIGHT = 14;
 const FACTS_MIN_LINES = 8;
 const FACTS_MAX_LINES = 12;
+// A fact wider than this many columns of the 11-point font scrolls sideways,
+// and a legacy horizontal scroll bar then takes this much of the pane's height.
+const FACTS_COLUMNS = 80;
+const FACTS_SCROLLER_HEIGHT = 16;
 const PANE_GAP = 8;
 
 // Room for the facts' lines, kept between the minimum and the maximum, plus
-// the border.
+// the border, plus a horizontal scroll bar when a fact is wider than the pane.
+// Characters outside ASCII count twice: a fallback font may draw them wide.
 function factsPaneHeight(facts) {
-    const lines = Math.min(Math.max(facts.split('\n').length, FACTS_MIN_LINES), FACTS_MAX_LINES);
-    return lines * FACTS_LINE_HEIGHT + 4;
+    const rows = facts.split('\n');
+    const lines = Math.min(Math.max(rows.length, FACTS_MIN_LINES), FACTS_MAX_LINES);
+    const wide = rows.some(function(row) { return row.replace(/[^\x00-\x7f]/g, '  ').length > FACTS_COLUMNS; });
+    return lines * FACTS_LINE_HEIGHT + 4 + (wide ? FACTS_SCROLLER_HEIGHT : 0);
 }
 
 // The message is what the reader came to check, so it comes first, gets the
@@ -280,6 +287,13 @@ function runPinEntry(argv) {
 }
 
 function run(argv) {
+    // A signing service from before the cached touch policy offer was removed
+    // asks for its window this way. Refuse it plainly instead of reading the
+    // flag as a summary path; that service then signs on without the offer.
+    if (argv.length > 0 && (argv[0] === '--touch-offer' || argv[0] === '--touch-unchanged')) {
+        throw new Error('The cached touch policy offer was removed. Restart the signing service ' +
+                        '(git-gpg-preview-setup serve-install) so it runs the version installed with this dialog.');
+    }
     if (argv.length > 0 && argv[0] === '--pin-error') {
         runPinError(argv.slice(1));
         return;
@@ -295,8 +309,12 @@ function run(argv) {
     const details = readText(argv[1]);
     const decisionPath = argv[2];
     const readyPath = argv.length > 3 ? argv[3] : '';
-    // Explicit capability from the signer; never infer it from payload text.
+    // Explicit capabilities from the signer; never infer them from payload text.
     const canMarkSpam = argv.length > 4 && argv[4] === 'mark-spam';
+    // With touch policy off the key signs without a touch, so the signer starts
+    // GPG only after Sign here; the touch policy notice comes with the request.
+    const requireSign = argv.length > 5 && argv[5] === 'require-sign';
+    const signNotice = argv.length > 6 ? String(argv[6]) : '';
 
     const app = $.NSApplication.sharedApplication;
     app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
@@ -310,11 +328,16 @@ function run(argv) {
         const alert = $.NSAlert.alloc.init;
         alert.alertStyle = $.NSAlertStyleInformational;
         alert.messageText = 'Confirm signature on your key';
-        alert.informativeText = 'Touch your key to sign; this closes when done. View Details for the full payload, or Cancel to abort.';
+        alert.informativeText = requireSign
+            ? signNotice + '\n\nThis key signs without a touch, so nothing is signed until you click Sign. ' +
+              'View Details for the full payload, or Cancel to abort.'
+            : 'Touch your key to sign; this closes when done. View Details for the full payload, or Cancel to abort.';
         alert.accessoryView = previewPanes(summary);
         alert.addButtonWithTitle('View Details');
         alert.addButtonWithTitle('Cancel');
         if (canMarkSpam) alert.addButtonWithTitle('Mark as Spam');
+        // Last, so Return (View Details) never signs by accident.
+        if (requireSign) alert.addButtonWithTitle('Sign');
         // Report readiness only once, as the first preview is about to show,
         // so the wrapper engages GPG after this window is already up.
         if (first) {
@@ -330,11 +353,16 @@ function run(argv) {
             rejectSignature(decisionPath, 'spam');
             return;
         }
+        if (requireSign && response === Number($.NSAlertThirdButtonReturn) + (canMarkSpam ? 1 : 0)) {
+            writeDecision(decisionPath, 'sign');
+            return;
+        }
 
         const detailAlert = $.NSAlert.alloc.init;
         detailAlert.alertStyle = $.NSAlertStyleInformational;
         detailAlert.messageText = 'Exact Payload and Derived Review Report';
-        detailAlert.informativeText = 'The exact GPG input is explicitly marked between the payload markers. The full diff is derived from Git objects and is not literal signed input. Touch your security key to sign, or return and Cancel to abort.';
+        detailAlert.informativeText = 'The exact GPG input is explicitly marked between the payload markers. The full diff is derived from Git objects and is not literal signed input. ' +
+            (requireSign ? 'Return and click Sign to sign, or Cancel to abort.' : 'Touch your security key to sign, or return and Cancel to abort.');
         detailAlert.accessoryView = scrollableText(details, 920, 600);
         detailAlert.addButtonWithTitle('Back');
         detailAlert.addButtonWithTitle('Cancel');

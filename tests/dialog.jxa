@@ -4,13 +4,21 @@ ObjC.import('Cocoa');
 
 var responses = [];
 var expectedSpam = false;
+var expectedSign = false;
 var modalCount = 0;
-function modalResponse(alert) {
+// The preview has Sign, last, only when the signer requires it; the details
+// window never has it.
+function modalResponse(alert, preview) {
     const buttons = alert.buttons;
     const count = Number(buttons.count);
-    if (count !== (expectedSpam ? 3 : 2)) throw new Error('Unexpected button count: ' + count);
+    const sign = !!preview && expectedSign;
+    if (count !== (expectedSpam ? 3 : 2) + (sign ? 1 : 0)) throw new Error('Unexpected button count: ' + count);
     if (ObjC.unwrap(buttons.objectAtIndex(1).title) !== 'Cancel') throw new Error('Cancel moved');
     if (expectedSpam && ObjC.unwrap(buttons.objectAtIndex(2).title) !== 'Mark as Spam') throw new Error('Spam button missing');
+    for (let i = 0; i < count; i++) {
+        const isSign = ObjC.unwrap(buttons.objectAtIndex(i).title) === 'Sign';
+        if (isSign !== (sign && i === count - 1)) throw new Error('Sign button where it does not belong, or missing');
+    }
     if (ObjC.unwrap(alert.informativeText).indexOf('Spam') >= 0) throw new Error('Spam text in the preview: ' + ObjC.unwrap(alert.informativeText));
     if (!responses.length) throw new Error('Unexpected extra modal');
     modalCount++;
@@ -29,9 +37,10 @@ function previewModalResponse(alert) {
         messageOnTop: message.frame.origin.y > facts.frame.origin.y,
         messageLarger: message.frame.size.height > facts.frame.size.height,
         messageWraps: !!message.documentView.textContainer.widthTracksTextView && !message.hasHorizontalScroller,
-        factsUnwrapped: !facts.documentView.textContainer.widthTracksTextView
+        factsUnwrapped: !facts.documentView.textContainer.widthTracksTextView,
+        info: ObjC.unwrap(alert.informativeText)
     });
-    return modalResponse(alert);
+    return modalResponse(alert, true);
 }
 
 var pinResponses = [];
@@ -147,6 +156,19 @@ function run(argv) {
         if (message.frame.origin.y < facts.frame.size.height || message.frame.size.height <= facts.frame.size.height) throw new Error('The message pane is not on top and larger');
         if (facts.documentView.textContainer.widthTracksTextView) throw new Error('The facts pane wraps');
     });
+    // A fact wider than the pane (560 points hold about 83 columns of the font)
+    // scrolls sideways, still on one line; a legacy scroll bar, 15 points tall,
+    // must not cover the last fact. Wide characters count double: 50 of them
+    // take about 100 columns.
+    const scrollBar = 15;
+    const wideFacts = ['Signing key: ' + 'A'.repeat(200), 'Branch: ' + '漢'.repeat(50)];
+    [].concat(...wideFacts.map(function(wide) { return [8, 12, 32].map(function(count) { return [wide].concat(new Array(count - 1).fill('Fact')); }); }))
+        .forEach(function(lines) {
+            const facts = previewPanes(lines.join('\n') + '\n\nMessage:\nSubject').subviews.objectAtIndex(1);
+            const room = Number(facts.contentSize.height);
+            if (room < Math.min(lines.length, 12) * factLine + scrollBar) throw new Error('A wide fact leaves no room for the scroll bar: ' + room);
+            if (facts.documentView.textContainer.widthTracksTextView) throw new Error('A wide fact wraps');
+        });
     // The first marker ends the facts, whatever the message says.
     [
         {summary: 'Request type: commit\n\nMessage:\nSubject', facts: 'Request type: commit', message: 'Subject'},
@@ -158,8 +180,31 @@ function run(argv) {
         const parts = splitSummary(test.summary);
         if (parts.facts !== test.facts || parts.message !== test.message) throw new Error('Wrong split of: ' + test.summary);
     });
-    // The touch policy offer is gone. A remote service still running a version
-    // that asks for it gets no window and no answer, and goes on to the preview.
+    // With touch policy off the signer adds require-sign and the notice: Sign
+    // comes last, so Return never signs, and only Sign writes 'sign'. The notice
+    // shows even when the summary lacks it, as when it could not be written.
+    $.NSString.stringWithString('Request type: commit\n\nMessage:\nNoisy subject').writeToFileAtomicallyEncodingError(summary, true, $.NSUTF8StringEncoding, null);
+    [
+        {spam: false, responses: [1002], decision: 'sign'},
+        {spam: true, responses: [1003], decision: 'sign'},
+        {spam: false, responses: [1000, 1000, 1002], decision: 'sign'},
+        {spam: false, responses: [1001], decision: 'cancel'},
+        {spam: true, responses: [1002], decision: 'spam'}
+    ].forEach(function(test) {
+        $.NSData.data.writeToFileAtomically(decision, true);
+        expectedSpam = test.spam;
+        expectedSign = true;
+        responses = test.responses.slice();
+        modalCount = 0;
+        panesSeen = [];
+        runPreview([summary, details, decision, ready, test.spam ? 'mark-spam' : '', 'require-sign', notice]);
+        expectedSign = false;
+        if (readText(decision) !== test.decision) throw new Error('Wrong decision with Sign required: ' + readText(decision));
+        if (responses.length || modalCount !== test.responses.length) throw new Error('Wrong modal sequence with Sign required');
+        if (panesSeen[0].info.indexOf(notice) !== 0 || panesSeen[0].info.indexOf('until you click Sign') < 0) throw new Error('Sign required without the notice: ' + panesSeen[0].info);
+    });
+    // A signing service from before the touch policy offer was removed asks for
+    // it with --touch-offer: no window, no answer, and a message that says why.
     $.NSData.data.writeToFileAtomically(decision, true);
     modalCount = 0;
     let refused = '';
@@ -168,7 +213,7 @@ function run(argv) {
     } catch (error) {
         refused = error.message;
     }
-    if (refused !== 'Unable to read review data.' || modalCount !== 0 || readText(decision) !== '') throw new Error('The touch offer was answered: ' + refused);
+    if (refused.indexOf('The cached touch policy offer was removed.') !== 0 || modalCount !== 0 || readText(decision) !== '') throw new Error('The touch offer was answered: ' + refused);
     // Wrong-PIN dialog: Try Again only while attempts remain and the signer allows it.
     [
         {args: ['2', 'retry'], buttons: ['Try Again', 'Cancel'], response: 1000, decision: 'retry', text: '2 attempts remaining'},
@@ -219,5 +264,5 @@ function run(argv) {
             if (!seen.secure) throw new Error(where + 'PIN field is not secure');
         });
     });
-    return 'Dialog actions passed (34 cases)';
+    return 'Dialog actions passed (45 cases)';
 }

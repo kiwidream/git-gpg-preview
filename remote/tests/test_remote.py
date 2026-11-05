@@ -648,10 +648,10 @@ class TouchPolicyTests(unittest.TestCase):
         self.card = self.tmp / 'card'
         self.repo, _, self.payload = fixture_repo(self.tmp)
 
-    def harness(self, name: str, real_gpg: Path | None = None, card_keys: str = CARD_SUB) -> Harness:
+    def harness(self, name: str, real_gpg: Path | None = None, card_keys: str = CARD_SUB, extra_env: dict | None = None) -> Harness:
         h = Harness(self.tmp / name, real_gpg=str(real_gpg or self.gnupg / 'gpg'),
                     extra_env={'FAKE_GPG_SECRET_KEYS': f'{self.PRIMARY}/{self.CARD_SUB}',
-                               'FAKE_GPG_CARD_KEYS': card_keys, 'FAKE_CARD_FILE': str(self.card)})
+                               'FAKE_GPG_CARD_KEYS': card_keys, 'FAKE_CARD_FILE': str(self.card), **(extra_env or {})})
         self.addCleanup(h.stop)
         return h
 
@@ -734,6 +734,102 @@ class TouchPolicyTests(unittest.TestCase):
         self.assertIn(self.note('off'), stderr)
         self.assertNotRegex(stderr, CACHED_HINT)
         self.assertIn('signing cancelled by operator', stderr)
+
+    @staticmethod
+    def touch_at_start(h: Harness) -> list[str]:
+        """For each signing GPG call, whether the fake dialog's answer (and so
+        the touch) already existed when it started: 'before' only when GPG
+        waited for the preview."""
+        record = h.calls / 'touch-at-start'
+        return record.read_text().split() if record.exists() else []
+
+    @staticmethod
+    def gate(h: Harness) -> str:
+        """What the latest preview was told beyond its files: require-sign and
+        the notice, or nothing."""
+        return sorted(h.captures.glob('*.gate'), key=lambda p: p.stat().st_mtime)[-1].read_text()
+
+    @staticmethod
+    def untouch(h: Harness) -> None:
+        """Forgets earlier touches and their records, so the same payload can be
+        signed again with a fresh answer."""
+        for path in [*h.tmp.glob('touch.*'), h.calls / 'touch-at-start']:
+            path.unlink(missing_ok=True)
+
+    REFUSED = 'git-gpg-preview: not signed: touch policy is off and Sign was not clicked\n'
+
+    def test_touch_off_starts_gpg_only_after_sign(self):
+        h = self.harness('h')
+        h.decision.write_text('delayed-sign')
+        _, stderr = self.sign(h, f'{self.CARD_SUB} %00+')
+        self.assertEqual(self.touch_at_start(h), ['before'], 'GPG started before Sign')
+        self.assertEqual(self.gate(h), 'require-sign\n' + remote.TOUCH_NOTICES['off'])
+        self.assertNotIn('not signed', stderr)
+
+    def test_other_policies_start_gpg_with_the_preview(self):
+        h = self.harness('h')
+        h.decision.write_text('delayed-sign')
+        for card in (f'{self.CARD_SUB} %01+', f'{self.CARD_SUB} %03+', f'{self.CARD_SUB} %04+', f'{self.CARD_SUB} %05+', ''):
+            with self.subTest(card=card):
+                self.untouch(h)
+                self.sign(h, card)
+                self.assertEqual(self.touch_at_start(h), ['after'], 'GPG waited for a click')
+                self.assertEqual(self.gate(h), '\n')
+
+    def test_touch_off_without_sign_signs_nothing(self):
+        for choice, status in (('cancel', remote.EX_CANCELLED), ('garbage', remote.EX_SOFTWARE), ('hang', remote.EX_SOFTWARE)):
+            with self.subTest(choice=choice):
+                h = self.harness(choice)
+                h.decision.write_text(choice)
+                self.card.write_text(f'{self.CARD_SUB} %00+')
+                started = time.monotonic()
+                result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+                self.assertLess(time.monotonic() - started, 10, 'sign_timeout_seconds=3 bounds the wait for Sign')
+                self.assertEqual((result.returncode, result.stdout), (status, b''))
+                self.assertIn(self.REFUSED, result.stderr.decode())
+                self.assertEqual((h.gpg_calls(), self.touch_at_start(h)), ([], []), 'GPG started without Sign')
+                self.assertIn('decision=' + ('cancel' if choice == 'cancel' else 'sign-not-clicked'), h.audit.read_text())
+
+    def test_a_notice_that_cannot_be_written_still_needs_sign(self):
+        """In process, so writing the notice can be made to fail. Neither file
+        gets it, the operator is told, and the preview still asks for Sign
+        with the notice text: GPG waits for Sign, and Cancel signs nothing."""
+        h = self.harness('h')
+        self.card.write_text(f'{self.CARD_SUB} %00+')
+        write_text = Path.write_text
+
+        def details_fail(path, text, *args, **kwargs):
+            if path.name == 'details.txt' and text.startswith('Touch policy'):
+                raise OSError(28, 'No space left on device')
+            return write_text(path, text, *args, **kwargs)
+
+        request = {'args': ['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], 'payload': base64.b64encode(self.payload).decode(),
+                   'context': {'repository': str(self.repo), 'branch': 'main'}}
+        for choice, status in (('cancel', remote.EX_CANCELLED), ('delayed-sign', 0)):
+            with self.subTest(choice=choice), unittest.mock.patch.dict(os.environ, h.env), \
+                    unittest.mock.patch.object(Path, 'write_text', details_fail):
+                h.decision.write_text(choice)
+                self.untouch(h)
+                service = remote.Service(remote.ServeConfig(h.serve_dir), {'login': '', 'node': 'mac', 'ips': []})
+                result = service.sign(request, {'node': 'minidev-test', 'login': 'tester'})
+                summary, details = h.latest_capture()
+                self.assertEqual(result['status'], status, result)
+                self.assertFalse(summary.startswith('Touch policy') or details.startswith('Touch policy'), 'only one file got the notice')
+                self.assertEqual(self.gate(h), 'require-sign\n' + remote.TOUCH_NOTICES['off'])
+                self.assertIn('could not add the touch policy notice to the preview or its details', result['stderr'])
+                self.assertEqual(self.touch_at_start(h), ['before'] if status == 0 else [])
+                if status:
+                    self.assertIn(self.REFUSED, result['stderr'])
+
+    def test_the_policy_lookup_counts_against_the_signing_time(self):
+        h = self.harness('h', extra_env={'FAKE_CONNECT_AGENT_SLEEP': '2'})
+        h.decision.write_text('approve-no-touch')
+        self.card.write_text(f'{self.CARD_SUB} %01+')
+        started = time.monotonic()
+        result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+        self.assertEqual(result.returncode, remote.EX_SOFTWARE, result.stderr)
+        self.assertIn(b'no hardware confirmation within 3s', result.stderr)
+        self.assertLess(time.monotonic() - started, 4.5, 'a 2s lookup and the 3s signing time were added up')
 
     def test_the_preview_is_the_only_window_and_nothing_is_recorded(self):
         h = self.harness('h')

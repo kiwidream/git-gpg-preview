@@ -865,24 +865,50 @@ class Service:
                 spam = self._spam_rejection(payload, info, digest, repo, peer)
                 if spam:
                     return spam
+                # From here on everything counts against sign_timeout_seconds:
+                # the policy lookup, the preview, a Sign click and the
+                # signature, so the service answers before the client gives up.
+                started = time.monotonic()
                 # Read under the lock, as the wrapper does: the card is busy
-                # while another request waits for its touch. Advisory: signing
-                # goes ahead under the key's current policy.
-                notice = self._touch_notice()
+                # while another request waits for its touch.
+                policy = self._touch_policy(started)
+                notice = TOUCH_NOTICES.get(policy, '')
+                notes = []
                 if notice:
-                    paths['summary.txt'].write_text(f'{notice}\n\n{summary}')
-                    paths['details.txt'].write_text(f'{notice}\n\n{details}')
-                result = self._run_dialog_and_gpg(args, paths, info, digest, repo, peer)
-                if notice:
-                    note = notice.replace('\n', ' ')
-                    result['stderr'] = f'git-gpg-preview: note from the signing Mac: {note}\n{result["stderr"]}'
+                    notes.append(notice.replace('\n', ' '))
+                    if not self._add_touch_notice(paths, notice, summary, details):
+                        error('could not add the touch policy notice to the preview or its details')
+                        notes.append('could not add the touch policy notice to the preview or its details')
+                # With touch off the key signs without a touch, so GPG waits for
+                # Sign. That follows the policy read, not the notice files.
+                result = self._run_dialog_and_gpg(args, paths, info, digest, repo, peer, started,
+                                                  notice if policy == 'off' else '')
+                result['stderr'] = ''.join(f'git-gpg-preview: note from the signing Mac: {note}\n' for note in notes) + result['stderr']
                 return result
 
-    def _touch_notice(self) -> str:
-        """What the preview should say about the touch policy of the key this
-        service signs with, which is GPG's pick for --local-user FINGERPRINT.
-        Both lookups share one deadline, since they hold the dialog lock."""
-        deadline = time.monotonic() + 10
+    @staticmethod
+    def _add_touch_notice(paths, notice, summary, details) -> bool:
+        """Puts NOTICE above the preview's summary and its details: both or
+        neither, so the two never disagree. Advisory: whatever cannot be
+        written is put back as it was, and the caller signs without it."""
+        try:
+            paths['summary.txt'].write_text(f'{notice}\n\n{summary}')
+            paths['details.txt'].write_text(f'{notice}\n\n{details}')
+            return True
+        except OSError:
+            for name, text in (('summary.txt', summary), ('details.txt', details)):
+                try:
+                    paths[name].write_text(text)
+                except OSError:
+                    pass
+            return False
+
+    def _touch_policy(self, started: float) -> str:
+        """The touch policy of the key this service signs with, which is GPG's
+        pick for --local-user FINGERPRINT; empty when it cannot be told. Both
+        lookups share one deadline, at most 10 seconds and within the request's
+        own, since they hold the dialog lock."""
+        deadline = min(started + 10, started + self.config.sign_timeout)
         agent = gpg_connect_agent(self.config.real_gpg)
         if not agent:
             return ''
@@ -897,7 +923,31 @@ class Service:
         key = selected_signing_key(listing.stdout.decode('utf-8', 'replace'), time.time())
         if not key.endswith(' card'):
             return ''
-        return TOUCH_NOTICES.get(card_touch_policy(agent, key.split()[0], deadline - time.monotonic()), '')
+        return card_touch_policy(agent, key.split()[0], deadline - time.monotonic())
+
+    def _await_sign_click(self, dialog, stop, paths, info, digest, repo, peer, started) -> dict | None:
+        """The wrapper's await_sign_click: waits, within the request's time,
+        for the preview to close. None after Sign; otherwise the refusal to
+        return, since GPG has not started and nothing can be signed."""
+        while dialog.poll() is None and time.monotonic() - started <= self.config.sign_timeout:
+            time.sleep(0.1)
+        stop(dialog)
+        try:
+            decision = paths['decision'].read_text().strip()
+        except OSError:
+            decision = ''
+        if decision == 'sign' and not self._deciding_marker(paths).exists():
+            return None
+        refusal = 'git-gpg-preview: not signed: touch policy is off and Sign was not clicked\n'
+        if decision == 'spam':
+            result = self._mark_spam(paths, info, digest, repo, peer)
+            return {**result, 'stderr': refusal + result['stderr']}
+        if decision == 'cancel':
+            self.audit('cancel', repo, info['type'], digest, peer)
+            return {'status': EX_CANCELLED, 'decision': 'cancel', 'stdout': '',
+                    'stderr': refusal + 'git-gpg-preview: signing cancelled by operator\n'}
+        self.audit('sign-not-clicked', repo, info['type'], digest, peer)
+        return {'status': EX_SOFTWARE, 'decision': 'sign-not-clicked', 'stdout': '', 'stderr': refusal}
 
     @staticmethod
     def _deciding_marker(paths):
@@ -916,7 +966,10 @@ class Service:
                 pass
             time.sleep(0.05)
 
-    def _run_dialog_and_gpg(self, args, paths, info, digest, repo, peer) -> dict:
+    def _run_dialog_and_gpg(self, args, paths, info, digest, repo, peer, started, sign_notice='') -> dict:
+        """Shows the preview and runs GPG, both within sign_timeout_seconds of
+        STARTED. With a SIGN_NOTICE (touch policy off) the preview asks for
+        Sign, and GPG starts only after it."""
         config = self.config
         if config.dialog_runner:
             dialog_cmd = [config.dialog_runner]
@@ -924,15 +977,29 @@ class Service:
             dialog_cmd = ['/usr/bin/osascript', '-l', 'JavaScript', config.ui_helper]
         dialog_cmd += [str(paths['summary.txt']), str(paths['details.txt']), str(paths['decision']), str(paths['ready'])]
         dialog_cmd.append('mark-spam' if spam_subject(paths['payload'].read_bytes()) else '')
+        if sign_notice:
+            dialog_cmd += ['require-sign', sign_notice]
         dialog = subprocess.Popen(dialog_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        deadline = time.monotonic() + 5
+        deadline = min(time.monotonic() + 5, started + config.sign_timeout)
         while not paths['ready'].exists() and dialog.poll() is None and time.monotonic() < deadline:
             time.sleep(0.05)
 
+        def stop(proc):
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+
+        if sign_notice:
+            refused = self._await_sign_click(dialog, stop, paths, info, digest, repo, peer, started)
+            if refused:
+                return refused
         with paths['payload'].open('rb') as stdin:
             gpg = subprocess.Popen([config.real_gpg, *args], stdin=stdin,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        started = time.monotonic()
         outcome = ''
         while True:
             if gpg.poll() is not None:
@@ -945,15 +1012,6 @@ class Service:
                 outcome = 'timeout'
                 break
             time.sleep(0.1)
-
-        def stop(proc):
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
 
         if outcome == 'dialog':
             decision = paths['decision'].read_text().strip()
