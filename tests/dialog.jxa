@@ -17,6 +17,33 @@ function modalResponse(alert) {
     return responses.shift();
 }
 
+// The preview: record which text went into which pane, then answer.
+var panesSeen = [];
+function previewModalResponse(alert) {
+    const panes = alert.accessoryView.subviews;
+    const message = panes.objectAtIndex(0);
+    const facts = panes.objectAtIndex(1);
+    panesSeen.push({
+        message: ObjC.unwrap(message.documentView.string),
+        facts: ObjC.unwrap(facts.documentView.string),
+        messageOnTop: message.frame.origin.y > facts.frame.origin.y,
+        messageLarger: message.frame.size.height > facts.frame.size.height,
+        messageWraps: !!message.documentView.textContainer.widthTracksTextView && !message.hasHorizontalScroller,
+        factsUnwrapped: !facts.documentView.textContainer.widthTracksTextView
+    });
+    return modalResponse(alert);
+}
+
+var touchResponses = [];
+var touchSeen = [];
+function touchModalResponse(alert) {
+    const titles = [];
+    for (let i = 0; i < Number(alert.buttons.count); i++) titles.push(ObjC.unwrap(alert.buttons.objectAtIndex(i).title));
+    touchSeen.push({buttons: titles.join('|'), title: ObjC.unwrap(alert.messageText), info: ObjC.unwrap(alert.informativeText)});
+    if (!touchResponses.length) throw new Error('Unexpected extra touch policy window');
+    return touchResponses.shift();
+}
+
 var pinResponses = [];
 var expectedPinButtons = [];
 function pinModalResponse(alert) {
@@ -55,12 +82,16 @@ function run(argv) {
     const substitutions = [
         ['function run(argv)', 'function runPreview(argv)'],
         ['app.activateIgnoringOtherApps(true);', ''],
-        ['Number(alert.runModal)', 'modalResponse(alert)'],
+        ['Number(alert.runModal)', 'previewModalResponse(alert)'],
         ['Number(detailAlert.runModal)', 'modalResponse(detailAlert)'],
         ['pinApp.activateIgnoringOtherApps(true);', ''],
         ['Number(pinAlert.runModal)', 'pinModalResponse(pinAlert)'],
         ['pinEntryApp.activateIgnoringOtherApps(true);', ''],
-        ['Number(pinEntryAlert.runModal)', 'pinEntryModalResponse(pinEntryAlert)']
+        ['Number(pinEntryAlert.runModal)', 'pinEntryModalResponse(pinEntryAlert)'],
+        ['offerApp.activateIgnoringOtherApps(true);', ''],
+        ['Number(offerAlert.runModal)', 'touchModalResponse(offerAlert)'],
+        ['unchangedApp.activateIgnoringOtherApps(true);', ''],
+        ['Number(unchangedAlert.runModal)', 'touchModalResponse(unchangedAlert)']
     ];
     let instrumented = source;
     substitutions.forEach(function(pair) {
@@ -72,7 +103,7 @@ function run(argv) {
     const details = argv[1] + '/dialog-details';
     const decision = argv[1] + '/dialog-decision';
     const ready = argv[1] + '/dialog-ready';
-    $.NSString.stringWithString('Request type: commit\nMessage:\nNoisy subject').writeToFileAtomicallyEncodingError(summary, true, $.NSUTF8StringEncoding, null);
+    $.NSString.stringWithString('Request type: commit\n\nMessage:\nNoisy subject').writeToFileAtomicallyEncodingError(summary, true, $.NSUTF8StringEncoding, null);
     $.NSString.stringWithString('Exact payload and details').writeToFileAtomicallyEncodingError(details, true, $.NSUTF8StringEncoding, null);
     [
         {spam: true, responses: [1002], decision: 'spam'},
@@ -94,6 +125,51 @@ function run(argv) {
         if (readText(decision) !== test.decision) throw new Error('Wrong decision');
         if (responses.length || modalCount !== test.responses.length) throw new Error('Wrong modal sequence');
         if (!$.NSFileManager.defaultManager.fileExistsAtPath(ready)) throw new Error('Readiness missing');
+    });
+    // The message has the top, larger, wrapping pane; the facts have their own.
+    panesSeen.forEach(function(seen) {
+        if (seen.message !== 'Noisy subject' || seen.facts !== 'Request type: commit') throw new Error('Wrong pane text: ' + JSON.stringify(seen));
+        if (!seen.messageOnTop || !seen.messageLarger) throw new Error('The message pane is not first and largest');
+        if (!seen.messageWraps || !seen.factsUnwrapped) throw new Error('Wrong pane wrapping');
+    });
+    // The first marker ends the facts, whatever the message says.
+    [
+        {summary: 'Request type: commit\n\nMessage:\nSubject', facts: 'Request type: commit', message: 'Subject'},
+        {summary: 'Request type: commit\n\nMessage:\nSubject\n\nMessage:\nForged', facts: 'Request type: commit', message: 'Subject\n\nMessage:\nForged'},
+        {summary: 'PIN attempt 2: wrong\n\nRequest type: commit\n\nMessage:\n', facts: 'PIN attempt 2: wrong\n\nRequest type: commit', message: ''},
+        {summary: 'Request type: commit\nMessage:\nNo blank line', facts: '', message: 'Request type: commit\nMessage:\nNo blank line'}
+    ].forEach(function(test) {
+        const parts = splitSummary(test.summary);
+        if (parts.facts !== test.facts || parts.message !== test.message) throw new Error('Wrong split of: ' + test.summary);
+    });
+    // Touch policy windows: 'apply' only from Use Cached, and the countdown is honest.
+    [
+        {policy: 'on', left: '3', response: 1000, result: 'apply', title: 'Let one touch cover 15 seconds?', text: '2 more times at most'},
+        {policy: 'on', left: '3', response: 1001, result: 'dismiss', title: 'Let one touch cover 15 seconds?', text: 'covers every signature in the next 15 seconds'},
+        {policy: 'off', left: '2', response: 1001, result: 'dismiss', title: 'This key signs without a touch', text: 'one more time at most'},
+        {policy: 'off', left: '1', response: 1000, result: 'apply', title: 'This key signs without a touch', text: 'Not Now stops asking about this key'}
+    ].forEach(function(test) {
+        $.NSData.data.writeToFileAtomically(decision, true);
+        touchResponses = [test.response];
+        touchSeen = [];
+        runPreview(['--touch-offer', decision, test.policy, test.left]);
+        const seen = touchSeen[0];
+        if (readText(decision) !== test.result) throw new Error('Wrong touch offer result for ' + test.policy + ' ' + test.left);
+        if (seen.buttons !== 'Use Cached|Not Now' || seen.title !== test.title) throw new Error('Wrong touch offer: ' + JSON.stringify(seen));
+        if (seen.info.indexOf(test.text) < 0) throw new Error('Touch offer text missing "' + test.text + '": ' + seen.info);
+        if (seen.info.indexOf('Admin PIN') < 0) throw new Error('Touch offer does not mention the Admin PIN');
+    });
+    [
+        {reason: 'Bad PIN <SCD>', text: 'gpg-agent reported: Bad PIN <SCD>.'},
+        {reason: '', text: 'The key did not confirm the change.'}
+    ].forEach(function(test) {
+        touchResponses = [1000];
+        touchSeen = [];
+        runPreview(['--touch-unchanged', test.reason]);
+        const seen = touchSeen[0];
+        if (seen.buttons !== 'OK') throw new Error('Wrong buttons on the unchanged window: ' + seen.buttons);
+        if (seen.info.indexOf(test.text) < 0) throw new Error('Unchanged window missing "' + test.text + '": ' + seen.info);
+        if (seen.info.indexOf('ykman openpgp keys set-touch sig cached') < 0) throw new Error('Unchanged window lost the ykman command');
     });
     // Wrong-PIN dialog: Try Again only while attempts remain and the signer allows it.
     [
@@ -145,5 +221,5 @@ function run(argv) {
             if (!seen.secure) throw new Error(where + 'PIN field is not secure');
         });
     });
-    return 'Dialog actions passed (19 cases)';
+    return 'Dialog actions passed (29 cases)';
 }

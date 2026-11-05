@@ -49,7 +49,7 @@ The installer:
 - records the exact previous global `gpg.openpgp.program` state once; and
 - sets global `gpg.openpgp.program` to the wrapper.
 
-It does not alter `commit.gpgSign`, `tag.gpgSign`, `user.signingkey`, GPG agent configuration, smart-card configuration, PIN policy, or hardware touch/confirmation policy; the preview only suggests a touch policy (see [Touch policy](#touch-policy)). Re-running `install.sh` updates the installed files without replacing the original recovery state.
+It does not alter `commit.gpgSign`, `tag.gpgSign`, `user.signingkey`, GPG agent configuration, smart-card configuration, PIN policy, or hardware touch/confirmation policy. The wrapper changes a key's touch policy only when you choose **Use Cached** and enter the key's Admin PIN (see [Touch policy](#touch-policy)). Re-running `install.sh` updates the installed files without replacing the original recovery state.
 
 To enable the optional metadata-only audit log during installation:
 
@@ -64,13 +64,14 @@ The audit file and its directory are restricted to the current user. Each line c
 
 For signing operations, stdin is copied exactly once into a unique mode-0600 file within a mode-0700 temporary request directory. Each request retains its own payload. Dialogs from simultaneous Git processes are serialized using macOS `shlock`; dead-process locks are recovered atomically. Because each request holds the lock across its preview and signature, one hardware confirmation completes before the next request's preview appears.
 
-The main dialog is deliberately small and concise, showing:
+The main dialog leads with the commit/tag message or payload body. It has the largest pane, which wraps long lines and scrolls, and holds up to 4,000 bytes of it. Below it, in a pane of its own that a long message cannot scroll out of sight, are:
 
 - request type: commit, annotated tag, push certificate, or unknown;
 - branch;
 - GPG signing-key selector, when present;
-- exact byte count and SHA-256;
-- the commit/tag message or payload body.
+- exact byte count and SHA-256.
+
+Every one of these is a single sanitized line, and the dialog splits the panes at the first `Message:` line after them, so nothing in a message can pass for one of them.
 
 **View Details** opens a selectable, scrollable report containing everything else: the full repository/worktree path, the tree and parent/target object hashes, the per-parent changed-file summary, the verbatim captured payload, a byte-preserving hex view, and the complete safely generated diff for commits.
 
@@ -80,15 +81,16 @@ There is no **Sign** button: the signature is produced by the hardware confirmat
 
 ### Touch policy
 
-Because the touch is the gate, the wrapper checks the key's touch policy before the preview opens. When the key GPG will sign with is the signature key of the card in the reader, it reads that slot's policy from scdaemon, which already holds the card, through the `gpg-connect-agent` installed beside real GPG. It never runs `ykman`, which kills scdaemon when scdaemon holds the card. If the policy is **off**, a YubiKey's default, the key signs without a touch, so the preview cannot hold the signature for your review. If it is **on**, every signature needs its own touch. In both cases the preview names the change above the request summary:
+Because the touch is the gate, the wrapper checks the key's touch policy before the preview opens. When the key GPG will sign with is the signature key of the card in the reader, it reads that slot's policy from scdaemon, which already holds the card, through the `gpg-connect-agent` installed beside real GPG. It never runs `ykman`, which kills scdaemon when scdaemon holds the card. If the policy is **off**, a YubiKey's default, the key signs without a touch, so the preview cannot hold the signature for your review. If it is **on**, every signature needs its own touch.
 
-```sh
-ykman openpgp keys set-touch sig cached
-```
+In both cases a window of its own offers the **cached** policy, before the preview opens and before GPG starts. With **cached** the key still needs a touch, and that touch also covers every signature in the next 15 seconds. A rebase signs all its commits on one touch, and a request queued behind one you just touched for signs as soon as its preview opens. Keep **on** if every signature must wait for its own touch.
 
-`ykman` asks for the Admin PIN. Cached needs YubiKey firmware 5.2.1 or later, and `ykman` refuses it on older keys; there, `ykman openpgp keys set-touch sig on` turns touch on. With **cached** the key still needs a touch, and that touch also covers every signature in the next 15 seconds. A rebase signs all its commits on one touch, and a request queued behind one you just touched for signs as soon as its preview opens. Keep **on** if every signature must wait for its own touch.
+- **Use Cached** changes the policy on the key. gpg-agent's pinentry asks for the Admin PIN, and a wrong one uses up one of its attempts. scdaemon then writes the value `ykman openpgp keys set-touch sig cached` writes (`SCD SETATTR UIF-1 %03+`). Only **cached** is ever written: **fixed** and **cached-fixed** could never be changed back. The change counts only if the key reads back as cached, and the preview then starts with `Touch policy is now cached.` Afterwards the wrapper stops scdaemon, as `gpgconf --kill scdaemon` does. Otherwise scdaemon would stay verified for Admin PIN operations, such as turning touch off, for as long as it runs. gpg-agent starts it again for the signature, which may ask for your PIN again. If the key refuses, as one older than YubiKey firmware 5.2.1 does, a second window says why and names the commands to run yourself: `ykman openpgp keys set-touch sig cached`, or `ykman openpgp keys set-touch sig on` on an older key.
+- **Not Now** leaves the key as it is.
 
-The notice is advisory: signing goes ahead under the current policy. The same line goes to stderr, which Git shows only when signing fails. With touch off and the PIN already cached, GPG can sign and close the preview before the line is read. **Fixed** cannot be changed without replacing the key, so it gets no notice, and neither do **cached** and **cached-fixed**. There is also no notice for a software key, another card or no card, a card that reports no touch policy, or a GnuPG without `gpg-connect-agent`. scdaemon can keep reporting the policy it read before a change until the key is reinserted or scdaemon restarts (`gpgconf --kill scdaemon`). The remote signing service shows the same notice for the key it signs with.
+Signing goes ahead either way, under the policy the key has afterwards. The offer appears at most once a day for each key. It stops after three dismissals: **Not Now**, or a **Use Cached** that failed or was cancelled. A window left unanswered for 30 seconds closes without counting, and so does an Admin PIN prompt after 60. `~/.config/git-gpg-preview/touch-offers` keeps one line per key: its fingerprint, the dismissals so far, and when the offer was last shown. Delete a key's line to see the offer again. If that file cannot be read and replaced, the offer is not shown, because it would otherwise open on every signature.
+
+Whenever the window opens, stderr also carries a line with the `ykman` command, which Git shows only when signing fails. **Fixed** cannot be changed without replacing the key, so it gets no offer, and neither do **cached** and **cached-fixed**. There is also no offer for a software key, another card or no card, a card that reports no touch policy, or a GnuPG without `gpg-connect-agent`. scdaemon can keep reporting the policy it read before a change made with `ykman` until the key is reinserted or scdaemon restarts (`gpgconf --kill scdaemon`). The remote signing service makes the same offer for the key it signs with, and keeps its record in the same file. The window and the Admin PIN prompt count toward its `sign_timeout_seconds`.
 
 ### PIN window
 
@@ -251,7 +253,7 @@ This tool protects against accidentally producing an unexpected Git OpenPGP sign
 
 Important limitations:
 
-- The preview is shown while GnuPG is already engaged, so the hardware confirmation is the authorization gate. This is a deliberate trade for the touch-to-sign workflow: unlike a design that contacts GPG only after a software approval, GnuPG and gpg-agent are invoked for every signing request. A key whose policy requires no touch (for example, a cached PIN and touch disabled) can therefore complete signing before the preview is meaningfully reviewed; keep the hardware touch requirement enabled so signing always blocks on a deliberate action. The preview says so when it finds touch off. The cached policy it suggests lets one touch cover every signature for the next 15 seconds, so a request that arrives in that window signs without a touch of its own.
+- The preview is shown while GnuPG is already engaged, so the hardware confirmation is the authorization gate. This is a deliberate trade for the touch-to-sign workflow: unlike a design that contacts GPG only after a software approval, GnuPG and gpg-agent are invoked for every signing request. A key whose policy requires no touch (for example, a cached PIN and touch disabled) can therefore complete signing before the preview is meaningfully reviewed; keep the hardware touch requirement enabled so signing always blocks on a deliberate action. A window says so before the preview when it finds touch off. The cached policy it offers lets one touch cover every signature for the next 15 seconds, so a request that arrives in that window signs without a touch of its own.
 - A process already running as your macOS account can modify user-owned wrapper/configuration files, tamper with Git objects between review and later use, simulate UI, or invoke GPG directly. The same goes for GnuPG configuration: the wrapper checks a request's arguments, not what a `gpg.conf`, `--options` file or `GNUPGHOME` tells GPG to do.
 - The derived diff reflects objects available when the preview is built. The signed tree hash—not the rendered diff—is authoritative.
 - Binary and very large changes can make a full textual report unwieldy; the exact payload's hex view remains byte-preserving.
@@ -287,7 +289,7 @@ The uninstaller restores all previously recorded `gpg.openpgp.program` values, o
 
 ## Tests
 
-`./tests/run.sh` uses a fake GPG and a noninteractive fake dialog in an isolated home directory. It covers normal and initial commits, merge commits, annotated tags, push certificates, unknown/binary payloads, hostile Unicode content, fixture-style subject and identity rejection, near-misses, and the override, cancellation, verification pass-through, GPG failure status, stdout purity, the PIN window (remaining-attempts line, short-PIN refusal, cancel), wrong-PIN retry, uncounted and blocked PINs, the pinentry fallback, the touch-policy notice, refusal of anything but the previewed standard input as signing input, exact stdin/argument forwarding, concurrent queueing, stale lock recovery, safe diff options, and audit logging.
+`./tests/run.sh` uses a fake GPG and a noninteractive fake dialog in an isolated home directory. It covers normal and initial commits, merge commits, annotated tags, push certificates, unknown/binary payloads, hostile Unicode content, fixture-style subject and identity rejection, near-misses, and the override, cancellation, verification pass-through, GPG failure status, stdout purity, the PIN window (remaining-attempts line, short-PIN refusal, cancel), wrong-PIN retry, uncounted and blocked PINs, the pinentry fallback, the touch-policy offer (Use Cached and its failures, Not Now, the per-key record and its limits, unanswered windows), the split between the message and the request's facts, refusal of anything but the previewed standard input as signing input, exact stdin/argument forwarding, concurrent queueing, stale lock recovery, safe diff options, and audit logging.
 
 ## License
 
