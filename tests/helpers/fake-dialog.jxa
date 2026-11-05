@@ -64,8 +64,9 @@ function run(argv) {
     // FAKE_DIALOG_DECISIONS answers one preview each, in order (comma-separated,
     // counted in FAKE_DIALOG_DECISION_STATE; past its end, no answer). Besides
     // the answers below: hang never answers, '' closes without an answer,
-    // raw:TEXT writes TEXT (\n and \0 escapes) with no marker, and marker-sign
-    // writes the rejection marker and then sign.
+    // raw:TEXT writes TEXT (\n and \0 escapes) with no marker, marker-sign
+    // writes the rejection marker and then sign, and sign-no-touch writes sign
+    // without the key ever confirming.
     const sequence = env.objectForKey('FAKE_DIALOG_DECISIONS');
     if (sequence) {
         const state = ObjC.unwrap(env.objectForKey('FAKE_DIALOG_DECISION_STATE') || '');
@@ -95,8 +96,10 @@ function run(argv) {
         $.NSThread.sleepForTimeInterval(30);
         return;
     }
-    if (decision === '' || decision.indexOf('raw:') === 0 || decision === 'marker-sign') {
-        if (decision.indexOf('raw:') === 0) {
+    if (decision === '' || decision.indexOf('raw:') === 0 || decision === 'marker-sign' || decision === 'sign-no-touch') {
+        if (decision === 'sign-no-touch') {
+            write(argv[2], 'sign');
+        } else if (decision.indexOf('raw:') === 0) {
             touchIt();
             write(argv[2], decision.slice(4).replace(/\\n/g, '\n').replace(/\\0/g, '\0'));
         } else if (decision === 'marker-sign') {

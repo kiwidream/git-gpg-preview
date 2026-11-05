@@ -214,6 +214,24 @@ function run(argv) {
         const marked = !!$.NSFileManager.defaultManager.fileExistsAtPath(decision + '.deciding');
         if (marked !== (test.decision !== 'sign')) throw new Error('Wrong rejection marker for ' + test.decision);
     });
+    // The notice is shown once: when the facts already hold it, the Sign text
+    // does not repeat it. A message that quotes it does not count.
+    [
+        {summary: notice + '\n\nRequest type: commit\n\nMessage:\nSubject', repeated: false},
+        {summary: 'Request type: commit\n\nMessage:\n' + notice, repeated: true}
+    ].forEach(function(test) {
+        $.NSString.stringWithString(test.summary).writeToFileAtomicallyEncodingError(summary, true, $.NSUTF8StringEncoding, null);
+        $.NSData.data.writeToFileAtomically(decision, true);
+        expectedSpam = false;
+        expectedSign = true;
+        responses = [1002];
+        panesSeen = [];
+        runPreview([summary, details, decision, ready, '', 'require-sign', notice]);
+        expectedSign = false;
+        const info = panesSeen[0].info;
+        if ((info.indexOf(notice) >= 0) !== test.repeated || info.indexOf('until you click Sign') < 0) throw new Error('Notice shown twice or not at all: ' + info);
+    });
+    $.NSString.stringWithString('Request type: commit\n\nMessage:\nNoisy subject').writeToFileAtomicallyEncodingError(summary, true, $.NSUTF8StringEncoding, null);
     // Only the exact argument require-sign asks for Sign.
     ['require-sign ', 'Require-Sign', 'yes'].forEach(function(flag) {
         $.NSData.data.writeToFileAtomically(decision, true);
@@ -284,5 +302,5 @@ function run(argv) {
             if (!seen.secure) throw new Error(where + 'PIN field is not secure');
         });
     });
-    return 'Dialog actions passed (49 cases)';
+    return 'Dialog actions passed (51 cases)';
 }

@@ -665,10 +665,12 @@ class TouchPolicyTests(unittest.TestCase):
         self.card = self.tmp / 'card'
         self.repo, _, self.payload = fixture_repo(self.tmp)
 
-    def harness(self, name: str, real_gpg: Path | None = None, card_keys: str = CARD_SUB, extra_env: dict | None = None) -> Harness:
+    def harness(self, name: str, real_gpg: Path | None = None, card_keys: str = CARD_SUB, extra_env: dict | None = None,
+                serve_extra: str = '') -> Harness:
         h = Harness(self.tmp / name, real_gpg=str(real_gpg or self.gnupg / 'gpg'),
                     extra_env={'FAKE_GPG_SECRET_KEYS': f'{self.PRIMARY}/{self.CARD_SUB}',
-                               'FAKE_GPG_CARD_KEYS': card_keys, 'FAKE_CARD_FILE': str(self.card), **(extra_env or {})})
+                               'FAKE_GPG_CARD_KEYS': card_keys, 'FAKE_CARD_FILE': str(self.card), **(extra_env or {})},
+                    serve_extra=serve_extra)
         self.addCleanup(h.stop)
         return h
 
@@ -773,6 +775,10 @@ class TouchPolicyTests(unittest.TestCase):
         for path in [*h.tmp.glob('touch.*'), h.calls / 'touch-at-start']:
             path.unlink(missing_ok=True)
 
+    def cached_long_ago(self, h: Harness, key: str = CARD_SUB) -> None:
+        """KEY's previous signature ended well outside the cached touch window."""
+        (h.serve_dir / 'last-signatures').write_text(f'{key} {int(time.time()) - 100}\n')
+
     REFUSED = 'git-gpg-preview: not signed: touch policy is off and Sign was not clicked\n'
 
     def test_touch_off_starts_gpg_only_after_sign(self):
@@ -814,6 +820,7 @@ class TouchPolicyTests(unittest.TestCase):
         for card in (f'{self.CARD_SUB} %01+', f'{self.CARD_SUB} %02+', f'{self.CARD_SUB} %03+', f'{self.CARD_SUB} %04+'):
             with self.subTest(card=card):
                 self.untouch(h)
+                self.cached_long_ago(h)
                 self.sign(h, card)
                 self.assertEqual(self.touch_at_start(h), ['after'], 'GPG waited for a click')
                 self.assertEqual(self.gate(h), '\n')
@@ -883,6 +890,119 @@ class TouchPolicyTests(unittest.TestCase):
         self.assertTrue(2.5 < time.monotonic() - started < 3.5, f'{time.monotonic() - started:.1f}s, not about 3s')
         self.assertEqual(result.stdout, b'')
         self.assertNotEqual(result.returncode, 0)
+
+    def test_a_long_wait_in_the_queue_leaves_the_policy_its_own_time(self):
+        """The policy lookup's 10 seconds start once the locks are held: a
+        request that queued for longer still reads on, and needs no Sign."""
+        h = self.harness('h', serve_extra='sign_timeout_seconds=20\n')
+        holder = int(subprocess.run(['sh', '-c', 'sleep 10.5 >/dev/null 2>&1 & echo $!'],
+                                    capture_output=True, text=True, check=True).stdout)
+        (self.tmp / 'h' / 'lock').mkdir(parents=True, exist_ok=True)
+        (self.tmp / 'h' / 'lock' / 'dialog.lock').write_text(str(holder))
+        started = time.monotonic()
+        self.sign(h, f'{self.CARD_SUB} %01+')
+        self.assertGreater(time.monotonic() - started, 10, 'the request did not queue')
+        self.assertEqual(self.gate(h), '\n', 'a long queue made the policy unknown')
+
+    def test_sign_leaves_gpg_its_reserve_and_counts_until_then(self):
+        """With sign_timeout_seconds=8 GPG keeps a quarter for a touch or the
+        PIN, so Sign counts until 6s: at 4.5s it signs, at 7s it is refused."""
+        h = self.harness('in-time', serve_extra='sign_timeout_seconds=8\n')
+        h.decision.write_text('late-sign:4.5')
+        self.sign(h, f'{self.CARD_SUB} %00+')
+        self.assertEqual(self.touch_at_start(h), ['before'])
+        self.refused(self.harness('late', serve_extra='sign_timeout_seconds=8\n'), 'late-sign:7', limit=7)
+
+    def test_after_sign_a_key_that_never_confirms_is_stopped(self):
+        h = self.harness('h')
+        h.decision.write_text('approve-no-touch')
+        self.card.write_text(f'{self.CARD_SUB} %00+')
+        started = time.monotonic()
+        result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+        self.assertLess(time.monotonic() - started, 4.5)
+        self.assertEqual((result.returncode, result.stdout), (remote.EX_SOFTWARE, b''))
+        self.assertIn(b'not signed: no touch or PIN before the deadline', result.stderr)
+        self.assertEqual(self.touch_at_start(h), ['after'], 'GPG did not run after Sign')
+
+    def test_cached_needs_sign_only_when_the_touch_would_be_skipped(self):
+        h = self.harness('h')
+        h.decision.write_text('delayed-sign')
+        record = h.serve_dir / 'last-signatures'
+
+        def signs(card: str, gated: bool, label: str):
+            with self.subTest(label):
+                self.untouch(h)
+                self.sign(h, f'{self.CARD_SUB} {card}')
+                self.assertEqual(self.gate(h), 'require-sign\n' + remote.CACHED_TOUCH_NOTICE if gated else '\n')
+                self.assertEqual(self.touch_at_start(h), ['before' if gated else 'after'])
+
+        signs('%03+', True, 'no record yet')
+        self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+        self.assertRegex(record.read_text(), rf'^{self.CARD_SUB} [1-9][0-9]*\n$')
+        signs('%03+', True, 'a second signature at once')
+        self.cached_long_ago(h)
+        signs('%03+', False, 'the previous signature 100s ago')
+        self.cached_long_ago(h)
+        signs('%04+', False, 'cached-fixed, the previous signature 100s ago')
+        signs('%04+', True, 'cached-fixed, a second signature at once')
+        for text in (f'{self.CARD_SUB} pending', f'{self.CARD_SUB} x', self.CARD_SUB, f'{self.CARD_SUB} 1 2', f'{self.CARD_SUB} 09',
+                     f'{self.CARD_SUB} {int(time.time()) + 100}', f'{self.OTHER} 1'):
+            record.write_text(text + '\n')
+            signs('%03+', True, f'record {text!r}')
+        record.write_text(f'{self.OTHER} {int(time.time())}\n{self.CARD_SUB} {int(time.time()) - 100}\n')
+        signs('%03+', False, 'another key signed just now')
+        self.assertIsNotNone(remote.last_signature(record, self.OTHER), 'another key lost its record')
+        record.unlink()
+        target = self.tmp / 'signatures-target'
+        target.write_text(f'{self.CARD_SUB} {int(time.time()) - 100}\n')
+        record.symlink_to(target)
+        signs('%03+', True, 'a symbolic link for the record')
+        self.assertEqual(target.read_text().split()[0], self.CARD_SUB)
+        self.assertEqual(len(target.read_text().splitlines()), 1, 'written through a symbolic link')
+        record.unlink()
+        record.mkdir()
+        signs('%03+', True, 'a directory for the record')
+        record.rmdir()
+        self.cached_long_ago(h)
+        h.serve_dir.chmod(0o500)
+        try:
+            self.untouch(h)
+            _, stderr = self.sign(h, f'{self.CARD_SUB} %03+')
+        finally:
+            h.serve_dir.chmod(0o700)
+        self.assertEqual(self.gate(h), 'require-sign\n' + remote.CACHED_TOUCH_NOTICE, 'a record that cannot be kept was trusted')
+        self.assertIn(f'could not record this signature in {record}', stderr)
+
+    def test_signature_records_match_the_wrapper(self):
+        """The wrapper and the service share last-signatures under the dialog
+        lock, so each reads what the other writes, the same way."""
+        wrapper = (ROOT.parent / 'git-gpg-preview').read_text()
+        functions = '\n'.join(re.search(rf'^{name}\(\) \{{\n.*?^\}}', wrapper, re.M | re.S).group()
+                              for name in ('last_signature', 'remember_signature'))
+        record = self.tmp / 'last-signatures'
+
+        def wrapper_call(*call: str) -> str:
+            result = subprocess.run(['bash', '-c', f'SIGNATURES_FILE="$1"\n{functions}\n"${{@:2}}"', 'bash', str(record), *call],
+                                    capture_output=True, text=True)
+            return f'{result.returncode} {result.stdout.strip()}'.strip()
+
+        key = self.CARD_SUB
+        for text in (f'{key} 1700000000', f'{key} 0', f'{key} pending', f'{key} x', key, f'{key} 1 2', f'{key}\t5', f'  {key}  5  ',
+                     f'{key} 09', f'{key} -5', f'{key} 999999999999999999', f'{key} 9999999999999999999', f'{self.OTHER} 5',
+                     'garbage', '', f'{key} 1\n{key} 2', f'{key} 1\n{key} x'):
+            with self.subTest(text=text):
+                record.write_text(text + '\n')
+                last = remote.last_signature(record, key)
+                self.assertEqual(wrapper_call('last_signature', key), f'0 {"" if last is None else last}'.strip())
+        record.write_text(f'{self.OTHER} 7\n')
+        self.assertTrue(remote.remember_signature(record, key, '100'))
+        self.assertEqual(wrapper_call('last_signature', key), '0 100')
+        self.assertEqual(wrapper_call('remember_signature', key, '200'), '0')
+        self.assertEqual((remote.last_signature(record, key), remote.last_signature(record, self.OTHER)), (200, 7))
+        self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(wrapper_call('remember_signature', key, 'pending'), '0')
+        self.assertIsNone(remote.last_signature(record, key))
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir() if 'last-signatures' in p.name), ['last-signatures'])
 
     def test_queued_requests_never_outlive_their_time(self):
         """Two requests queued behind a dialog lock that another signer holds
@@ -963,13 +1083,14 @@ class TouchPolicyTests(unittest.TestCase):
 
     def test_the_preview_is_the_only_window_and_nothing_is_recorded(self):
         h = self.harness('h')
-        files = sorted(p.name for p in h.serve_dir.iterdir())
+        # The cached policy keeps its own record of signatures, nothing else.
+        files = sorted(p.name for p in h.serve_dir.iterdir() if p.name != 'last-signatures')
         for count, uif in enumerate(('%00+', '%01+', '%02+', '%03+', '%04+'), start=1):
             with self.subTest(uif=uif):
                 self.sign(h, f'{self.CARD_SUB} {uif}')
                 self.assertFalse((h.captures / 'other-windows').exists())
                 self.assertEqual(len(list(h.captures.glob('*.summary'))), count)
-                self.assertEqual(sorted(p.name for p in h.serve_dir.iterdir()), files)
+                self.assertEqual(sorted(p.name for p in h.serve_dir.iterdir() if p.name != 'last-signatures'), files)
 
     def test_an_old_offer_record_is_neither_read_nor_written(self):
         h = self.harness('h')

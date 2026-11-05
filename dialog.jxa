@@ -316,6 +316,9 @@ function run(argv) {
     // comes with the request.
     const requireSign = argv.length > 5 && argv[5] === 'require-sign';
     const signNotice = argv.length > 6 ? String(argv[6]) : '';
+    // Shown once: above the facts when the signer could write it there, and
+    // otherwise with the Sign text. Only the facts count, never the message.
+    const noticeInFacts = !!signNotice && splitSummary(summary).facts.indexOf(signNotice) >= 0;
 
     const app = $.NSApplication.sharedApplication;
     app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
@@ -330,7 +333,8 @@ function run(argv) {
         alert.alertStyle = $.NSAlertStyleInformational;
         alert.messageText = 'Confirm signature on your key';
         alert.informativeText = requireSign
-            ? signNotice + '\n\nYour key may sign without a touch, so nothing is signed until you click Sign. ' +
+            ? (noticeInFacts ? '' : signNotice + '\n\n') +
+              'Your key may sign without a touch, so nothing is signed until you click Sign. ' +
               'View Details for the full payload, or Cancel to abort.'
             : 'Touch your key to sign; this closes when done. View Details for the full payload, or Cancel to abort.';
         alert.accessoryView = previewPanes(summary);

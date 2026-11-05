@@ -22,6 +22,9 @@ choice=$(cat "${FAKE_DIALOG_DECISION_FILE:?}" 2>/dev/null || echo sign)
 if [[ "$choice" == delayed-spam || "$choice" == delayed-sign ]]; then
     sleep 0.5
     choice=${choice#delayed-}
+elif [[ "$choice" == late-sign:* ]]; then                 # Sign after that many seconds
+    sleep "${choice#late-sign:}"
+    choice=sign
 fi
 touched() {
     local sha
