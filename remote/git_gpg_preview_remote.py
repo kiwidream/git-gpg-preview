@@ -464,6 +464,15 @@ TOUCH_NOTICES = {
     'on': 'Touch policy is on: a touch for every signature. '
           'To let a touch cover 15 seconds, run: ykman openpgp keys set-touch sig cached',
 }
+# Must match TOUCH_OFFER_DISMISSALS and TOUCH_OFFER_INTERVAL in the wrapper,
+# which shares the file: three dismissals end the offer for a key, and one a day
+# means a rebase cannot use them all up at once.
+TOUCH_OFFER_DISMISSALS = 3
+TOUCH_OFFER_INTERVAL = 86400
+# How long the offer's windows and the Admin PIN prompt may hold the dialog
+# lock, at most: each also leaves half of the request's time to what follows.
+TOUCH_OFFER_SECONDS = 30
+TOUCH_PIN_SECONDS = 60
 
 
 def selected_signing_key(listing: str, now: float) -> str:
@@ -553,9 +562,78 @@ def card_touch_policy(agent: str, key_fpr: str, timeout: float = 10) -> str:
     return TOUCH_POLICIES[int(match.group(1))] if match and card == key_fpr else ''
 
 
+def touch_offer_fields(line: bytes) -> list[bytes]:
+    """A line split the way the wrapper's C-locale awk splits it."""
+    return re.findall(rb'[^ \t]+', line)
+
+
+def touch_offer_state(path: Path, key: str) -> tuple[int, int]:
+    """(dismissals, last shown) for KEY, read as the wrapper's touch_offer_state
+    reads them. A malformed line counts as no line: the offer is advice, so the
+    worst outcome is seeing it again."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return 0, 0
+        data = path.read_bytes()
+    except OSError:
+        return 0, 0
+    for line in data.split(b'\n'):
+        fields = touch_offer_fields(line)
+        if (len(fields) == 3 and fields[0] == key.encode()
+                and all(re.fullmatch(rb'0|[1-9][0-9]{0,17}', field) for field in fields[1:])):
+            return int(fields[1]), int(fields[2])
+    return 0, 0
+
+
+def touch_offer_due(dismissals: int, shown: int, now: int) -> bool:
+    """A time in the future is a clock that moved, not a recent offer."""
+    return dismissals < TOUCH_OFFER_DISMISSALS and (shown > now or now - shown >= TOUCH_OFFER_INTERVAL)
+
+
+def remember_touch_offer(path: Path, key: str, dismissals: int, now: int) -> None:
+    """Atomic replacement under the shared dialog lock, one line per key."""
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise OSError('touch offer file must be a regular file')
+    previous = path.read_bytes() if path.exists() else b''
+    kept = [line for line in previous.split(b'\n') if line and touch_offer_fields(line)[:1] != [key.encode()]]
+    fd, name = tempfile.mkstemp(prefix='.touch-offers.', dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(b''.join(line + b'\n' for line in kept))
+            stream.write(f'{key} {dismissals} {now}\n'.encode())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def set_cached_touch(agent: str, timeout: float) -> tuple[bool, str]:
+    """Whether the card now reads back as touch policy cached, and otherwise
+    gpg-agent's first error. See set_cached_touch in the wrapper: the same write
+    as ykman, the Admin PIN asked for by gpg-agent's pinentry, never a fixed
+    policy, and scdaemon stopped so it does not stay verified for Admin PIN
+    operations such as turning touch off."""
+    try:
+        result = subprocess.run([agent, 'SCD SERIALNO openpgp', 'SCD SETATTR UIF-1 %03+', 'SCD GETATTR UIF-1',
+                                 'SCD KILLSCD', '/bye'],
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
+                                env={**os.environ, 'LC_ALL': 'C'})
+    except (OSError, subprocess.TimeoutExpired):
+        return False, ''
+    uif = reason = ''
+    for line in result.stdout.decode('utf-8', 'replace').splitlines():
+        fields = line.split()
+        if fields[:2] == ['S', 'UIF-1'] and len(fields) > 2:
+            uif = fields[2]
+        elif fields[:1] == ['ERR'] and not reason:
+            reason = one_line(' '.join(fields[2:]))
+    return uif.startswith('%03'), reason
+
+
 class ServeConfig:
     def __init__(self, base: Path) -> None:
         self.spam_file = base / 'spam-subjects'
+        self.touch_offers_file = base / 'touch-offers'
         wrapper = read_kv(base / 'config')
         own = read_kv(base / 'serve')
         self.real_gpg = own.get('real_gpg') or wrapper.get('real_gpg', '')
@@ -799,12 +877,14 @@ class Service:
             return self._review_and_sign(args, payload, info, digest, repo, peer, summary, details)
 
     def _summary(self, info, args, payload, digest, context, peer) -> str:
+        # dialog.jxa splits the preview at the Message: line, so every line
+        # above it must stay a single sanitized line.
         return (f"Request type: {info['type']}\n"
                 f"Requested by: {one_line(peer)}\n"
                 f"Branch: {one_line(context.get('branch', '(unknown)'))}\n"
                 f"Signing key: {one_line(key_selector(args))}\n"
                 f"Exact payload: {len(payload)} bytes\n"
-                f"SHA-256: {digest}\n\nMessage:\n{limited(info['message'], 600)}")
+                f"SHA-256: {digest}\n\nMessage:\n{limited(info['message'], 4000)}")
 
     def _details(self, info, args, payload, digest, context, peer) -> str:
         out = ['GIT OPENPGP SIGNING REVIEW — FULL DETAILS (REMOTE REQUEST)\n',
@@ -847,12 +927,13 @@ class Service:
         with tempfile.TemporaryDirectory(prefix='git-gpg-preview-remote.') as tmp_name:
             tmp = Path(tmp_name)
             tmp.chmod(0o700)
-            paths = {name: tmp / name for name in ('payload', 'summary.txt', 'details.txt', 'decision', 'ready')}
+            paths = {name: tmp / name for name in ('payload', 'summary.txt', 'details.txt', 'decision', 'ready', 'touch-choice')}
             paths['payload'].write_bytes(payload)
             paths['summary.txt'].write_text(summary)
             paths['details.txt'].write_text(details)
             paths['decision'].write_text('')
-            for p in ('payload', 'summary.txt', 'details.txt', 'decision'):
+            paths['touch-choice'].write_text('')
+            for p in ('payload', 'summary.txt', 'details.txt', 'decision', 'touch-choice'):
                 paths[p].chmod(0o600)
 
             with DialogLock(lock_root / 'dialog.lock'):
@@ -860,37 +941,105 @@ class Service:
                 spam = self._spam_rejection(payload, info, digest, repo, peer)
                 if spam:
                     return spam
-                # Read under the lock, as the wrapper does: the card is busy
-                # while another request waits for its touch. Advisory: signing
-                # goes ahead under the key's current policy.
-                notice = self._touch_notice()
-                if notice:
-                    paths['summary.txt'].write_text(f'{notice}\n\n{summary}')
-                result = self._run_dialog_and_gpg(args, paths, info, digest, repo, peer)
-                if notice:
-                    result['stderr'] = f'git-gpg-preview: note from the signing Mac: {notice}\n{result["stderr"]}'
+                # Under the lock, as the wrapper does: the card is busy while
+                # another request waits for its touch.
+                key, policy, agent = self._touch_policy()
+                # The offer and the signature share one time limit, which the
+                # client's own longer one relies on.
+                started = time.monotonic()
+                notes = self._offer_cached_touch(key, policy, agent, paths, summary, started,
+                                                 lambda decision: self.audit(decision, repo, info['type'], digest, peer))
+                result = self._run_dialog_and_gpg(args, paths, info, digest, repo, peer, started)
+                result['stderr'] = ''.join(f'git-gpg-preview: note from the signing Mac: {note}\n' for note in notes) + result['stderr']
                 return result
 
-    def _touch_notice(self) -> str:
-        """What the preview should say about the touch policy of the key this
-        service signs with, which is GPG's pick for --local-user FINGERPRINT.
-        Both lookups share one deadline, since they hold the dialog lock."""
+    def _dialog_command(self) -> list[str]:
+        if self.config.dialog_runner:
+            return [self.config.dialog_runner]
+        return ['/usr/bin/osascript', '-l', 'JavaScript', self.config.ui_helper]
+
+    def _offer_cached_touch(self, key, policy, agent, paths, summary, started, audit) -> list[str]:
+        """The wrapper's offer_cached_touch: a key whose touch policy is worth
+        changing gets a window of its own, before the first preview and before
+        GPG starts. Advisory and bounded: signing goes ahead under whatever
+        policy the key has afterwards. Returns the notes for stderr."""
+        notice = TOUCH_NOTICES.get(policy, '')
+        if not notice:
+            return []
+        offers = self.config.touch_offers_file
+        dismissals, shown = touch_offer_state(offers, key)
+        now = int(time.time())
+        if not touch_offer_due(dismissals, shown, now):
+            return []
+
+        def remember(count: int, notes: list[str]) -> bool:
+            try:
+                remember_touch_offer(offers, key, count, now)
+            except OSError:
+                notes.append(f'could not save {offers}')
+                return False
+            return True
+
+        def limit(seconds: float) -> float:
+            return min(seconds, (started + self.config.sign_timeout - time.monotonic()) / 2)
+
+        def show(*arguments: str) -> None:
+            try:
+                subprocess.run([*self._dialog_command(), *arguments], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=limit(TOUCH_OFFER_SECONDS))
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+        notes = [notice]
+        # Recorded first, so a window nobody answers waits a day like any other.
+        # An offer that cannot be remembered would open on every signature.
+        if not remember(dismissals, []):
+            notes.append(f'could not save {offers}, so the touch policy offer was not shown')
+            return notes
+        show('--touch-offer', str(paths['touch-choice']), policy, str(TOUCH_OFFER_DISMISSALS - dismissals))
+        choice = paths['touch-choice'].read_text().strip()
+        if choice == 'dismiss':
+            remember(dismissals + 1, notes)
+        if choice != 'apply':
+            return notes
+        changed, reason = set_cached_touch(agent, limit(TOUCH_PIN_SECONDS))
+        if changed:
+            audit('touch-policy-cached')
+            paths['summary.txt'].write_text(f'Touch policy is now cached.\n\n{summary}')
+            notes.append('touch policy is now cached')
+            return notes
+        # Counted like a dismissal, so a key that refuses cached stops being asked.
+        remember(dismissals + 1, notes)
+        if 'cancel' in reason:
+            return notes
+        audit('touch-policy-unchanged')
+        notes.append(f'could not set the cached touch policy: {reason or "the key did not confirm the change"}')
+        show('--touch-unchanged', reason)
+        return notes
+
+    def _touch_policy(self) -> tuple[str, str, str]:
+        """The fingerprint and touch policy of the key this service signs with,
+        which is GPG's pick for --local-user FINGERPRINT, and the gpg-connect-agent
+        to change it with; empty when they cannot be told. Both lookups share one
+        deadline, since they hold the dialog lock."""
+        nothing = ('', '', '')
         deadline = time.monotonic() + 10
         agent = gpg_connect_agent(self.config.real_gpg)
         if not agent:
-            return ''
+            return nothing
         try:
             listing = subprocess.run([self.config.real_gpg, '--batch', '--with-colons', '--list-secret-keys', '--',
                                       self.service_fingerprint()],
                                      stdin=subprocess.DEVNULL, capture_output=True, timeout=deadline - time.monotonic())
         except (OSError, subprocess.TimeoutExpired):
-            return ''
+            return nothing
         if listing.returncode:
-            return ''
+            return nothing
         key = selected_signing_key(listing.stdout.decode('utf-8', 'replace'), time.time())
         if not key.endswith(' card'):
-            return ''
-        return TOUCH_NOTICES.get(card_touch_policy(agent, key.split()[0], deadline - time.monotonic()), '')
+            return nothing
+        fingerprint = key.split()[0]
+        return fingerprint, card_touch_policy(agent, fingerprint, deadline - time.monotonic()), agent
 
     @staticmethod
     def _deciding_marker(paths):
@@ -909,12 +1058,9 @@ class Service:
                 pass
             time.sleep(0.05)
 
-    def _run_dialog_and_gpg(self, args, paths, info, digest, repo, peer) -> dict:
+    def _run_dialog_and_gpg(self, args, paths, info, digest, repo, peer, started) -> dict:
         config = self.config
-        if config.dialog_runner:
-            dialog_cmd = [config.dialog_runner]
-        else:
-            dialog_cmd = ['/usr/bin/osascript', '-l', 'JavaScript', config.ui_helper]
+        dialog_cmd = self._dialog_command()
         dialog_cmd += [str(paths['summary.txt']), str(paths['details.txt']), str(paths['decision']), str(paths['ready'])]
         dialog_cmd.append('mark-spam' if spam_subject(paths['payload'].read_bytes()) else '')
         dialog = subprocess.Popen(dialog_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -925,7 +1071,6 @@ class Service:
         with paths['payload'].open('rb') as stdin:
             gpg = subprocess.Popen([config.real_gpg, *args], stdin=stdin,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        started = time.monotonic()
         outcome = ''
         while True:
             if gpg.poll() is not None:

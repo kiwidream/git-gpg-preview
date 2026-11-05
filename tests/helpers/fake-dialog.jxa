@@ -61,6 +61,22 @@ function run(argv) {
         write(argv[1], ObjC.unwrap(env.objectForKey('FAKE_PIN_ERROR_DECISION') || 'retry'));
         return;
     }
+    if (argv[0] === '--touch-offer') {
+        // Record what the user would be asked, then answer from
+        // FAKE_TOUCH_OFFER_DECISION: apply, dismiss, or hang until stopped.
+        if (log) append(log, 'touch-offer ' + argv[2] + ' ' + argv[3] + '\n');
+        const answer = ObjC.unwrap(env.objectForKey('FAKE_TOUCH_OFFER_DECISION') || 'dismiss');
+        if (answer === 'hang') {
+            $.NSThread.sleepForTimeInterval(30);
+            return;
+        }
+        write(argv[1], answer);
+        return;
+    }
+    if (argv[0] === '--touch-unchanged') {
+        if (log) append(log, 'touch-unchanged ' + argv[1] + '\n');
+        return;
+    }
     if (log) append(log, 'start ' + $.NSProcessInfo.processInfo.processIdentifier + '\n');
     if (argv.length > 3 && argv[3]) {
         $.NSData.data.writeToFileAtomically(argv[3], true);
