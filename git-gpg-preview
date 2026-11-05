@@ -593,6 +593,23 @@ touch_policy_notice() {
     esac
 }
 
+# Puts NOTICE at the top of each FILE: above the facts in the preview, and above
+# the report in its details. Advisory: a file that cannot be rewritten keeps its
+# text and loses its partial copy, stderr says so, and signing goes ahead.
+prepend_touch_notice() {
+    local notice="$1" file failed=0
+    shift
+    for file in "$@"; do
+        if { printf '%s\n\n' "$notice"; /bin/cat "$file"; } 2>/dev/null > "$file.touch" &&
+           /bin/mv -f "$file.touch" "$file" 2>/dev/null; then
+            continue
+        fi
+        /bin/rm -f "$file.touch"
+        failed=1
+    done
+    [[ "$failed" -eq 0 ]] || error "note: could not add the touch policy notice to the preview; signing goes ahead without it"
+}
+
 # Whether the request names its own home directory, keyring or options file.
 # What this wrapper looks up would then describe keys GPG does not use.
 names_own_gnupg_files() {
@@ -1087,12 +1104,12 @@ if uses_builtin_pin_entry "$@"; then
 fi
 # Read under the lock, like the PIN counter: the card is busy while another
 # request waits for its touch. The notice is two lines above the facts in every
-# preview of this request, and one on stderr, which Git shows only when signing
-# fails. Advisory: signing goes ahead under the key's current policy.
+# preview of this request and above its details, and one on stderr, which Git
+# shows only when signing fails. Advisory: signing goes ahead under the key's
+# current policy.
 names_own_gnupg_files "$@" || card_touch_policy
 if TOUCH_NOTICE=$(touch_policy_notice "$TOUCH_POLICY"); then
-    { printf '%s\n\n' "$TOUCH_NOTICE"; /bin/cat "$SUMMARY"; } > "$SUMMARY.touch" &&
-        /bin/mv -f "$SUMMARY.touch" "$SUMMARY"
+    prepend_touch_notice "$TOUCH_NOTICE" "$SUMMARY" "$DETAILS"
     # The newline goes through a variable, which keeps the pattern plain for
     # macOS's bash 3.2: no $'...' quoting inside a double-quoted expansion.
     NEWLINE=$'\n'

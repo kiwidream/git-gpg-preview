@@ -871,6 +871,7 @@ class Service:
                 notice = self._touch_notice()
                 if notice:
                     paths['summary.txt'].write_text(f'{notice}\n\n{summary}')
+                    paths['details.txt'].write_text(f'{notice}\n\n{details}')
                 result = self._run_dialog_and_gpg(args, paths, info, digest, repo, peer)
                 if notice:
                     note = notice.replace('\n', ' ')

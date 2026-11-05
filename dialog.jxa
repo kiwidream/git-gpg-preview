@@ -92,23 +92,35 @@ function splitSummary(summary) {
 
 const PREVIEW_WIDTH = 560;
 const MESSAGE_PANE_HEIGHT = 240;
-// Nine lines at 11 points: the remote service's six facts, below a blank line
-// and a two-line touch policy notice.
-const FACTS_PANE_HEIGHT = 128;
+// The facts pane has room for each of its lines, so none is cut off: at 11
+// points a line takes about 13, and 14 leaves a margin. It never wraps, so a
+// long fact cannot pose as two; past the maximum it scrolls. Tests read these
+// lines; keep the format.
+const FACTS_LINE_HEIGHT = 14;
+const FACTS_MIN_LINES = 8;
+const FACTS_MAX_LINES = 12;
 const PANE_GAP = 8;
+
+// Room for the facts' lines, kept between the minimum and the maximum, plus
+// the border.
+function factsPaneHeight(facts) {
+    const lines = Math.min(Math.max(facts.split('\n').length, FACTS_MIN_LINES), FACTS_MAX_LINES);
+    return lines * FACTS_LINE_HEIGHT + 4;
+}
 
 // The message is what the reader came to check, so it comes first, gets the
 // most room and wraps. The facts have a pane of their own, because a long
 // message must not be able to scroll them out of sight.
 function previewPanes(summary) {
     const parts = splitSummary(summary);
-    const total = MESSAGE_PANE_HEIGHT + PANE_GAP + FACTS_PANE_HEIGHT;
+    const factsHeight = factsPaneHeight(parts.facts);
+    const total = MESSAGE_PANE_HEIGHT + PANE_GAP + factsHeight;
     if (!parts.facts) return scrollableText(parts.message, PREVIEW_WIDTH, total, {wrap: true});
     const panes = $.NSView.alloc.initWithFrame($.NSMakeRect(0, 0, PREVIEW_WIDTH, total));
     const message = scrollableText(parts.message.trim() ? parts.message : '(no message)',
                                    PREVIEW_WIDTH, MESSAGE_PANE_HEIGHT, {wrap: true, fontSize: 13});
-    message.frame = $.NSMakeRect(0, FACTS_PANE_HEIGHT + PANE_GAP, PREVIEW_WIDTH, MESSAGE_PANE_HEIGHT);
-    const facts = scrollableText(parts.facts, PREVIEW_WIDTH, FACTS_PANE_HEIGHT, {fontSize: 11});
+    message.frame = $.NSMakeRect(0, factsHeight + PANE_GAP, PREVIEW_WIDTH, MESSAGE_PANE_HEIGHT);
+    const facts = scrollableText(parts.facts, PREVIEW_WIDTH, factsHeight, {fontSize: 11});
     panes.addSubview(message);
     panes.addSubview(facts);
     return panes;

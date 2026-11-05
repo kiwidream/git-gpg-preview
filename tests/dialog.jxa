@@ -130,6 +130,23 @@ function run(argv) {
     runPreview([summary, details, decision, ready]);
     if (panesSeen.length !== 1 || panesSeen[0].facts !== notice + '\n\nRequest type: commit' ||
         panesSeen[0].message !== 'Noisy subject' || !panesSeen[0].factsUnwrapped) throw new Error('Wrong panes with a touch notice: ' + JSON.stringify(panesSeen));
+    // The facts pane has room for every line up to twelve, at about 13 points a
+    // line for the 11-point font, so the longest preview the signers make (a PIN
+    // retry with a touch notice: ten lines) shows its last fact, the SHA-256.
+    // Past that it scrolls, and the message pane stays on top and larger.
+    const factLine = 13;
+    [1, 5, 8, 9, 10, 12, 32].forEach(function(count) {
+        const lines = [];
+        for (let i = 0; i < count; i++) lines.push('Fact ' + i);
+        const panes = previewPanes(lines.join('\n') + '\n\nMessage:\nSubject').subviews;
+        const message = panes.objectAtIndex(0);
+        const facts = panes.objectAtIndex(1);
+        const room = Number(facts.contentSize.height);
+        if (room < Math.min(count, 12) * factLine) throw new Error(count + ' fact lines do not fit: ' + room);
+        if (count > 12 && room >= count * factLine) throw new Error('The facts pane grew past its maximum');
+        if (message.frame.origin.y < facts.frame.size.height || message.frame.size.height <= facts.frame.size.height) throw new Error('The message pane is not on top and larger');
+        if (facts.documentView.textContainer.widthTracksTextView) throw new Error('The facts pane wraps');
+    });
     // The first marker ends the facts, whatever the message says.
     [
         {summary: 'Request type: commit\n\nMessage:\nSubject', facts: 'Request type: commit', message: 'Subject'},
@@ -202,5 +219,5 @@ function run(argv) {
             if (!seen.secure) throw new Error(where + 'PIN field is not secure');
         });
     });
-    return 'Dialog actions passed (27 cases)';
+    return 'Dialog actions passed (34 cases)';
 }

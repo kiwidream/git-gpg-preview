@@ -673,6 +673,11 @@ class TouchPolicyTests(unittest.TestCase):
         return summary, stderr
 
     @staticmethod
+    def facts_max_lines() -> int:
+        """How many fact lines dialog.jxa's facts pane shows before it scrolls."""
+        return int(re.search(r'^const FACTS_MAX_LINES = (\d+);$', (ROOT.parent / 'dialog.jxa').read_text(), re.M).group(1))
+
+    @staticmethod
     def note(policy: str) -> str:
         """The one stderr line that carries POLICY's notice."""
         return 'git-gpg-preview: note from the signing Mac: ' + remote.TOUCH_NOTICES[policy].replace('\n', ' ') + '\n'
@@ -691,6 +696,9 @@ class TouchPolicyTests(unittest.TestCase):
                 facts, marker, message = summary.partition('\n\nMessage:\n')
                 self.assertIn('ykman openpgp keys set-touch sig on', facts)
                 self.assertTrue(marker and message.startswith('Second commit'), summary)
+                self.assertLessEqual(len(facts.split('\n')), self.facts_max_lines(), 'the facts pane would scroll')
+                details = h.latest_capture()[1]
+                self.assertTrue(details.startswith(remote.TOUCH_NOTICES[policy] + '\n\nGIT OPENPGP SIGNING REVIEW'), details[:300])
                 self.assertIn(self.note(policy), stderr)
                 self.assertEqual(stderr.count('note from the signing Mac'), 1, stderr)
         self.assertEqual(self.agent_calls(h), 2, 'the policy is read once per request')
@@ -702,6 +710,7 @@ class TouchPolicyTests(unittest.TestCase):
             with self.subTest(card=card):
                 summary, stderr = self.sign(h, card)
                 self.assertTrue(summary.startswith('Request type: commit\n'), summary)
+                self.assertTrue(h.latest_capture()[1].startswith('GIT OPENPGP SIGNING REVIEW'))
                 self.assertNotIn('ykman', stderr)
                 self.assertNotIn('note from the signing Mac', stderr)
 
