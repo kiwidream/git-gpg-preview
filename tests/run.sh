@@ -20,9 +20,20 @@ export FAKE_DIALOG_LOG="$TMP/dialog.log"
 # Shared "hardware touch" signal: the fake dialog creates it for a sign
 # decision; the fake GPG blocks on it so signing is concurrent with review.
 export FAKE_TOUCH_FILE="$TMP/touch"
+# By default GPG signs with a card key whose touch policy reads on, through the
+# gpg-connect-agent beside it, so the preview runs beside GPG and the touch is
+# the gate. The touch policy tests below vary this; default_card restores it.
+DEFAULT_CARD_KEY=CCCC000000000000000000000000000000000002
+default_card() {
+    export FAKE_CARD_SIG_KEY=$DEFAULT_CARD_KEY FAKE_CARD_UIF=%01+
+}
+default_card
+mkdir -p "$TMP/default-gnupg"
+ln -s "$ROOT/tests/helpers/fake-gpg" "$TMP/default-gnupg/gpg"
+ln -s "$ROOT/tests/helpers/fake-gpg-connect-agent" "$TMP/default-gnupg/gpg-connect-agent"
 
 cat > "$XDG_CONFIG_HOME/git-gpg-preview/config" <<EOF
-real_gpg=$ROOT/tests/helpers/fake-gpg
+real_gpg=$TMP/default-gnupg/gpg
 ui_helper=$ROOT/tests/helpers/fake-dialog.jxa
 lock_root=$TMP/lock
 audit_log=$TMP/audit.log
@@ -663,6 +674,7 @@ fi
 TOUCH_OFF=$'Touch policy is off: this key signs with no touch.\nTo require one, run: ykman openpgp keys set-touch sig on'
 TOUCH_CACHED=$'Touch policy is cached: a touch also signs what arrives in the next 15 seconds.\nTo require a touch for every signature, run: ykman openpgp keys set-touch sig on'
 CACHED_HINT='set-touch[[:space:]]+sig[[:space:]]+cached|use cached'
+TOUCH_UNKNOWN='Touch policy unknown: Sign to continue'
 DETAILS_TITLE='GIT OPENPGP SIGNING REVIEW — FULL DETAILS'
 # note_line NOTICE: the one stderr line that carries NOTICE.
 note_line() {
@@ -682,7 +694,7 @@ connect_agent_calls() {
 }
 # assert_touch_notice LABEL UIF EXPECTED-NOTICE GPG-ARGS...; an empty notice means none.
 assert_touch_notice() {
-    local label="$1" expected="$3" summary details
+    local label="$1" uif="$2" expected="$3" summary details
     export FAKE_CARD_UIF="$2"
     shift 3
     reset_pin_state
@@ -696,6 +708,16 @@ assert_touch_notice() {
     details=$(details_of "$summary")
     ! grep -qiE "$CACHED_HINT" "$summary" "$details" "$TMP/pin.stderr" ||
         fail "$label: suggests the cached touch policy"
+    # A policy read as on, fixed, cached or cached-fixed keeps the touch as the
+    # gate. Off asks for Sign with its notice; a policy that was not read (every
+    # case here that does not read one of those) with the unknown notice.
+    if [[ "$expected" == "$TOUCH_OFF" ]]; then
+        [[ $(cat "${summary%.summary}.gate") == require-sign$'\n'"$TOUCH_OFF" ]] || fail "$label: the preview was not asked for Sign"
+    elif [[ "$uif" == %0[1-4]+ ]]; then
+        [[ -z $(cat "${summary%.summary}.gate") ]] || fail "$label: the preview was asked for Sign"
+    else
+        [[ $(cat "${summary%.summary}.gate") == require-sign$'\n'"$TOUCH_UNKNOWN" ]] || fail "$label: the preview was not asked for Sign"
+    fi
     if [[ -n "$expected" ]]; then
         [[ $(head -n 2 "$details") == "$expected" && -z $(sed -n 3p "$details") && $(sed -n 4p "$details") == "$DETAILS_TITLE" ]] ||
             fail "$label: the notice is not above the details"
@@ -874,7 +896,8 @@ gate_case() {
     reset_pin_state
     rm -f "$FAKE_GPG_CALL_DIR/touch-at-start"
     set +e
-    pin_output=$("${GATE_WRAPPER:-$ROOT/git-gpg-preview}" "$@" < "$TMP/commit.payload" 2>"$TMP/pin.stderr")
+    rm -f "$TMP/decision-state"
+    pin_output=$("${GATE_WRAPPER:-$ROOT/git-gpg-preview}" "$@" < "${GATE_PAYLOAD:-$TMP/commit.payload}" 2>"$TMP/pin.stderr")
     pin_status=$?
     set -e
 }
@@ -887,11 +910,11 @@ dialog_order() {
 GATE_REFUSED='git-gpg-preview: not signed: touch policy is off and Sign was not clicked'
 use_real_gpg "$TMP/gnupg-bin/gpg"
 export FAKE_DIALOG_DELAY=1 FAKE_PIN_RETRIES=3 FAKE_GPG_PIN=123456 FAKE_PIN_ENTRIES=123456
-for uif in %00+ %01+ %03+ %05+; do
+for uif in %00+ %05+ %01+ %02+ %03+ %04+; do
     export FAKE_CARD_UIF=$uif
     gate_case --status-fd=2 -bsau TEST
     [[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "touch $uif: not signed ($pin_status)"
-    if [[ "$uif" == %00+ ]]; then
+    if [[ "$uif" == %00+ || "$uif" == %05+ ]]; then
         [[ $(touch_at_start) == before ]] || fail "touch off: GPG started before Sign ($(touch_at_start))"
         [[ $(dialog_order) == 'start end pin-entry ' ]] || fail "touch off: the PIN window did not follow Sign: $(dialog_order)"
     else
@@ -921,6 +944,18 @@ GATE_WRAPPER="$TMP/fast-sign-wrapper" gate_case --status-fd=2 -bsau TEST
 [[ "$pin_status" -eq 70 && -z "$pin_output" && -z $(touch_at_start) && $((SECONDS - gate_started)) -lt 10 ]] ||
     fail "touch off, no click in time: $pin_status after $((SECONDS - gate_started))s, GPG $(touch_at_start)"
 grep -qxF "$GATE_REFUSED" "$TMP/pin.stderr" || fail "touch off, no click in time: $(cat "$TMP/pin.stderr")"
+# A policy that cannot be read is refused the same way, and says so.
+export FAKE_CARD_UIF=%05+ FAKE_DIALOG_DECISION=cancel FAKE_DIALOG_DELAY=0
+gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 1 && -z $(touch_at_start) ]] &&
+    grep -qxF 'git-gpg-preview: not signed: touch policy is unknown and Sign was not clicked' "$TMP/pin.stderr" ||
+    fail "touch unknown, Cancel: $pin_status, GPG $(touch_at_start), $(cat "$TMP/pin.stderr")"
+export FAKE_DIALOG_DECISION=sign FAKE_DIALOG_DELAY=30
+GATE_WRAPPER="$TMP/fast-sign-wrapper" gate_case -bsau TEST --homedir "$TMP/elsewhere"
+[[ "$pin_status" -eq 70 && -z $(touch_at_start) ]] &&
+    grep -qxF 'git-gpg-preview: not signed: touch policy is unknown and Sign was not clicked' "$TMP/pin.stderr" ||
+    fail "touch not read, no click in time: $pin_status, GPG $(touch_at_start)"
+export FAKE_CARD_UIF=%00+
 # The gate does not depend on the notice: with its files unwritable, Sign is
 # still needed, and Cancel still signs nothing.
 export FAKE_DIALOG_DELAY=1
@@ -932,8 +967,50 @@ GATE_WRAPPER="$TMP/notice-failing-wrapper" gate_case --status-fd=2 -bsau TEST
 [[ "$pin_status" -eq 1 && -z $(touch_at_start) ]] && grep -qxF "$GATE_REFUSED" "$TMP/pin.stderr" ||
     fail "touch off, notice not written, Cancel: $pin_status, GPG $(touch_at_start)"
 export FAKE_DIALOG_DECISION=sign FAKE_DIALOG_DELAY=0
+pass 'touch off or unknown: GPG starts only after Sign, then the PIN window; Cancel, no answer or no click in time sign nothing'
+
+# Each PIN attempt needs a Sign of its own: after a wrong PIN, a second preview
+# that hangs, is cancelled or closes without an answer signs nothing, and GPG
+# ran once. Two Signs sign, with two GPG calls.
+export FAKE_DIALOG_DECISION_STATE="$TMP/decision-state" FAKE_PIN_ENTRIES=654321,123456 FAKE_PIN_ERROR_DECISION=retry
+for answers in sign,hang:70 sign,cancel:1 sign,:70 sign,sign:0; do
+    export FAKE_DIALOG_DECISIONS=${answers%:*}
+    GATE_WRAPPER="$TMP/fast-sign-wrapper" gate_case --status-fd=2 -bsau TEST
+    if [[ "${answers#*:}" -eq 0 ]]; then
+        [[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' && $(touch_at_start | grep -c .) -eq 2 ]] ||
+            fail "touch off, PIN retry with Sign twice: $pin_status, GPG $(touch_at_start | tr '\n' ' ')"
+    else
+        [[ "$pin_status" -eq "${answers#*:}" && -z "$pin_output" && $(touch_at_start | grep -c .) -eq 1 ]] ||
+            fail "touch off, PIN retry answered ${FAKE_DIALOG_DECISIONS#sign,}: $pin_status, GPG $(touch_at_start | tr '\n' ' ')"
+        grep -qxF "$GATE_REFUSED" "$TMP/pin.stderr" || fail "touch off, PIN retry answered ${FAKE_DIALOG_DECISIONS#sign,}: $(cat "$TMP/pin.stderr")"
+    fi
+done
+unset FAKE_DIALOG_DECISIONS FAKE_DIALOG_DECISION_STATE FAKE_PIN_ERROR_DECISION
+export FAKE_PIN_ENTRIES=123456
+# Only the exact bytes "sign" are a Sign: not with a space, another case, twice,
+# a trailing newline or NUL, or after the rejection marker. GPG never runs.
+for answer in 'raw: sign' 'raw:Sign' 'raw:signsign' 'raw:sign\n' 'raw:sign\0' marker-sign; do
+    export FAKE_DIALOG_DECISION=$answer
+    gate_case --status-fd=2 -bsau TEST
+    [[ "$pin_status" -eq 70 && -z "$pin_output" && -z $(touch_at_start) ]] && grep -qxF "$GATE_REFUSED" "$TMP/pin.stderr" ||
+        fail "touch off, answer '$answer': $pin_status, GPG $(touch_at_start)"
+done
+export FAKE_DIALOG_DECISION=raw:sign
+gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 0 && $(touch_at_start) == before ]] || fail "touch off, an exact sign: $pin_status, GPG $(touch_at_start)"
+# Mark as Spam is no Sign either: the subject is saved, and GPG never runs.
+awk '{ print } $0 == "" { exit }' "$TMP/initial.payload" > "$TMP/gate-spam.payload"
+printf 'Touch off spam subject\n' >> "$TMP/gate-spam.payload"
+export FAKE_DIALOG_DECISION=spam
+GATE_PAYLOAD="$TMP/gate-spam.payload" gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 1 && -z "$pin_output" && -z $(touch_at_start) ]] && grep -qxF "$GATE_REFUSED" "$TMP/pin.stderr" ||
+    fail "touch off, Mark as Spam: $pin_status, GPG $(touch_at_start)"
+grep -qxF 'touch off spam subject' "$XDG_CONFIG_HOME/git-gpg-preview/spam-subjects" || fail 'touch off, Mark as Spam: the subject was not saved'
+grep -qF 'decision=spam-mark' "$TMP/audit.log" || fail 'touch off, Mark as Spam: not audited'
+rm -f "$XDG_CONFIG_HOME/git-gpg-preview/spam-subjects"
+export FAKE_DIALOG_DECISION=sign
 unset FAKE_PIN_RETRIES FAKE_GPG_PIN FAKE_PIN_ENTRIES
-pass 'touch off: GPG starts only after Sign, then the PIN window; Cancel, no answer or no click in time sign nothing'
+pass 'touch off: each PIN attempt needs its own Sign, only an exact "sign" counts, and Mark as Spam saves the subject without GPG'
 
 # A wrong PIN repeats the preview: the notice stays, and the policy is read once.
 use_real_gpg "$TMP/gnupg-bin/gpg"
@@ -950,7 +1027,8 @@ max_facts=$(sed -n 's/^const FACTS_MAX_LINES = \([0-9][0-9]*\);$/\1/p' "$ROOT/di
 [[ "$facts_lines" -eq 10 && "$facts_lines" -le "$max_facts" ]] ||
     fail "the retry preview has $facts_lines fact lines, and the facts pane shows $max_facts"
 [[ $(connect_agent_calls) -eq 1 ]] || fail 'touch policy was read again for the retry'
-unset FAKE_CARD_UIF FAKE_CARD_SIG_KEY FAKE_PIN_RETRIES FAKE_GPG_PIN FAKE_PIN_ENTRIES FAKE_PIN_ERROR_DECISION FAKE_SECRET_KEYS
+unset FAKE_PIN_RETRIES FAKE_GPG_PIN FAKE_PIN_ENTRIES FAKE_PIN_ERROR_DECISION FAKE_SECRET_KEYS
+default_card
 cp "$TMP/config.saved" "$XDG_CONFIG_HOME/git-gpg-preview/config"
 pass 'a PIN retry keeps the touch notice without reading the policy again'
 

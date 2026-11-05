@@ -461,6 +461,11 @@ TOUCH_POLICIES = ('off', 'on', 'fixed', 'cached', 'cached-fixed')
 # without replacing the key, so they get no notice. Two lines of at most 80
 # characters, the policy and then the command, so both fit the width of the
 # preview's facts pane, which does not wrap.
+# Shown with the Sign button when the policy could not be read.
+UNKNOWN_TOUCH_NOTICE = 'Touch policy unknown: Sign to continue'
+# The policies that need a touch, which stays the gate; any other, off or one
+# that could not be read, needs a click on Sign.
+TOUCHED_POLICIES = ('on', 'fixed', 'cached', 'cached-fixed')
 TOUCH_NOTICES = {
     'off': 'Touch policy is off: this key signs with no touch.\n'
            'To require one, run: ykman openpgp keys set-touch sig on',
@@ -582,6 +587,21 @@ class ServeConfig:
             raise RemoteError('ui_helper must name the installed dialog (run git-gpg-preview install first)')
 
 
+def read_decision(path: Path) -> str:
+    """The preview's answer. Only the exact bytes b'sign' count as Sign: no
+    stripping, no case folding, nothing dropped. Other answers are read with
+    surrounding space stripped, so a rejection can never be read as no answer.
+    Empty when the file cannot be read."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ''
+    if data == b'sign':
+        return 'sign'
+    answer = data.decode('utf-8', 'replace').strip()
+    return 'invalid' if answer == 'sign' else answer
+
+
 class DialogLock:
     """The wrapper's `shlock -p $$ -f dialog.lock` protocol, in Python.
 
@@ -605,7 +625,9 @@ class DialogLock:
             return True
         return True
 
-    def acquire(self) -> None:
+    def acquire(self, deadline: float | None = None) -> bool:
+        """Waits for the lock, until DEADLINE (time.monotonic()) when given:
+        False once that has passed, even if the lock is free by then."""
         # The pid is written to a private file first and linked onto the lock
         # path: link() is atomic and fails if the lock exists, so the lock
         # file is never seen empty. A stale lock is claimed by renaming it to a
@@ -617,13 +639,15 @@ class DialogLock:
         mine.chmod(0o600)
         try:
             while True:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return False
                 try:
                     os.link(mine, self.path)
                 except FileExistsError:
                     pass
                 else:
                     self.held = True
-                    return
+                    return True
                 try:
                     owner = int(self.path.read_text().strip() or '0')
                 except (OSError, ValueError):
@@ -664,7 +688,8 @@ class DialogLock:
         self.held = False
 
     def __enter__(self):
-        self.acquire()
+        if not self.held:
+            self.acquire()
         return self
 
     def __exit__(self, *exc):
@@ -756,6 +781,10 @@ class Service:
                           f'(edit {self.config.spam_file} on the signing Mac to undo)\n'}
 
     def sign(self, request: dict, who: dict) -> dict:
+        # Everything from here counts against sign_timeout_seconds, waiting
+        # behind other requests included: the client's own, longer timeout
+        # relies on it, and a preview must never open after the client is gone.
+        started = time.monotonic()
         args = request.get('args')
         if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
             raise RemoteError('args must be a list of strings', 400)
@@ -798,8 +827,19 @@ class Service:
 
         summary = self._summary(info, args, payload, digest, context, peer)
         details = self._details(info, args, payload, digest, context, peer)
-        with self.lock:
-            return self._review_and_sign(args, payload, info, digest, repo, peer, summary, details)
+        if not self.lock.acquire(timeout=max(0.0, started + self.config.sign_timeout - time.monotonic())):
+            return self._busy(info, digest, repo, peer)
+        try:
+            return self._review_and_sign(args, payload, info, digest, repo, peer, summary, details, started)
+        finally:
+            self.lock.release()
+
+    def _busy(self, info, digest, repo, peer) -> dict:
+        """Another request held the signing Mac for this one's whole time."""
+        self.audit('busy', repo, info['type'], digest, peer)
+        return {'status': EX_SOFTWARE, 'decision': 'busy', 'stdout': '',
+                'stderr': f'git-gpg-preview: the signing Mac was busy with another signature for '
+                          f'{int(self.config.sign_timeout)}s; refusing to sign\n'}
 
     def _summary(self, info, args, payload, digest, context, peer) -> str:
         # dialog.jxa splits the preview at the Message: line, so every line
@@ -844,7 +884,7 @@ class Service:
                        + '=' * 60 + '\n' + sanitize(context.get('full_diff', '(not supplied)')))
         return '\n'.join(out) + '\n'
 
-    def _review_and_sign(self, args, payload, info, digest, repo, peer, summary, details) -> dict:
+    def _review_and_sign(self, args, payload, info, digest, repo, peer, summary, details, started) -> dict:
         config = self.config
         lock_root = Path(config.lock_root)
         lock_root.mkdir(parents=True, exist_ok=True)
@@ -860,15 +900,14 @@ class Service:
             for p in ('payload', 'summary.txt', 'details.txt', 'decision'):
                 paths[p].chmod(0o600)
 
-            with DialogLock(lock_root / 'dialog.lock'):
+            lock = DialogLock(lock_root / 'dialog.lock')
+            if not lock.acquire(started + config.sign_timeout):
+                return self._busy(info, digest, repo, peer)
+            with lock:
                 # Includes marks made by a local wrapper while we were queued.
                 spam = self._spam_rejection(payload, info, digest, repo, peer)
                 if spam:
                     return spam
-                # From here on everything counts against sign_timeout_seconds:
-                # the policy lookup, the preview, a Sign click and the
-                # signature, so the service answers before the client gives up.
-                started = time.monotonic()
                 # Read under the lock, as the wrapper does: the card is busy
                 # while another request waits for its touch.
                 policy = self._touch_policy(started)
@@ -879,10 +918,12 @@ class Service:
                     if not self._add_touch_notice(paths, notice, summary, details):
                         error('could not add the touch policy notice to the preview or its details')
                         notes.append('could not add the touch policy notice to the preview or its details')
-                # With touch off the key signs without a touch, so GPG waits for
-                # Sign. That follows the policy read, not the notice files.
+                # With touch off, or a policy that could not be read, the key may
+                # sign without a touch, so GPG waits for Sign. That follows the
+                # policy read, not the notice files.
+                sign_notice = '' if policy in TOUCHED_POLICIES else notice or UNKNOWN_TOUCH_NOTICE
                 result = self._run_dialog_and_gpg(args, paths, info, digest, repo, peer, started,
-                                                  notice if policy == 'off' else '')
+                                                  sign_notice, policy or 'unknown')
                 result['stderr'] = ''.join(f'git-gpg-preview: note from the signing Mac: {note}\n' for note in notes) + result['stderr']
                 return result
 
@@ -925,20 +966,21 @@ class Service:
             return ''
         return card_touch_policy(agent, key.split()[0], deadline - time.monotonic())
 
-    def _await_sign_click(self, dialog, stop, paths, info, digest, repo, peer, started) -> dict | None:
+    def _await_sign_click(self, dialog, stop, paths, info, digest, repo, peer, started, policy) -> dict | None:
         """The wrapper's await_sign_click: waits, within the request's time,
         for the preview to close. None after Sign; otherwise the refusal to
         return, since GPG has not started and nothing can be signed."""
         while dialog.poll() is None and time.monotonic() - started <= self.config.sign_timeout:
             time.sleep(0.1)
-        stop(dialog)
-        try:
-            decision = paths['decision'].read_text().strip()
-        except OSError:
-            decision = ''
+        if dialog.poll() is None or time.monotonic() - started > self.config.sign_timeout:
+            # No answer in time: whatever the preview wrote or writes is ignored.
+            stop(dialog)
+            decision = 'timeout'
+        else:
+            decision = read_decision(paths['decision'])
         if decision == 'sign' and not self._deciding_marker(paths).exists():
             return None
-        refusal = 'git-gpg-preview: not signed: touch policy is off and Sign was not clicked\n'
+        refusal = f'git-gpg-preview: not signed: touch policy is {policy} and Sign was not clicked\n'
         if decision == 'spam':
             result = self._mark_spam(paths, info, digest, repo, peer)
             return {**result, 'stderr': refusal + result['stderr']}
@@ -966,10 +1008,10 @@ class Service:
                 pass
             time.sleep(0.05)
 
-    def _run_dialog_and_gpg(self, args, paths, info, digest, repo, peer, started, sign_notice='') -> dict:
+    def _run_dialog_and_gpg(self, args, paths, info, digest, repo, peer, started, sign_notice='', policy='') -> dict:
         """Shows the preview and runs GPG, both within sign_timeout_seconds of
-        STARTED. With a SIGN_NOTICE (touch policy off) the preview asks for
-        Sign, and GPG starts only after it."""
+        STARTED. With a SIGN_NOTICE (touch POLICY off or unknown) the preview
+        asks for Sign, and GPG starts only after it."""
         config = self.config
         if config.dialog_runner:
             dialog_cmd = [config.dialog_runner]
@@ -994,7 +1036,7 @@ class Service:
                     proc.wait()
 
         if sign_notice:
-            refused = self._await_sign_click(dialog, stop, paths, info, digest, repo, peer, started)
+            refused = self._await_sign_click(dialog, stop, paths, info, digest, repo, peer, started, policy)
             if refused:
                 return refused
         with paths['payload'].open('rb') as stdin:
@@ -1014,7 +1056,7 @@ class Service:
             time.sleep(0.1)
 
         if outcome == 'dialog':
-            decision = paths['decision'].read_text().strip()
+            decision = read_decision(paths['decision'])
             if decision == 'sign':
                 outcome = 'signed'
             elif decision == 'spam':
@@ -1053,10 +1095,7 @@ class Service:
         # answer in flight is awaited before its writer is terminated.
         self._await_pending_decision(paths)
         stop(dialog)
-        try:
-            decision = paths['decision'].read_text().strip()
-        except OSError:
-            decision = ''
+        decision = read_decision(paths['decision'])
         if decision == 'spam':
             return self._mark_spam(paths, info, digest, repo, peer)
         if decision == 'cancel':

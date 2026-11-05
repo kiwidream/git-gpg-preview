@@ -169,6 +169,13 @@ function run(argv) {
             if (room < Math.min(lines.length, 12) * factLine + scrollBar) throw new Error('A wide fact leaves no room for the scroll bar: ' + room);
             if (facts.documentView.textContainer.widthTracksTextView) throw new Error('A wide fact wraps');
         });
+    // The scroll bar room starts at 81 columns: 80 fit across the pane.
+    const factsHeight = function(fact) {
+        return Number(previewPanes(fact + '\n\nMessage:\nSubject').subviews.objectAtIndex(1).frame.size.height);
+    };
+    if (factsHeight('x'.repeat(80)) !== factsHeight('Fact') || factsHeight('x'.repeat(81)) < factsHeight('Fact') + scrollBar) {
+        throw new Error('Scroll bar room for 80, 81 and narrow facts: ' + [80, 81].map(function(n) { return factsHeight('x'.repeat(n)); }) + ', ' + factsHeight('Fact'));
+    }
     // The first marker ends the facts, whatever the message says.
     [
         {summary: 'Request type: commit\n\nMessage:\nSubject', facts: 'Request type: commit', message: 'Subject'},
@@ -192,6 +199,7 @@ function run(argv) {
         {spam: true, responses: [1002], decision: 'spam'}
     ].forEach(function(test) {
         $.NSData.data.writeToFileAtomically(decision, true);
+        $.NSFileManager.defaultManager.removeItemAtPathError(decision + '.deciding', null);
         expectedSpam = test.spam;
         expectedSign = true;
         responses = test.responses.slice();
@@ -202,6 +210,18 @@ function run(argv) {
         if (readText(decision) !== test.decision) throw new Error('Wrong decision with Sign required: ' + readText(decision));
         if (responses.length || modalCount !== test.responses.length) throw new Error('Wrong modal sequence with Sign required');
         if (panesSeen[0].info.indexOf(notice) !== 0 || panesSeen[0].info.indexOf('until you click Sign') < 0) throw new Error('Sign required without the notice: ' + panesSeen[0].info);
+        // Sign is no rejection: it writes no marker, which signers would read as one.
+        const marked = !!$.NSFileManager.defaultManager.fileExistsAtPath(decision + '.deciding');
+        if (marked !== (test.decision !== 'sign')) throw new Error('Wrong rejection marker for ' + test.decision);
+    });
+    // Only the exact argument require-sign asks for Sign.
+    ['require-sign ', 'Require-Sign', 'yes'].forEach(function(flag) {
+        $.NSData.data.writeToFileAtomically(decision, true);
+        expectedSpam = false;
+        responses = [1001];
+        modalCount = 0;
+        runPreview([summary, details, decision, ready, '', flag, notice]);
+        if (readText(decision) !== 'cancel' || modalCount !== 1) throw new Error('Sign required by ' + JSON.stringify(flag));
     });
     // A signing service from before the touch policy offer was removed asks for
     // it with --touch-offer: no window, no answer, and a message that says why.
@@ -264,5 +284,5 @@ function run(argv) {
             if (!seen.secure) throw new Error(where + 'PIN field is not secure');
         });
     });
-    return 'Dialog actions passed (45 cases)';
+    return 'Dialog actions passed (49 cases)';
 }

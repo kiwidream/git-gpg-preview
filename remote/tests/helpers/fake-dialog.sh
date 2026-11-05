@@ -16,13 +16,22 @@ cp "$details" "$capture/$$.details"
 printf '%s' "$spam_action" > "$capture/$$.spam-action"
 # require-sign and the touch policy notice, when the service asks for Sign.
 printf '%s\n%s' "${6-}" "${7-}" > "$capture/$$.gate"
-[[ -n "$ready" ]] && : > "$ready"
 choice=$(cat "${FAKE_DIALOG_DECISION_FILE:?}" 2>/dev/null || echo sign)
+[[ "$choice" == never-ready ]] && exec sleep 30            # never shows, never answers
+[[ -n "$ready" ]] && : > "$ready"
 if [[ "$choice" == delayed-spam || "$choice" == delayed-sign ]]; then
     sleep 0.5
     choice=${choice#delayed-}
 fi
+touched() {
+    local sha
+    sha=$(sed -n 's/^SHA-256: //p' "$summary" | head -n 1)
+    : > "${FAKE_TOUCH_FILE:?}.$sha"
+}
 case "$choice" in
+    raw:*) touched; printf '%b' "${choice#raw:}" > "$decision" ;;   # exactly these bytes, no marker
+    marker-sign) touched; : > "$decision.deciding"; printf 'sign' > "$decision" ;;
+    early-sign) touched; printf 'sign' > "$decision"; sleep 30 ;;   # answers, but the window stays open
     sign)
         sha=$(sed -n 's/^SHA-256: //p' "$summary" | head -n 1)
         : > "${FAKE_TOUCH_FILE:?}.$sha"   # the "touch" completes the signature

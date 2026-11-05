@@ -38,11 +38,13 @@ TOUCH_POLICY=""
 PIN_PROMPT="builtin"
 # Upper bound on PIN attempts per request, even when the card reports more.
 PIN_ATTEMPT_LIMIT=10
-# With touch policy off the key signs as soon as GPG asks it, so GPG waits for
-# Sign in the preview instead, at most this long. Tests read this line; keep
-# the format.
+# With touch policy off, or one that could not be read, the key may sign as
+# soon as GPG asks it, so GPG waits for Sign in the preview instead, at most
+# this long. Tests read this line; keep the format.
 SIGN_CLICK_SECONDS=120
 SIGN_GATE=0
+SIGN_NOTICE=""
+UNKNOWN_TOUCH_NOTICE="Touch policy unknown: Sign to continue"
 TOUCH_NOTICE=""
 
 error() {
@@ -703,8 +705,20 @@ poll_pin_entry() {
     return 0
 }
 
-# With touch off, GPG starts only after the operator clicks Sign: the key would
-# otherwise sign the moment GPG asked it, before anyone could read the preview.
+# Reads the preview's answer into DECISION_VALUE. Only the exact bytes "sign"
+# count as Sign: no case folding, no whitespace, and nothing that a command
+# substitution would quietly drop, such as a trailing newline or a NUL. Other
+# answers keep the plain read, so a rejection can never be read as no answer.
+read_decision() {
+    { DECISION_VALUE=$(/bin/cat "$DECISION" 2>/dev/null || true); } 2>/dev/null
+    if [[ "$DECISION_VALUE" == sign ]] && ! printf sign | /usr/bin/cmp -s - "$DECISION"; then
+        DECISION_VALUE=invalid
+    fi
+}
+
+# With touch off or unknown, GPG starts only after the operator clicks Sign:
+# the key could otherwise sign the moment GPG asked it, before anyone could
+# read the preview.
 # Waits for the preview to close, at most SIGN_CLICK_SECONDS. Anything but Sign
 # (Cancel, Mark as Spam, a window closed without an answer, or no answer in
 # time) ends the request unsigned, and GPG never started.
@@ -713,12 +727,18 @@ await_sign_click() {
     while /bin/kill -0 "$DIALOG_PID" 2>/dev/null && [[ "$SECONDS" -lt "$deadline" ]]; do
         /bin/sleep 0.1
     done
-    /bin/kill -s TERM "$DIALOG_PID" 2>/dev/null || true
-    wait "$DIALOG_PID" 2>/dev/null || true
+    if /bin/kill -0 "$DIALOG_PID" 2>/dev/null || [[ "$SECONDS" -ge "$deadline" ]]; then
+        # No answer in time: whatever the preview wrote or writes is ignored.
+        /bin/kill -s TERM "$DIALOG_PID" 2>/dev/null || true
+        wait "$DIALOG_PID" 2>/dev/null || true
+        DECISION_VALUE=timeout
+    else
+        wait "$DIALOG_PID" 2>/dev/null || true
+        read_decision
+    fi
     DIALOG_PID=""
-    DECISION_VALUE=$(/bin/cat "$DECISION" 2>/dev/null || true)
     [[ "$DECISION_VALUE" == sign && ! -e "$DECIDING" ]] && return 0
-    error "not signed: touch policy is off and Sign was not clicked"
+    error "not signed: touch policy is ${TOUCH_POLICY:-unknown} and Sign was not clicked"
     handle_operator_rejection
     release_dialog_lock
     audit_decision "sign-not-clicked" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
@@ -1122,10 +1142,11 @@ reject_spam_subject
 # GPG before it can produce a signature, so Git aborts. The physical
 # confirmation, not a software button, is the authorization gate.
 #
-# Except with touch policy off: then the key needs no touch, and GPG would sign
-# before the preview could be read. The preview then has a Sign button, which
-# is the gate: GPG starts only after Sign is clicked, and Cancel, a closed
-# window or no click within SIGN_CLICK_SECONDS leaves the request unsigned.
+# Except with touch policy off, or one that could not be read: then the key may
+# need no touch, and GPG would sign before the preview could be read. The
+# preview then has a Sign button, which is the gate: GPG starts only after Sign
+# is clicked, and Cancel, a closed window or no click within SIGN_CLICK_SECONDS
+# leaves the request unsigned.
 #
 # The preview is started first and reports readiness; only then is GPG
 # engaged. This ordering means the PIN prompt (the PIN window or pinentry) launches last and
@@ -1161,8 +1182,15 @@ if TOUCH_NOTICE=$(touch_policy_notice "$TOUCH_POLICY"); then
     error "note: ${TOUCH_NOTICE//$NEWLINE/ }"
 fi
 # Decided by the policy read from the card, never by whether the notice could
-# be written: the preview gets the notice text directly.
-[[ "$TOUCH_POLICY" != off ]] || SIGN_GATE=1
+# be written: the preview gets the notice text directly. Only a policy known to
+# need a touch keeps the touch as the gate; off, and anything that could not be
+# read (a software key, another card, a query that failed or took too long),
+# needs Sign.
+case "$TOUCH_POLICY" in
+    on|fixed|cached|cached-fixed) ;;
+    off) SIGN_GATE=1; SIGN_NOTICE=$TOUCH_NOTICE ;;
+    *) SIGN_GATE=1; SIGN_NOTICE=$UNKNOWN_TOUCH_NOTICE ;;
+esac
 ATTEMPT=1
 while :; do
     # Each attempt starts with a fresh, unanswered preview.
@@ -1188,7 +1216,7 @@ while :; do
     # short; scdaemon then rejects them without asking the card).
     PIN_REMAINING_BEFORE=$(card_pin_retries)
     PREVIEW_ARGS=("$PREVIEW_SUMMARY" "$DETAILS" "$DECISION" "$READY" "$SPAM_ACTION")
-    [[ "$SIGN_GATE" -eq 0 ]] || PREVIEW_ARGS+=(require-sign "$TOUCH_NOTICE")
+    [[ "$SIGN_GATE" -eq 0 ]] || PREVIEW_ARGS+=(require-sign "$SIGN_NOTICE")
     /usr/bin/osascript -l JavaScript "$UI_HELPER" "${PREVIEW_ARGS[@]}" >/dev/null 2>&1 4>&- &
     DIALOG_PID=$!
 
@@ -1234,7 +1262,7 @@ while :; do
         if ! /bin/kill -0 "$DIALOG_PID" 2>/dev/null; then
             wait "$DIALOG_PID" 2>/dev/null || true
             DIALOG_PID=""
-            DECISION_VALUE=$(/bin/cat "$DECISION" 2>/dev/null || true)
+            read_decision
             OUTCOME="dialog"
             break
         fi
@@ -1313,7 +1341,7 @@ while :; do
     DIALOG_PID=""
     dismiss_pin_entry
     CHILD_PID=""
-    DECISION_VALUE=$(/bin/cat "$DECISION" 2>/dev/null || true)
+    read_decision
     handle_operator_rejection
     if [[ -e "$DECIDING" ]]; then
         # The operator answered and the answer never arrived. A signature
