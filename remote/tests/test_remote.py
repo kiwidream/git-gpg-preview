@@ -792,11 +792,13 @@ class TouchPolicyTests(unittest.TestCase):
                       'or click Sign in the preview (off, cached, cached-fixed or unknown)\n', stderr)
 
     def test_an_unknown_policy_needs_sign_too(self):
-        """A policy that cannot be read (an unknown value, no setting, no card,
-        another key on the card, a software key or no gpg-connect-agent) may
-        hide touch off: the preview asks for Sign with its own notice, GPG
-        waits for Sign, and anything else signs nothing."""
+        """A policy that cannot be read (an unknown value, a reply whose status
+        word is not 90 00, no setting, no card, another key on the card, a
+        software key or no gpg-connect-agent) may hide touch off: the preview
+        asks for Sign with its own notice, GPG waits for Sign, and anything
+        else signs nothing."""
         cases = ((self.harness('unknown'), f'{self.CARD_SUB} %05+'), (self.harness('unset'), self.CARD_SUB),
+                 (self.harness('apdu-sw', extra_env={'FAKE_CARD_APDU_SW': '6A 82'}), f'{self.CARD_SUB} %01+'),
                  (self.harness('none'), ''), (self.harness('other'), f'{self.OTHER} %01+'),
                  (self.harness('software', card_keys=''), f'{self.CARD_SUB} %01+'),
                  (self.harness('plain', real_gpg=HELPERS / 'fake-gpg.py'), f'{self.CARD_SUB} %01+'))
@@ -1115,6 +1117,64 @@ class TouchPolicyTests(unittest.TestCase):
                 self.assertEqual(result.stdout, f'signed:{remote.hashlib.sha256(self.initial).hexdigest()}'.encode(),
                                  'the next touch went to the stopped signature')
 
+    def test_the_card_cancel_is_only_for_a_card_operation_left_pending(self):
+        """Stopping scdaemon drops the PIN it holds and disturbs its other users,
+        so the cancel goes only where a card operation may be pending: a GPG
+        stopped while it ran, signing from a certificate with a signing key on
+        a card (even when its software key is the pick, as GnuPG 2.3 and later
+        may sign on the card), or one whose lookup failed. Not a certificate
+        with no card signing key, and not a GPG that had already finished when
+        the operator's Cancel landed."""
+        soft = '5' * 40
+        for name, extra, cancels in (('software', {'card_keys': ''}, False),
+                                     ('card and software', {'extra_env': {'FAKE_GPG_SECRET_KEYS': f'{self.PRIMARY}/{soft}/{self.CARD_SUB}'}}, True),
+                                     ('lookup failed', {'extra_env': {'FAKE_GPG_LIST_FAIL': str(self.tmp / 'list-fails')}}, True),
+                                     ('finished', {}, False)):
+            with self.subTest(name):
+                h = self.harness(name.replace(' ', '-'), **extra)
+                if name == 'lookup failed':
+                    (self.tmp / 'list-fails').write_text('')  # the service has started; its lookup now fails
+                h.decision.write_text('touch-then-late-cancel' if name == 'finished' else 'approve-no-touch')
+                self.card.write_text(f'{self.CARD_SUB} {"%01+" if name == "finished" else "%00+"}')
+                result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+                status = remote.EX_CANCELLED if name == 'finished' else remote.EX_SOFTWARE
+                self.assertEqual((result.returncode, result.stdout), (status, b''), result.stderr)
+                if name == 'finished':
+                    self.assertEqual(len(h.gpg_calls()), 1, 'GPG did not finish before the Cancel')
+                else:
+                    self.assertIn(b'not signed: no touch or PIN before the deadline', result.stderr)
+                    self.assertEqual(self.gate(h).split('\n')[0], 'require-sign', 'the policy was read')
+                calls = h.calls / 'connect-agent-calls'
+                self.assertEqual('SCD KILLSCD /bye' in (calls.read_text() if calls.exists() else '').splitlines(), cancels)
+
+    def test_a_gpg_that_finished_before_it_was_stopped_gets_no_card_cancel(self):
+        """In process: GPG takes 0.4s, and the Cancel the preview wrote with the
+        touch is read a second later, after GPG has signed. Stopping it then
+        sends no KILLSCD: nothing waits at the card."""
+        h = self.harness('h', extra_env={'FAKE_GPG_SLOW': '0.4'})
+        service = remote.Service(remote.ServeConfig(h.serve_dir), {'login': '', 'node': 'mac', 'ips': []})
+        info = remote.parse_payload(self.payload)
+        read = remote.read_decision
+
+        def slow_read(path):
+            time.sleep(1)
+            return read(path)
+
+        h.decision.write_text('touch-then-cancel')
+        paths = {name: self.tmp / f'finished-{name}' for name in ('payload', 'summary.txt', 'details.txt', 'decision', 'ready')}
+        paths['payload'].write_bytes(self.payload)
+        digest = remote.hashlib.sha256(self.payload).hexdigest()
+        paths['summary.txt'].write_text(f'Request type: commit\nSHA-256: {digest}\n\nMessage:\nSubject')
+        paths['details.txt'].write_text('details')
+        paths['decision'].write_text('')
+        with unittest.mock.patch.dict(os.environ, h.env), unittest.mock.patch.object(remote, 'read_decision', slow_read):
+            result = service._run_dialog_and_gpg(['--status-fd=2', '-bsau', self.PRIMARY], paths, info, digest,
+                                                 'repo', 'peer', time.monotonic(), require_sign=False, policy='on')
+        self.assertEqual(result['status'], remote.EX_CANCELLED, result)
+        self.assertEqual(len(h.gpg_calls()), 1, 'GPG did not finish')
+        calls = h.calls / 'connect-agent-calls'
+        self.assertNotIn('KILLSCD', calls.read_text() if calls.exists() else '')
+
     def test_a_pending_answer_is_read_with_the_one_rule(self):
         """An answer the preview began (its marker exists) is awaited as
         read_decision reads it: only exactly sign, cancel and spam count, so
@@ -1268,6 +1328,19 @@ class TouchPolicyTests(unittest.TestCase):
         self.assertTrue(summary.endswith(long_message), summary)
         summary = remote.Service._summary(None, {**info, 'message': long_message * 2}, [], b'payload', 'a' * 64, {}, 'peer')
         self.assertIn('[truncated in summary; View Details shows the complete report]', summary)
+
+    def test_a_branch_name_cannot_break_or_reorder_its_fact_line(self):
+        """NSTextView starts a new line at U+0085, U+2028 and U+2029, and the
+        bidirectional controls reorder text, though none is a control
+        character: in a fact each becomes '?', as in the wrapper. Other text
+        stays."""
+        unsafe = '\u0085\u2028\u2029\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069'
+        branch = 'facts' + ''.join(c + chr(ord('a') + i) for i, c in enumerate(unsafe)) + '\u00e9'
+        info = {'type': 'commit', 'message': 'Subject'}
+        summary = remote.Service._summary(None, info, ['-u', 'KEY'], b'payload', 'a' * 64, {'branch': branch}, 'peer')
+        facts = summary.partition('\n\nMessage:\n')[0].split('\n')
+        self.assertIn('Branch: facts?a?b?c?d?e?f?g?h?i?j?k?l?m?n?o\u00e9', facts)
+        self.assertFalse(set(summary) & set(unsafe), summary)
 
     def test_a_failed_slow_or_late_card_query_gives_no_policy(self):
         agent = str(HELPERS / 'fake-gpg-connect-agent.py')

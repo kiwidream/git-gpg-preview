@@ -84,10 +84,17 @@ function scrollableText(text, width, height, options) {
 // message can pass itself off as one of them.
 const MESSAGE_MARKER = '\n\nMessage:\n';
 
+// Characters NSTextView starts a new line at, or that reorder text, though the
+// signers' sanitizers pass them or never see them: the C1 controls
+// U+0080-U+009F (among them NEL, which Latin-1 decoding makes of a raw 0x85
+// byte in a summary that is not valid UTF-8), U+2028, U+2029 and the
+// bidirectional controls. In the facts each becomes '?', so no fact can draw a
+// line of its own.
+const FACT_UNSAFE = /[\u0080-\u009f\u2028\u2029\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 function splitSummary(summary) {
     const at = summary.indexOf(MESSAGE_MARKER);
     if (at < 0) return {facts: '', message: summary};
-    return {facts: summary.slice(0, at), message: summary.slice(at + MESSAGE_MARKER.length)};
+    return {facts: summary.slice(0, at).replace(FACT_UNSAFE, '?'), message: summary.slice(at + MESSAGE_MARKER.length)};
 }
 
 const PREVIEW_WIDTH = 560;
@@ -264,7 +271,7 @@ function runPinEntry(argv) {
         pinEntryAlert.alertStyle = $.NSAlertStyleInformational;
         pinEntryAlert.messageText = attempt > 1 ? 'Enter your security key PIN again' : 'Enter your security key PIN';
         pinEntryAlert.informativeText = (attempt > 1 ? 'The previous PIN was incorrect. ' : '') +
-            'Git is asking your key to sign the request in the review window. Enter the PIN, then touch the key when it blinks.';
+            'Git is asking your key to sign the request shown for your review. Enter the PIN, then touch the key if it blinks.';
         const parts = problem
             ? pinEntryView(problem + ' ' + status.text + '.', true)
             : pinEntryView(status.text, status.warn);
@@ -303,10 +310,14 @@ function runWaiting(argv) {
 
     const waitingAlert = $.NSAlert.alloc.init;
     waitingAlert.alertStyle = $.NSAlertStyleInformational;
-    waitingAlert.messageText = 'Touch the key to finish signing';
-    waitingAlert.informativeText = 'GPG is signing the request you approved. If your key asks for a touch or the PIN, ' +
-        'give it now; if it needs neither, this window closes by itself. Cancel stops the signature.';
-    waitingAlert.addButtonWithTitle('Cancel');
+    // A key with touch off never blinks: the title must not ask for a touch.
+    waitingAlert.messageText = 'Finishing the signature (touch the key if it blinks)';
+    waitingAlert.informativeText = 'GPG is signing the request you approved. If your key blinks or asks for the PIN, ' +
+        'answer it now; otherwise this window closes by itself. Cancel stops the signature.';
+    // The only button would get Return as the first one, and a stray Return
+    // must not cancel a signature just approved: Escape is its only key.
+    const waitingCancel = waitingAlert.addButtonWithTitle('Cancel');
+    waitingCancel.keyEquivalent = '\u001b';
     markReady(argv.length > 1 ? argv[1] : '');
     Number(waitingAlert.runModal);
     rejectSignature(argv[0], 'cancel');

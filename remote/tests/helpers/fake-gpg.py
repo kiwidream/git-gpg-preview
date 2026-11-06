@@ -16,6 +16,10 @@ with (call_dir / 'calls').open('a') as f:
     f.write(ident + '\n')
 
 if '--list-secret-keys' in args:
+    # FAKE_GPG_LIST_FAIL: a file whose existence makes the listing fail, as a
+    # lookup can after the service has started.
+    if os.environ.get('FAKE_GPG_LIST_FAIL') and Path(os.environ['FAKE_GPG_LIST_FAIL']).exists():
+        sys.exit(2)
     # FAKE_GPG_SECRET_KEYS: comma-separated keys, each `PRIMARY[/SUBKEY...]`
     # fingerprints. A selector after the option lists only the key it names,
     # by any of its fingerprints' suffix, as gpg does. FAKE_GPG_CARD_KEYS:

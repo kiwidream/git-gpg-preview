@@ -197,8 +197,17 @@ def sanitize(text: str) -> str:
     return ''.join('?' if (ord(c) < 32 and c not in '\n\t') or ord(c) == 127 else c for c in text)
 
 
+# Characters that break a line or reorder text where a fact is shown, though
+# none is a control character: NSTextView starts a new line at U+0085, U+2028
+# and U+2029, and the rest are bidirectional controls. As the wrapper's
+# sanitize_one_line, they become '?'.
+ONE_LINE_UNSAFE = frozenset('\u0085\u2028\u2029\u061c\u200e\u200f'
+                            + ''.join(map(chr, range(0x202a, 0x202f))) + ''.join(map(chr, range(0x2066, 0x206a))))
+
+
 def one_line(text: str) -> str:
-    return sanitize(text).replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+    text = sanitize(text).replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+    return ''.join('?' if c in ONE_LINE_UNSAFE else c for c in text)
 
 
 def limited(text: str, limit: int) -> str:
@@ -493,10 +502,12 @@ TOUCH_NOTICES = {
 
 def selected_signing_key(listing: str, now: float) -> str:
     """The wrapper's selected_signing_key for a selector without a trailing !,
-    from a --with-colons secret key listing: '<fingerprint> card' or
-    '<fingerprint> software' for the first certificate that can sign, using its
-    newest usable signing subkey, or its primary key when no subkey can sign.
-    Empty when no key can sign, or when a usable subkey is from the future."""
+    from a --with-colons secret key listing: '<fingerprint> <kind> <certificate
+    kind>' for the first certificate that can sign, using its newest usable
+    signing subkey, or its primary key when no subkey can sign. Each kind is
+    card or software; the certificate's is card when any usable signing key in
+    it is on a card. Empty when no key can sign, or when a usable subkey is
+    from the future."""
     certificates: list[list[dict]] = []
     key = None
     for line in listing.splitlines():
@@ -533,7 +544,8 @@ def selected_signing_key(listing: str, now: float) -> str:
             continue
         if unclear:
             return ''
-        return f"{best['fpr']} {'software' if best['token'] in ('', '+') else 'card'}"
+        on_card = any(usable(k) and k['token'] not in ('', '+') for k in keys)
+        return f"{best['fpr']} {'software' if best['token'] in ('', '+') else 'card'} {'card' if on_card else 'software'}"
     return ''
 
 
@@ -938,7 +950,7 @@ class Service:
                     return spam
                 # Read under the lock, as the wrapper does: the card is busy
                 # while another request waits for its touch.
-                policy = self._touch_policy(started)
+                policy, certificate_kind = self._touch_policy(started)
                 # Whether GPG waits for Sign follows the policy read, never the
                 # notice files or whether a notice text exists.
                 require_sign = policy not in TOUCHED_POLICIES
@@ -958,7 +970,7 @@ class Service:
                 sign_notice = notice or (CACHED_FIXED_TOUCH_NOTICE if policy == 'cached-fixed' else UNKNOWN_TOUCH_NOTICE)
                 result = self._run_dialog_and_gpg(args, paths, info, digest, repo, peer, started,
                                                   require_sign=require_sign, sign_notice=sign_notice,
-                                                  policy=policy or 'unknown')
+                                                  policy=policy or 'unknown', software_key=certificate_kind == 'software')
                 result['stderr'] = ''.join(f'git-gpg-preview: note from the signing Mac: {note}\n' for note in notes) + result['stderr']
                 return result
 
@@ -979,29 +991,33 @@ class Service:
                     pass
             return False
 
-    def _touch_policy(self, started: float) -> str:
+    def _touch_policy(self, started: float) -> tuple[str, str]:
         """The touch policy of the key this service signs with, which is GPG's
-        pick for --local-user FINGERPRINT; empty when it cannot be told. Both
-        lookups share one deadline: 10 seconds from now, since they hold the
-        dialog lock, and within the request's own."""
+        pick for --local-user FINGERPRINT, empty when it cannot be told, and
+        the kind of the certificate GPG signs from: 'card' when it has a signing
+        key on a card, 'software' when it has none, or '' when it was not
+        looked up.
+        Both lookups share one deadline: 10 seconds from now, since they hold
+        the dialog lock, and within the request's own."""
         deadline = min(time.monotonic() + 10, started + self.config.sign_timeout)
         if deadline <= time.monotonic():
-            return ''
+            return '', ''
         agent = gpg_connect_agent(self.config.real_gpg)
         if not agent:
-            return ''
+            return '', ''
         try:
             listing = subprocess.run([self.config.real_gpg, '--batch', '--with-colons', '--list-secret-keys', '--',
                                       self.service_fingerprint()],
                                      stdin=subprocess.DEVNULL, capture_output=True, timeout=deadline - time.monotonic())
         except (OSError, subprocess.TimeoutExpired):
-            return ''
+            return '', ''
         if listing.returncode:
-            return ''
+            return '', ''
         key = selected_signing_key(listing.stdout.decode('utf-8', 'replace'), time.time())
-        if not key.endswith(' card'):
-            return ''
-        return card_touch_policy(agent, key.split()[0], deadline - time.monotonic())
+        fingerprint, kind, certificate = key.split() if key else ('', '', '')
+        if kind != 'card':
+            return '', certificate
+        return card_touch_policy(agent, fingerprint, deadline - time.monotonic()), certificate
 
     def _await_sign_click(self, dialog, stop, paths, info, digest, repo, peer, started, policy) -> dict | None:
         """The wrapper's await_sign_click: waits for the preview to close, until
@@ -1052,7 +1068,13 @@ class Service:
         timeout, Cancel, Mark as Spam or a preview closed without an answer)
         leaves its request, and any PIN request, with gpg-agent and scdaemon,
         and the next touch would complete it or find the card busy. Stopping
-        scdaemon ends both, before the dialog lock goes to the next request."""
+        scdaemon ends both, before the dialog lock goes to the next request,
+        but not at once (read from GnuPG 2.4's source, not measured): scdaemon
+        exits only after the card has answered the command in progress, so a
+        key already blinking for a touch can keep blinking until it is touched
+        or its own touch timeout passes (about 15 seconds on a YubiKey). A touch
+        then completes the stale signature inside scdaemon, where nobody reads
+        it, and the next request may fail once or need a second touch."""
         agent = gpg_connect_agent(self.config.real_gpg)
         if not agent:
             return
@@ -1062,12 +1084,15 @@ class Service:
             pass
 
     def _run_dialog_and_gpg(self, args, paths, info, digest, repo, peer, started, *,
-                            require_sign: bool, sign_notice: str = '', policy: str = '') -> dict:
+                            require_sign: bool, sign_notice: str = '', policy: str = '',
+                            software_key: bool = False) -> dict:
         """Shows the preview and runs GPG, both within sign_timeout_seconds of
         STARTED. With REQUIRE_SIGN (touch POLICY off, cached, cached-fixed or
         unknown; only on and fixed keep the touch as the gate) the preview asks
         for Sign, showing SIGN_NOTICE, and GPG starts only after it. It has no
-        default, so no caller can open the gate by leaving it out."""
+        default, so no caller can open the gate by leaving it out. SOFTWARE_KEY
+        (a certificate known to have no signing key on a card) skips the card
+        cancel when GPG is stopped: it leaves nothing at the card."""
         config = self.config
         if config.dialog_runner:
             ui = [config.dialog_runner]
@@ -1127,9 +1152,12 @@ class Service:
         def stop_gpg():
             # GPG stopped before it finished may have left its operation waiting
             # at the card: end that too, before the lock goes to the next request.
+            # Not for a GPG that had already finished, nor a certificate with no
+            # signing key on a card: there stopping scdaemon would only drop the
+            # PIN it holds and disturb its other users.
             running = gpg.poll() is None
             stop(gpg)
-            if running:
+            if running and not software_key:
                 self._cancel_card_operation()
 
         if outcome == 'dialog':

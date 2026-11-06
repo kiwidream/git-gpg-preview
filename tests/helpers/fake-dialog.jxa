@@ -37,7 +37,8 @@ function run(argv) {
     const touch = ObjC.unwrap(env.objectForKey('FAKE_TOUCH_FILE') || '');
     if (argv[0] === '--pin-entry') {
         // Type the next PIN from FAKE_PIN_ENTRIES (comma-separated); CANCEL
-        // presses Cancel. argv: channel, result, remaining, attempt.
+        // presses Cancel, and CLOSE closes the window without an answer.
+        // argv: channel, result, remaining, attempt.
         if (log) append(log, 'pin-entry ' + argv[3] + ' ' + argv[4] + '\n');
         const entries = ObjC.unwrap(env.objectForKey('FAKE_PIN_ENTRIES') || '').split(',');
         const used = ObjC.unwrap(env.objectForKey('FAKE_PIN_ENTRY_STATE') || '');
@@ -48,6 +49,7 @@ function run(argv) {
             write(argv[2], 'cancel');
             return;
         }
+        if (pin === 'CLOSE') return;
         // "a+b" sends two lines, like a PIN that lands as its attempt ends.
         const handle = $.NSFileHandle.fileHandleForWritingAtPath(argv[1]);
         handle.writeData($.NSString.stringWithString(pin.split('+').join('\n') + '\n').dataUsingEncoding($.NSUTF8StringEncoding));

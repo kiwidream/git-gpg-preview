@@ -1071,38 +1071,128 @@ done
 rm -f "$XDG_CONFIG_HOME/git-gpg-preview/spam-subjects"
 # So does a Cancel in the PIN window, and a question it cannot answer.
 export FAKE_DIALOG_DECISION=sign-no-touch FAKE_PIN_RETRIES=3 FAKE_GPG_PIN=123456
-for pin_case in pin-cancel:1 ask:70; do
+for pin_case in pin-cancel:1 pin-close:70 ask:70; do
     : > "$FAKE_CARD_QUEUE"
     : > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
-    if [[ "${pin_case%:*}" == ask ]]; then
-        export FAKE_GPG_ASK='GET_BOOL cardctrl.insert_card.okay'
-    else
-        export FAKE_PIN_ENTRIES=CANCEL
-    fi
+    case "${pin_case%:*}" in
+        ask) export FAKE_GPG_ASK='GET_BOOL cardctrl.insert_card.okay' ;;
+        pin-close) export FAKE_PIN_ENTRIES=CLOSE ;;
+        *) export FAKE_PIN_ENTRIES=CANCEL ;;
+    esac
     gate_case --status-fd=2 -bsau TEST
     unset FAKE_GPG_ASK FAKE_PIN_ENTRIES
     [[ "$pin_status" -eq "${pin_case#*:}" && -z "$pin_output" && -n $(touch_at_start) ]] ||
         fail "${pin_case%:*} after Sign: $pin_status, GPG $(touch_at_start)"
     grep -qxF 'SCD KILLSCD /bye' "$FAKE_GPG_CALL_DIR/connect-agent-calls" ||
         fail "${pin_case%:*} after Sign: the stopped signature was left pending at the card"
+    [[ "${pin_case%:*}" != pin-close ]] || grep -qxF 'git-gpg-preview: PIN window closed without an answer; refusing to sign' "$TMP/pin.stderr" ||
+        fail "the PIN window closed without an answer: $(cat "$TMP/pin.stderr")"
 done
 unset FAKE_PIN_RETRIES FAKE_GPG_PIN
 export FAKE_CARD_UIF=%00+
 unset FAKE_CARD_QUEUE
 # A request with its own GnuPG home has its card operation cancelled there,
-# not in the default home's agent.
+# not in the default home's agent, by GPG's rule: the last --homedir wins, under
+# any name GPG takes for it. An --options file cannot change the home (GPG
+# ignores homedir there), so its line naming another one does not count.
 export FAKE_DIALOG_DECISION=sign-no-touch
-for homedir in '--homedir:' '--homedir='; do
+printf 'homedir %s\n' "$TMP/not-this-one" > "$TMP/homedir-options"
+for homedir_case in plain equals home hom last options options-only; do
+    case "$homedir_case" in
+        plain) homedir_args=(--homedir "$TMP/elsewhere") ;;
+        equals) homedir_args=(--homedir="$TMP/elsewhere") ;;
+        home) homedir_args=(--home="$TMP/elsewhere") ;;
+        hom) homedir_args=(--hom="$TMP/elsewhere") ;;
+        last) homedir_args=(--homedir "$TMP/not-this-one" --homedir="$TMP/elsewhere") ;;
+        options) homedir_args=(--homedir "$TMP/elsewhere" --options "$TMP/homedir-options") ;;
+        options-only) homedir_args=(--options "$TMP/homedir-options") ;;
+    esac
+    homedir_cancel="--homedir $TMP/elsewhere SCD KILLSCD /bye"
+    [[ "$homedir_case" != options-only ]] || homedir_cancel='SCD KILLSCD /bye'
     : > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
-    if [[ "$homedir" == *: ]]; then
-        GATE_WRAPPER="$TMP/short-wrapper" gate_case --status-fd=2 -bsau TEST --homedir "$TMP/elsewhere"
-    else
-        GATE_WRAPPER="$TMP/short-wrapper" gate_case --status-fd=2 -bsau TEST --homedir="$TMP/elsewhere"
-    fi
-    [[ "$pin_status" -eq 70 && -n $(touch_at_start) ]] || fail "a stopped signature with ${homedir%:}: $pin_status"
-    [[ $(cat "$FAKE_GPG_CALL_DIR/connect-agent-calls") == "--homedir $TMP/elsewhere SCD KILLSCD /bye" ]] ||
-        fail "a stopped signature with ${homedir%:} was cancelled elsewhere: $(cat "$FAKE_GPG_CALL_DIR/connect-agent-calls")"
+    GATE_WRAPPER="$TMP/short-wrapper" gate_case --status-fd=2 -bsau TEST "${homedir_args[@]}"
+    [[ "$pin_status" -eq 70 && -n $(touch_at_start) ]] || fail "a stopped signature, $homedir_case home: $pin_status"
+    [[ $(cat "$FAKE_GPG_CALL_DIR/connect-agent-calls") == "$homedir_cancel" ]] ||
+        fail "a stopped signature, $homedir_case home, was cancelled elsewhere: $(cat "$FAKE_GPG_CALL_DIR/connect-agent-calls")"
 done
+# The wrapper looks up no key of its own for such a request: --home= names its
+# own home as --homedir does, so the policy goes unread and Sign is needed.
+grep -qxF 'git-gpg-preview: not signed: no touch or PIN before the deadline' "$TMP/pin.stderr" ||
+    fail "a stopped signature with its own home: $(cat "$TMP/pin.stderr")"
+# A certificate with no signing key on a card leaves nothing there: stopping
+# its GPG cancels nothing, which would drop the PIN scdaemon holds and disturb
+# its other users. One with a card signing key gets the cancel even when its
+# newer software key is the pick, since GnuPG 2.3 and later may sign on the card.
+cp "$FAKE_SECRET_KEYS" "$TMP/secret-keys.card"
+for certificate in software-only:0 card-and-software:1; do
+    if [[ "${certificate%:*}" == software-only ]]; then
+        secret_keys "$PRIMARY" cSC '' "$SOFT_SUB" u 300 '' > "$FAKE_SECRET_KEYS"
+    else
+        secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 200 "$CARD" "$SOFT_SUB" u 300 + > "$FAKE_SECRET_KEYS"
+    fi
+    : > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+    GATE_WRAPPER="$TMP/short-wrapper" gate_case --status-fd=2 -bsau TEST
+    [[ "$pin_status" -eq 70 && -n $(touch_at_start) ]] || fail "a stopped signature, ${certificate%:*} certificate: $pin_status"
+    [[ $(grep -c '^SCD KILLSCD /bye$' "$FAKE_GPG_CALL_DIR/connect-agent-calls") -eq "${certificate#*:}" ]] ||
+        fail "a stopped signature, ${certificate%:*} certificate: $(cat "$FAKE_GPG_CALL_DIR/connect-agent-calls")"
+done
+cp "$TMP/secret-keys.card" "$FAKE_SECRET_KEYS"
+# Nor does a GPG that finished after Cancel was read but before it was stopped:
+# here GPG takes 0.4s, and this copy of the wrapper takes a second over the
+# Cancel. It signed, so nothing waits at the card.
+/usr/bin/awk '{ print } /^handle_operator_rejection\(\) \{$/ { print "    /bin/sleep 1" }' "$ROOT/git-gpg-preview" > "$TMP/slow-cancel-wrapper"
+chmod 700 "$TMP/slow-cancel-wrapper"
+[[ $(grep -c '^    /bin/sleep 1$' "$TMP/slow-cancel-wrapper") -eq 1 ]] || fail 'could not slow the Cancel down'
+export FAKE_CARD_UIF=%01+ FAKE_DIALOG_DECISION=raw:cancel FAKE_GPG_SLOW=0.4
+: > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+finished_before=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
+GATE_WRAPPER="$TMP/slow-cancel-wrapper" gate_case --status-fd=2 -bsau TEST
+unset FAKE_GPG_SLOW
+[[ "$pin_status" -eq 1 && -z "$pin_output" && $(wc -l < "$FAKE_GPG_CALL_DIR/calls") -gt "$finished_before" ]] ||
+    fail "Cancel read before GPG finished: $pin_status, GPG finished: $(($(wc -l < "$FAKE_GPG_CALL_DIR/calls") > finished_before))"
+! grep -q KILLSCD "$FAKE_GPG_CALL_DIR/connect-agent-calls" || fail 'a GPG that had finished before it was stopped stopped scdaemon'
+export FAKE_CARD_UIF=%00+
+# A GPG_PID or PIN_CHANNEL the caller exports is not the wrapper's: an early
+# exit (here Cancel, before GPG starts) stops no such process and sends no
+# KILLSCD, and the PIN path deletes no such file.
+sleep 30 &
+inherited_pid=$!
+: > "$TMP/inherited-pin-channel"
+: > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+export FAKE_DIALOG_DECISION=cancel
+GPG_PID=$inherited_pid PIN_CHANNEL="$TMP/inherited-pin-channel" gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 1 && -z $(touch_at_start) ]] || fail "Cancel with an inherited GPG_PID: $pin_status, GPG $(touch_at_start)"
+kill -0 "$inherited_pid" 2>/dev/null || fail 'an inherited GPG_PID was stopped'
+! grep -q KILLSCD "$FAKE_GPG_CALL_DIR/connect-agent-calls" || fail 'an inherited GPG_PID stopped scdaemon'
+[[ -e "$TMP/inherited-pin-channel" ]] || fail 'an inherited PIN_CHANNEL was deleted'
+kill "$inherited_pid"
+wait "$inherited_pid" 2>/dev/null || true
+# The policy is read only from a status word of 90 00 (done): a reply with a
+# valid policy byte but another one, such as 6A 82, reads as unknown and asks
+# for Sign. So does an abbreviation GPG takes for --homedir or --keyring: the
+# request names its own files, whose card the wrapper does not read.
+export FAKE_CARD_UIF=%01+
+for unread in apdu-sw homed keyr no-default-k opt; do
+    unread_arg=""
+    case "$unread" in
+        apdu-sw) export FAKE_CARD_APDU_SW='6A 82' ;;
+        homed) unread_arg=--homed="$TMP/elsewhere" ;;
+        keyr) unread_arg=--keyr="$TMP/elsewhere/pubring.kbx" ;;
+        no-default-k) unread_arg=--no-default-k ;;
+        opt) unread_arg=--opt="$TMP/homedir-options" ;;
+    esac
+    if [[ -z "$unread_arg" ]]; then
+        gate_case --status-fd=2 -bsau TEST
+    else
+        gate_case --status-fd=2 -bsau TEST "$unread_arg"
+    fi
+    unset FAKE_CARD_APDU_SW
+    unread_gate=$(latest_capture)
+    unread_gate=$(cat "${unread_gate%.summary}.gate")
+    [[ "$pin_status" -eq 1 && "$unread_gate" == "require-sign"$'\n'"$TOUCH_UNKNOWN" ]] ||
+        fail "touch on, $unread: the policy was read ($pin_status, preview asked: $unread_gate)"
+done
+export FAKE_CARD_UIF=%00+
 # A preview still open at the deadline is stopped, and a Sign it wrote before
 # then does not count: GPG never starts.
 export FAKE_DIALOG_DECISION=early-sign
@@ -1173,6 +1263,99 @@ for signal in INT:130:5 TERM:143:5 TERM:143:8:wedged; do
         fail "SIG${signal%:*} after Sign: the stopped signature was left pending at the card"
 done
 unset FAKE_GPG_IGNORE_SIGNALS FAKE_KILLSCD_SLEEP
+# A signal after GPG has finished and been reaped, while the request still runs
+# (here waiting for an answer the preview began), signals neither GPG's old
+# number, which may belong to another process by now, nor scdaemon: GPG had
+# finished, so nothing waits at the card. /bin/kill is logged to see that.
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s"\nexec /bin/kill "$@"\n' "$TMP/kill.log" > "$TMP/logged-kill"
+chmod 700 "$TMP/logged-kill"
+sed "s#/bin/kill#$TMP/logged-kill#g" "$ROOT/git-gpg-preview" > "$TMP/kill-logged-wrapper"
+chmod 700 "$TMP/kill-logged-wrapper"
+export FAKE_CARD_UIF=%01+ FAKE_DIALOG_DECISION=touch-then-stall-spam FAKE_DIALOG_DELAY=0
+reset_pin_state
+rm -f "$TMP/kill.log"
+: > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+reaped_before=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
+"$TMP/kill-logged-wrapper" --status-fd=2 -bsau TEST < "$TMP/commit.payload" > "$TMP/signal.stdout" 2> "$TMP/signal.stderr" &
+signal_pid=$!
+waited=0
+while [[ $(wc -l < "$FAKE_GPG_CALL_DIR/calls") -eq "$reaped_before" && "$waited" -lt 100 ]]; do
+    sleep 0.1
+    waited=$((waited + 1))
+done
+reaped_gpg=$(latest_call)
+reaped_gpg=${reaped_gpg%%.*}
+sleep 0.5
+kill -s TERM "$signal_pid"
+signal_status=0
+wait "$signal_pid" || signal_status=$?
+[[ "$signal_status" -eq 143 && ! -s "$TMP/signal.stdout" && "$waited" -lt 100 ]] ||
+    fail "SIGTERM after GPG finished: status $signal_status, GPG finished: $((waited < 100))"
+! grep -qE "^-s [A-Z]+ $reaped_gpg\$" "$TMP/kill.log" || fail "SIGTERM after GPG finished signalled its old number $reaped_gpg"
+! grep -q KILLSCD "$FAKE_GPG_CALL_DIR/connect-agent-calls" || fail 'SIGTERM after GPG finished stopped scdaemon'
+# Where ps cannot answer (a sandbox may deny it), a child kill -0 reaches still
+# counts as the wrapper's: Cancel and SIGTERM while GPG waits for the touch stop
+# it promptly and cancel what it left at the card.
+printf '#!/bin/bash\necho "ps: Operation not permitted" >&2\nexit 1\n' > "$TMP/denied-ps"
+chmod 700 "$TMP/denied-ps"
+sed "s#/bin/ps#$TMP/denied-ps#g" "$ROOT/git-gpg-preview" > "$TMP/no-ps-wrapper"
+chmod 700 "$TMP/no-ps-wrapper"
+! grep -q '/bin/ps' "$TMP/no-ps-wrapper" || fail 'could not deny ps'
+export FAKE_CARD_UIF=%01+ FAKE_DIALOG_DECISION=cancel FAKE_DIALOG_DELAY=0.5
+# A ps that fails, and one that answers nothing.
+for ps_answer in 'echo "ps: Operation not permitted" >&2; exit 1' 'exit 0'; do
+    printf '#!/bin/bash\n%s\n' "$ps_answer" > "$TMP/denied-ps"
+    : > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+    no_ps_started=$SECONDS
+    GATE_WRAPPER="$TMP/no-ps-wrapper" gate_case --status-fd=2 -bsau TEST
+    [[ "$pin_status" -eq 1 && -n $(touch_at_start) && $((SECONDS - no_ps_started)) -lt 6 ]] ||
+        fail "Cancel with ps ($ps_answer): $pin_status after $((SECONDS - no_ps_started))s"
+    grep -qxF 'SCD KILLSCD /bye' "$FAKE_GPG_CALL_DIR/connect-agent-calls" ||
+        fail "Cancel with ps ($ps_answer) left the signature pending at the card"
+done
+printf '#!/bin/bash\necho "ps: Operation not permitted" >&2\nexit 1\n' > "$TMP/denied-ps"
+export FAKE_DIALOG_DECISION=hang FAKE_DIALOG_DELAY=0
+for no_ps_case in denied-ps inherited-pid; do
+    reset_pin_state
+    rm -f "$FAKE_GPG_CALL_DIR/touch-at-start"
+    : > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+    if [[ "$no_ps_case" == denied-ps ]]; then
+        "$TMP/no-ps-wrapper" --status-fd=2 -bsau TEST < "$TMP/commit.payload" > "$TMP/signal.stdout" 2> "$TMP/signal.stderr" &
+    else
+        # A signal with a GPG_PID the caller exported, before GPG starts (touch
+        # off: the preview waits for Sign), stops no such process.
+        export FAKE_CARD_UIF=%00+
+        sleep 30 &
+        inherited_pid=$!
+        GPG_PID=$inherited_pid "$ROOT/git-gpg-preview" --status-fd=2 -bsau TEST < "$TMP/commit.payload" > "$TMP/signal.stdout" 2> "$TMP/signal.stderr" &
+    fi
+    signal_pid=$!
+    waited=0
+    if [[ "$no_ps_case" == denied-ps ]]; then
+        while [[ ! -s "$FAKE_GPG_CALL_DIR/touch-at-start" && "$waited" -lt 100 ]]; do sleep 0.1; waited=$((waited + 1)); done
+        signal_gpg=$(ls -t "$FAKE_GPG_CALL_DIR"/*.stdin | head -n 1)
+        signal_gpg=${signal_gpg##*/}
+    else
+        while ! grep -q '^start ' "$FAKE_DIALOG_LOG" && [[ "$waited" -lt 100 ]]; do sleep 0.1; waited=$((waited + 1)); done
+    fi
+    sleep 0.3
+    signal_sent=$SECONDS
+    kill -s TERM "$signal_pid"
+    signal_status=0
+    wait "$signal_pid" || signal_status=$?
+    [[ "$signal_status" -eq 143 && $((SECONDS - signal_sent)) -lt 5 && "$waited" -lt 100 ]] ||
+        fail "SIGTERM, $no_ps_case: status $signal_status after $((SECONDS - signal_sent))s"
+    if [[ "$no_ps_case" == denied-ps ]]; then
+        ! kill -0 "${signal_gpg%%.*}" 2>/dev/null || fail 'SIGTERM with ps denied: GPG still runs'
+        grep -qxF 'SCD KILLSCD /bye' "$FAKE_GPG_CALL_DIR/connect-agent-calls" || fail 'SIGTERM with ps denied left the signature pending at the card'
+    else
+        kill -0 "$inherited_pid" 2>/dev/null || fail 'SIGTERM stopped an inherited GPG_PID'
+        ! grep -q KILLSCD "$FAKE_GPG_CALL_DIR/connect-agent-calls" || fail 'SIGTERM with an inherited GPG_PID stopped scdaemon'
+        kill "$inherited_pid"
+        wait "$inherited_pid" 2>/dev/null || true
+    fi
+done
+export FAKE_CARD_UIF=%00+ FAKE_DIALOG_DECISION=sign-no-touch
 # scdaemon answers GETATTR UIF-1 from the card data it read first (here
 # FAKE_SCD_CACHE), so a policy changed since would read as the old one. The
 # wrapper asks the card itself: a key turned from on to off asks for Sign on
@@ -1248,6 +1431,18 @@ grep -qxF 'Signing key: TEST  Message: FORGED selector' <<< "$facts" || fail 'a 
 [[ $(sed -n 7p "$summary") == 'Message:' && $(sed -n 8p "$summary") == 'Message split subject' ]] || fail 'facts do not end at the first Message: line'
 ! grep -qF 'FORGED fact' <<< "$facts" || fail 'the message reached the facts'
 grep -qF 'FORGED fact in the body' "$summary" || fail 'the message lost its own text'
+# Nor a character at which the facts pane would start a new line or reorder the
+# text, though none of their bytes is a control: U+0085, U+2028, U+2029 and the
+# bidirectional controls in a branch name each become '?'. Other text stays.
+unsafe_branch=$(printf 'facts\302\205a\342\200\250b\342\200\251c\330\234d\342\200\216e\342\200\217f\342\200\252g')
+unsafe_branch=$unsafe_branch$(printf '\342\200\253h\342\200\254i\342\200\255j\342\200\256k\342\201\246l\342\201\247m\342\201\250n\342\201\251o\303\251')
+git -C "$FIXTURE" checkout -q -b "$unsafe_branch"
+reset_pin_state
+"$ROOT/git-gpg-preview" --status-fd=2 -bsau TEST < "$TMP/forged-message.payload" > /dev/null 2>&1 || fail 'signing on a branch with line separators'
+git -C "$FIXTURE" checkout -q -
+git -C "$FIXTURE" branch -q -D "$unsafe_branch"
+grep -qxF "Branch: facts?a?b?c?d?e?f?g?h?i?j?k?l?m?n?o$(printf '\303\251')" "$(latest_capture)" ||
+    fail "a branch name drew past its fact line: $(grep '^Branch: ' "$(latest_capture)" | od -c | head -3)"
 git -C "$FIXTURE" commit -q --allow-empty -F - >/dev/null <<< "$(printf 'A long message\n\n'; printf 'body line of a long commit message\n%.0s' {1..100})"
 git -C "$FIXTURE" cat-file commit HEAD > "$TMP/long-message.payload"
 "$ROOT/git-gpg-preview" --status-fd=2 -bsau TEST < "$TMP/long-message.payload" > /dev/null 2>&1 || fail 'signing a long message'

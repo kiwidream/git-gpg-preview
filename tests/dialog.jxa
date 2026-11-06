@@ -62,7 +62,9 @@ function waitingModalResponse(alert) {
     const buttons = alert.buttons;
     const titles = [];
     for (let i = 0; i < Number(buttons.count); i++) titles.push(ObjC.unwrap(buttons.objectAtIndex(i).title));
-    waitingSeen.push({buttons: titles.join('|'), message: ObjC.unwrap(alert.messageText), info: ObjC.unwrap(alert.informativeText)});
+    const keys = [];
+    for (let i = 0; i < Number(buttons.count); i++) keys.push(ObjC.unwrap(buttons.objectAtIndex(i).keyEquivalent));
+    waitingSeen.push({buttons: titles.join('|'), keys: keys.join('|'), message: ObjC.unwrap(alert.messageText), info: ObjC.unwrap(alert.informativeText)});
     return 1000;
 }
 
@@ -76,6 +78,7 @@ function pinEntryModalResponse(alert) {
     if (!pinEntryScript.length) throw new Error('Unexpected extra PIN window');
     pinEntrySeen.push({
         initial: ObjC.unwrap(field.stringValue),
+        info: ObjC.unwrap(alert.informativeText),
         label: ObjC.unwrap(label.stringValue),
         red: !!label.textColor.isEqual($.NSColor.systemRedColor),
         bold: (Number(label.font.fontDescriptor.symbolicTraits) & 2) !== 0,
@@ -235,6 +238,24 @@ function run(argv) {
         const marked = !!$.NSFileManager.defaultManager.fileExistsAtPath(decision + '.deciding');
         if (marked !== (test.decision !== 'sign')) throw new Error('Wrong rejection marker for ' + test.decision);
     });
+    // A summary that is not valid UTF-8 is read as Latin-1, where a raw 0x85
+    // byte is NEL, at which the facts pane would start a new line: it becomes
+    // '?', as do the C1 controls a valid character's bytes become alongside
+    // an invalid byte elsewhere (U+514D is E5 85 8D).
+    [
+        {bytes: 'UmVxdWVzdCB0eXBlOiBjb21taXQKQnJhbmNoOiBmYWN0c4VTSEEtMjU2PTAwMDAtRk9SR0VECgpNZXNzYWdlOgpTdWJqZWN0',
+         facts: 'Request type: commit\nBranch: facts?SHA-256=0000-FORGED'},
+        {bytes: 'UmVxdWVzdCB0eXBlOiBjb21taXQKQnJhbmNoOiB45YWNeQoKTWVzc2FnZToKU3ViamVjdCD/',
+         facts: 'Request type: commit\nBranch: x\u00e5??y'}
+    ].forEach(function(test) {
+        $.NSData.alloc.initWithBase64EncodedStringOptions(test.bytes, 0).writeToFileAtomically(summary, true);
+        $.NSData.data.writeToFileAtomically(decision, true);
+        expectedSpam = false;
+        responses = [1001];
+        panesSeen = [];
+        runPreview([summary, details, decision, ready]);
+        if (panesSeen.length !== 1 || panesSeen[0].facts !== test.facts) throw new Error('A fact drew a line of its own: ' + JSON.stringify(panesSeen));
+    });
     // The notice is shown once: when the facts already hold it, the Sign text
     // does not repeat it. A message that quotes it does not count.
     // Nor does a fact that merely contains it, such as a crafted branch name.
@@ -296,7 +317,10 @@ function run(argv) {
     $.NSFileManager.defaultManager.removeItemAtPathError(decision + '.deciding', null);
     waitingSeen = [];
     runPreview(['--waiting', decision, ready]);
-    if (waitingSeen.length !== 1 || waitingSeen[0].buttons !== 'Cancel' || waitingSeen[0].message !== 'Touch the key to finish signing' ||
+    // Escape is Cancel's only key: a stray Return must not stop a signature
+    // the operator has just approved.
+    if (waitingSeen.length !== 1 || waitingSeen[0].buttons !== 'Cancel' || waitingSeen[0].keys !== '\u001b' ||
+        waitingSeen[0].message !== 'Finishing the signature (touch the key if it blinks)' ||
         waitingSeen[0].info.indexOf('Cancel stops the signature') < 0) throw new Error('Wrong window after Sign: ' + JSON.stringify(waitingSeen));
     if (readText(decision) !== 'cancel' || !$.NSFileManager.defaultManager.fileExistsAtPath(decision + '.deciding') ||
         !$.NSFileManager.defaultManager.fileExistsAtPath(ready)) throw new Error('Cancel after Sign was not a marked rejection, or the window never reported');
@@ -348,7 +372,10 @@ function run(argv) {
             if (seen.red !== expected[1].red || seen.bold !== expected[1].bold) throw new Error(where + 'label style');
             if (seen.initial !== '') throw new Error(where + 'PIN field was not empty');
             if (!seen.secure) throw new Error(where + 'PIN field is not secure');
+            // After Sign the preview has closed, and a key with touch off never
+            // blinks: the text names neither as certain.
+            if (seen.info.indexOf('review window') >= 0 || seen.info.indexOf('touch the key if it blinks') < 0) throw new Error(where + 'text: ' + seen.info);
         });
     });
-    return 'Dialog actions passed (59 cases)';
+    return 'Dialog actions passed (61 cases)';
 }

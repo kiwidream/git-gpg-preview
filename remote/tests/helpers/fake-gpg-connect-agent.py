@@ -5,7 +5,8 @@ signature-key fingerprint and its raw UIF-1 value as scdaemon escapes it
 ("%01+" is touch policy on); no file means no card. Until SERIALNO selects
 the OpenPGP application, another one (PIV, say) answers GETATTR.
 FAKE_CONNECT_AGENT_SLEEP delays the answer (a wedged agent) and
-FAKE_CONNECT_AGENT_EXIT is the exit status after it."""
+FAKE_CONNECT_AGENT_EXIT is the exit status after it. FAKE_CARD_APDU_SW is the
+status word the APDU reply ends with (90 00: done)."""
 import os, re, sys, time
 from pathlib import Path
 
@@ -48,7 +49,8 @@ for command in commands:
     elif command == 'SCD APDU 00CA00D600':
         # As gpg-connect-agent --hex prints it: the policy byte, 0x20, 90 00.
         match = re.fullmatch(r'%(0[0-9A-F])\+', uif)
-        print(f'D[0000]  {match.group(1)} 20 90 00                                         . ..\nOK' if match
+        sw = os.environ.get('FAKE_CARD_APDU_SW', '90 00')
+        print(f'D[0000]  {match.group(1)} 20 {sw}                                         . ..\nOK' if match
               else 'ERR 100663354 No such object <SCD>')
     elif command == 'SCD KILLSCD':
         # scdaemon stops: every operation queued at the card ends.

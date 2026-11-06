@@ -62,6 +62,8 @@ case "$choice" in
         printf 'cancel' > "$decision"
         ;;
     cancel) : > "$decision.deciding"; printf 'cancel' > "$decision" ;;
+    touch-then-late-cancel)                             # Cancel begun, the key confirms, and Cancel lands after GPG ends
+        : > "$decision.deciding"; touched; sleep 0.5; printf 'cancel' > "$decision" ;;
     spam) : > "$decision.deciding"; printf 'spam' > "$decision" ;;
     touch-then-spam)
         sha=$(sed -n 's/^SHA-256: //p' "$summary" | head -n 1)
