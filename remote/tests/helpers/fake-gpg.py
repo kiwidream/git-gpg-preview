@@ -47,6 +47,8 @@ if signing and '--verify' not in args and os.environ.get('FAKE_TOUCH_FILE'):
     # call started: "before" means GPG was engaged only after the preview.
     with (call_dir / 'touch-at-start').open('a') as f:
         f.write('before\n' if touch.exists() else 'after\n')
+    # FAKE_GPG_SLOW: seconds the operator takes over the PIN and touch.
+    time.sleep(float(os.environ.get('FAKE_GPG_SLOW', '0')))
     deadline = time.monotonic() + 10
     while not touch.exists():
         if time.monotonic() > deadline:

@@ -117,6 +117,8 @@ if [[ "$signing" -eq 1 && "$verify" -eq 0 ]]; then
         fail_bad_pin "${FAKE_GPG_BAD_PIN_COUNTED:-counted}"
     fi
 fi
+# FAKE_GPG_SLOW: seconds the operator takes over the PIN and touch.
+[[ -z "${FAKE_GPG_SLOW-}" ]] || sleep "$FAKE_GPG_SLOW"
 if [[ "$signing" -eq 1 && "$verify" -eq 0 && -n "${FAKE_TOUCH_FILE-}" ]]; then
     sha=$(shasum -a 256 "$payload" | awk '{print $1}')
     touch_file="$FAKE_TOUCH_FILE.$sha"

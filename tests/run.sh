@@ -672,16 +672,10 @@ fi
 # anywhere suggests the cached policy, the preview is the only window, and
 # signing goes ahead either way.
 TOUCH_OFF=$'Touch policy is off: this key signs with no touch.\nTo require one, run: ykman openpgp keys set-touch sig on'
-TOUCH_CACHED=$'Touch policy is cached: a touch also signs what arrives in the next 15 seconds.\nTo require a touch for every signature, run: ykman openpgp keys set-touch sig on'
+TOUCH_CACHED=$'Touch policy is cached: one touch signs for 15 seconds, so Sign is required.\nTo require a touch for every signature, run: ykman openpgp keys set-touch sig on'
 CACHED_HINT='set-touch[[:space:]]+sig[[:space:]]+cached|use cached'
 TOUCH_UNKNOWN='Touch policy unknown: Sign to continue'
-TOUCH_SKIPPED='Touch cached: this signature would not need a touch; Sign to continue'
-SIGNATURES_FILE="$XDG_CONFIG_HOME/git-gpg-preview/last-signatures"
-# cached_long_ago: the card key's previous signature ended well outside the
-# cached touch window, so a cached key keeps the touch as its gate.
-cached_long_ago() {
-    printf '%s %d\n' "$CARD_SUB" "$(($(date +%s) - 100))" > "$SIGNATURES_FILE"
-}
+TOUCH_CACHED_FIXED='Touch policy cached-fixed: one touch signs for 15 seconds; Sign is required.'
 DETAILS_TITLE='GIT OPENPGP SIGNING REVIEW — FULL DETAILS'
 # note_line NOTICE: the one stderr line that carries NOTICE.
 note_line() {
@@ -705,7 +699,6 @@ assert_touch_notice() {
     export FAKE_CARD_UIF="$2"
     shift 3
     reset_pin_state
-    [[ "$uif" != %0[34]+ ]] || cached_long_ago
     rm -f "$FAKE_GPG_CALL_DIR/connect-agent-calls" "$FAKE_GPG_CALL_DIR/secret-key-listings"
     ls -A "$XDG_CONFIG_HOME/git-gpg-preview" > "$TMP/config-files.before"
     run_pin_case "$@"
@@ -716,12 +709,14 @@ assert_touch_notice() {
     details=$(details_of "$summary")
     ! grep -qiE "$CACHED_HINT" "$summary" "$details" "$TMP/pin.stderr" ||
         fail "$label: suggests the cached touch policy"
-    # A policy read as on, fixed, cached or cached-fixed keeps the touch as the
-    # gate. Off asks for Sign with its notice; a policy that was not read (every
-    # case here that does not read one of those) with the unknown notice.
-    if [[ "$expected" == "$TOUCH_OFF" ]]; then
-        [[ $(cat "${summary%.summary}.gate") == require-sign$'\n'"$TOUCH_OFF" ]] || fail "$label: the preview was not asked for Sign"
-    elif [[ "$uif" == %0[1-4]+ ]]; then
+    # A policy read as on or fixed keeps the touch as the gate. Off and cached
+    # ask for Sign with their notice, cached-fixed with its own; a policy that
+    # was not read (every case here that does not read one) with the unknown one.
+    if [[ "$expected" == "$TOUCH_OFF" || "$expected" == "$TOUCH_CACHED" ]]; then
+        [[ $(cat "${summary%.summary}.gate") == require-sign$'\n'"$expected" ]] || fail "$label: the preview was not asked for Sign"
+    elif [[ "$uif" == %04+ ]]; then
+        [[ $(cat "${summary%.summary}.gate") == require-sign$'\n'"$TOUCH_CACHED_FIXED" ]] || fail "$label: the preview was not asked for Sign"
+    elif [[ "$uif" == %0[12]+ ]]; then
         [[ -z $(cat "${summary%.summary}.gate") ]] || fail "$label: the preview was asked for Sign"
     else
         [[ $(cat "${summary%.summary}.gate") == require-sign$'\n'"$TOUCH_UNKNOWN" ]] || fail "$label: the preview was not asked for Sign"
@@ -920,12 +915,11 @@ use_real_gpg "$TMP/gnupg-bin/gpg"
 export FAKE_DIALOG_DELAY=1 FAKE_PIN_RETRIES=3 FAKE_GPG_PIN=123456 FAKE_PIN_ENTRIES=123456
 for uif in %00+ %05+ %01+ %02+ %03+ %04+; do
     export FAKE_CARD_UIF=$uif
-    [[ "$uif" != %0[34]+ ]] || cached_long_ago
     gate_case --status-fd=2 -bsau TEST
     [[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "touch $uif: not signed ($pin_status)"
-    if [[ "$uif" == %00+ || "$uif" == %05+ ]]; then
-        [[ $(touch_at_start) == before ]] || fail "touch off: GPG started before Sign ($(touch_at_start))"
-        [[ $(dialog_order) == 'start end pin-entry ' ]] || fail "touch off: the PIN window did not follow Sign: $(dialog_order)"
+    if [[ "$uif" != %0[12]+ ]]; then
+        [[ $(touch_at_start) == before ]] || fail "touch $uif: GPG started before Sign ($(touch_at_start))"
+        [[ $(dialog_order) == 'start end pin-entry ' ]] || fail "touch $uif: the PIN window did not follow Sign: $(dialog_order)"
     else
         [[ $(touch_at_start) == after ]] || fail "touch $uif: GPG waited for a click ($(touch_at_start))"
     fi
@@ -1040,69 +1034,28 @@ GATE_WRAPPER="$TMP/short-wrapper" gate_case --status-fd=2 -bsau TEST
     fail "touch off, no touch after Sign: $pin_status after $((SECONDS - gate_started))s"
 grep -qxF 'git-gpg-preview: not signed: no touch or PIN before the deadline' "$TMP/pin.stderr" || fail "no touch after Sign: $(cat "$TMP/pin.stderr")"
 grep -qF 'decision=gpg-timeout' "$TMP/audit.log" || fail 'no touch after Sign: not audited'
-export FAKE_DIALOG_DECISION=sign
-pass 'touch off: a Sign inside the deadline counts and a later one does not; a key that never confirms after Sign is stopped'
-
-# Touch cached: within 15 seconds of a touch the key signs without one, so a
-# signature within 20 seconds of the same key's previous one, or one whose
-# previous one cannot be told, needs Sign with its own notice. Any other keeps
-# the touch as its gate.
-latest_gate() {
-    local summary
-    summary=$(latest_capture)
-    cat "${summary%.summary}.gate"
-}
-# cached_case gate|touch LABEL: one signature with the card key set to cached.
-cached_case() {
-    gate_case --status-fd=2 -bsau TEST
-    [[ "$pin_status" -eq 0 ]] || fail "$2: not signed ($pin_status)"
-    if [[ "$1" == gate ]]; then
-        [[ $(latest_gate) == require-sign$'\n'"$TOUCH_SKIPPED" && $(touch_at_start) == before ]] ||
-            fail "$2: no Sign was needed ($(touch_at_start))"
-    else
-        [[ -z $(latest_gate) && $(touch_at_start) == after ]] || fail "$2: Sign was needed ($(touch_at_start))"
-    fi
-}
-export FAKE_CARD_UIF=%03+ FAKE_DIALOG_DELAY=1
-rm -f "$SIGNATURES_FILE"
-cached_case gate 'touch cached, no record yet'
-[[ $(stat -f '%Lp' "$SIGNATURES_FILE") == 600 ]] || fail 'the signature record is not private'
-grep -qE "^$CARD_SUB [0-9]+\$" "$SIGNATURES_FILE" || fail "the signature was not recorded: $(cat "$SIGNATURES_FILE")"
-cached_case gate 'touch cached, a second signature at once'
-cached_long_ago
-cached_case touch 'touch cached, the previous signature 100s ago'
-export FAKE_CARD_UIF=%04+
-cached_long_ago
-cached_case touch 'touch cached-fixed, the previous signature 100s ago'
-cached_case gate 'touch cached-fixed, a second signature at once'
-export FAKE_CARD_UIF=%03+
-for record in "$CARD_SUB pending" "$CARD_SUB x" "$CARD_SUB" "$CARD_SUB 1 2" "$CARD_SUB 09" "$CARD_SUB $(($(date +%s) + 100))" "$OTHER_CARD 1"; do
-    printf '%s\n' "$record" > "$SIGNATURES_FILE"
-    cached_case gate "touch cached, record '$record'"
-done
-printf '%s %d\n%s %d\n' "$OTHER_CARD" "$(date +%s)" "$CARD_SUB" "$(($(date +%s) - 100))" > "$SIGNATURES_FILE"
-cached_case touch 'touch cached, another key signed just now'
-grep -qE "^$OTHER_CARD [0-9]+\$" "$SIGNATURES_FILE" || fail 'another key lost its signature record'
-rm -f "$SIGNATURES_FILE"
-printf '%s %d\n' "$CARD_SUB" "$(($(date +%s) - 100))" > "$TMP/signatures-target"
-ln -s "$TMP/signatures-target" "$SIGNATURES_FILE"
-cached_case gate 'touch cached, a symbolic link for the record'
-[[ -L "$SIGNATURES_FILE" && $(cut -d' ' -f1 "$TMP/signatures-target") == "$CARD_SUB" && $(wc -l < "$TMP/signatures-target") -eq 1 ]] ||
-    fail 'the signature record was written through a symbolic link'
-rm -f "$SIGNATURES_FILE"
-mkdir "$SIGNATURES_FILE"
-cached_case gate 'touch cached, a directory for the record'
-rmdir "$SIGNATURES_FILE"
-# A record that cannot be kept is not trusted, however old it says the last one is.
-cached_long_ago
-chmod 500 "$XDG_CONFIG_HOME/git-gpg-preview"
-gate_case --status-fd=2 -bsau TEST
-chmod 700 "$XDG_CONFIG_HOME/git-gpg-preview"
-[[ "$pin_status" -eq 0 && $(latest_gate) == require-sign$'\n'"$TOUCH_SKIPPED" ]] || fail "touch cached, a record that cannot be kept: no Sign was needed"
-grep -qF "could not record this signature in $SIGNATURES_FILE" "$TMP/pin.stderr" || fail 'a record that cannot be kept was not reported'
+# A slow PIN and touch within SIGN_GPG_SECONDS sign, and the real allowance
+# leaves a person time to type a PIN, find the key and touch it.
+[[ $(sed -n 's/^SIGN_GPG_SECONDS=//p' "$ROOT/git-gpg-preview") -ge 60 ]] || fail 'too little time after Sign for a PIN and a touch'
+sed 's/^SIGN_GPG_SECONDS=.*/SIGN_GPG_SECONDS=3/' "$ROOT/git-gpg-preview" > "$TMP/slow-pin-wrapper"
+chmod 700 "$TMP/slow-pin-wrapper"
+export FAKE_DIALOG_DECISION=sign FAKE_GPG_SLOW=1.5
+GATE_WRAPPER="$TMP/slow-pin-wrapper" gate_case --status-fd=2 -bsau TEST
+unset FAKE_GPG_SLOW
+[[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "touch off, a slow PIN within SIGN_GPG_SECONDS: $pin_status"
+# The gate follows the policy, never the notice text: an empty one still gates.
+sed 's/^UNKNOWN_TOUCH_NOTICE=.*/UNKNOWN_TOUCH_NOTICE=""/' "$ROOT/git-gpg-preview" > "$TMP/no-notice-wrapper"
+chmod 700 "$TMP/no-notice-wrapper"
+! cmp -s "$ROOT/git-gpg-preview" "$TMP/no-notice-wrapper" || fail 'could not empty the unknown notice'
+export FAKE_CARD_UIF=%05+ FAKE_DIALOG_DELAY=1
+GATE_WRAPPER="$TMP/no-notice-wrapper" gate_case --status-fd=2 -bsau TEST
+empty_gate=$(latest_capture)
+empty_gate=$(cat "${empty_gate%.summary}.gate")
+[[ "$pin_status" -eq 0 && $(touch_at_start) == before && "$empty_gate" == require-sign ]] ||
+    fail "touch unknown, an empty notice: $pin_status, GPG $(touch_at_start), preview asked: $empty_gate"
 export FAKE_CARD_UIF=%00+ FAKE_DIALOG_DELAY=0
-rm -f "$SIGNATURES_FILE"
-pass 'touch cached: Sign within 20s of the same key'"'"'s last signature, or without a record to trust; none otherwise'
+pass 'touch off: a Sign inside the deadline counts and a later one does not; a key that never confirms after Sign is stopped, a slow one signs; the gate needs no notice'
+
 
 # A wrong PIN repeats the preview: the notice stays, and the policy is read once.
 use_real_gpg "$TMP/gnupg-bin/gpg"

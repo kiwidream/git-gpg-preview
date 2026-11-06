@@ -19,17 +19,6 @@ CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 CONFIG_FILE="$CONFIG_HOME/git-gpg-preview/config"
 SPAM_FILE="$CONFIG_HOME/git-gpg-preview/spam-subjects"
 SPAM_TEMP=""
-# When each cached card key last finished a signature: one "<fingerprint>
-# <epoch seconds>" line per key, or "<fingerprint> pending" while one is under
-# way, shared with the remote service under the dialog lock. Such a key skips
-# its touch within 15 seconds of the last one, so a signature within
-# CACHED_TOUCH_WINDOW seconds of the previous, or one whose previous cannot be
-# told, needs Sign. Tests read these lines; keep the format.
-SIGNATURES_FILE="$CONFIG_HOME/git-gpg-preview/last-signatures"
-CACHED_TOUCH_WINDOW=20
-CACHED_TOUCH_NOTICE="Touch cached: this signature would not need a touch; Sign to continue"
-SIGNATURES_TEMP=""
-TRACK_SIGNATURE=0
 REAL_GPG=""
 UI_HELPER=""
 LOCK_ROOT=""
@@ -49,16 +38,22 @@ TOUCH_POLICY=""
 PIN_PROMPT="builtin"
 # Upper bound on PIN attempts per request, even when the card reports more.
 PIN_ATTEMPT_LIMIT=10
-# With touch policy off, or one that could not be read, the key may sign as
-# soon as GPG asks it, so GPG waits for Sign in the preview instead, at most
-# SIGN_CLICK_SECONDS. The preview is closed after Sign, so a key that still
-# wants a touch or the PIN then gets SIGN_GPG_SECONDS. Tests read these lines;
-# keep the format.
+# With touch policy off or cached, or one that could not be read, the key may
+# sign as soon as GPG asks it, so GPG waits for Sign in the preview instead, at
+# most SIGN_CLICK_SECONDS. The preview is closed after Sign, so the PIN window
+# (or pinentry) and a touch then get SIGN_GPG_SECONDS: time to type a PIN, look
+# for the key and touch it. Git waits for the wrapper without a timeout of its
+# own, so unlike the remote service, which must answer within its client's
+# timeout, these need not share one budget. Tests read these lines; keep the
+# format.
 SIGN_CLICK_SECONDS=120
-SIGN_GPG_SECONDS=30
+SIGN_GPG_SECONDS=90
 SIGN_GATE=0
 SIGN_NOTICE=""
 UNKNOWN_TOUCH_NOTICE="Touch policy unknown: Sign to continue"
+# Cached-fixed gets no notice of its own (it cannot be changed), only this
+# with the Sign button.
+CACHED_FIXED_TOUCH_NOTICE="Touch policy cached-fixed: one touch signs for 15 seconds; Sign is required."
 TOUCH_NOTICE=""
 
 error() {
@@ -67,7 +62,6 @@ error() {
 
 cleanup() {
     [[ -z "$SPAM_TEMP" ]] || /bin/rm -f "$SPAM_TEMP"
-    [[ -z "$SIGNATURES_TEMP" ]] || /bin/rm -f "$SIGNATURES_TEMP"
     flush_gpg_stderr
     if [[ -n "$DIALOG_PID" ]] && /bin/kill -0 "$DIALOG_PID" 2>/dev/null; then
         /bin/kill -s TERM "$DIALOG_PID" 2>/dev/null || true
@@ -602,7 +596,7 @@ card_touch_policy() {
 
 # What to tell the operator about a touch policy that is worth changing: off
 # signs without any touch, and cached lets a request queued behind a touch sign
-# without its own. On already asks for a touch on every signature, and fixed and
+# without its own, so both need Sign. On already asks for a touch on every signature, and fixed and
 # cached-fixed cannot be changed without replacing the key, so they get nothing.
 # Two lines of at most 80 characters, the policy and then the command, so both
 # fit the width of the preview's facts pane, which does not wrap.
@@ -610,7 +604,7 @@ touch_policy_notice() {
     case "$1" in
         off) printf '%s\n%s' "Touch policy is off: this key signs with no touch." \
             "To require one, run: ykman openpgp keys set-touch sig on" ;;
-        cached) printf '%s\n%s' "Touch policy is cached: a touch also signs what arrives in the next 15 seconds." \
+        cached) printf '%s\n%s' "Touch policy is cached: one touch signs for 15 seconds, so Sign is required." \
             "To require a touch for every signature, run: ykman openpgp keys set-touch sig on" ;;
         *) return 1 ;;
     esac
@@ -643,51 +637,6 @@ prepend_touch_notice() {
     fi
     /bin/rm -f "$new_summary" "$new_details" "$old_summary"
     error "note: could not add the touch policy notice to the preview or its details"
-}
-
-# When KEY last finished a signature, in epoch seconds; nothing without a
-# usable record: no file, a symbolic link or anything but a regular file, no
-# line for KEY, or a malformed or pending one. No leading zeros, which shell
-# arithmetic would read as octal.
-last_signature() {
-    [[ -f "$SIGNATURES_FILE" && ! -L "$SIGNATURES_FILE" ]] || return 0
-    /usr/bin/awk -v key="$1" '
-        $1 == key { found = (NF == 2 && $2 ~ /^(0|[1-9][0-9]*)$/ && length($2) <= 18) ? $2 : "" }
-        END { print found }
-    ' "$SIGNATURES_FILE" 2>/dev/null
-}
-
-# Replaces KEY's line with VALUE (epoch seconds, or pending), atomically and
-# 0600. Fails, changing nothing, for a symbolic link or anything but a regular
-# file, or a file that cannot be replaced. Caller holds dialog.lock.
-remember_signature() {
-    local key="$1" value="$2"
-    if [[ -L "$SIGNATURES_FILE" || ( -e "$SIGNATURES_FILE" && ! -f "$SIGNATURES_FILE" ) ]]; then
-        return 1
-    fi
-    SIGNATURES_TEMP=$(/usr/bin/mktemp "$SIGNATURES_FILE.XXXXXX" 2>/dev/null) || return 1
-    if { [[ ! -e "$SIGNATURES_FILE" ]] || /usr/bin/awk -v key="$key" '$1 != key' "$SIGNATURES_FILE" > "$SIGNATURES_TEMP"; } 2>/dev/null &&
-       printf '%s %s\n' "$key" "$value" >> "$SIGNATURES_TEMP" &&
-       /bin/mv -f "$SIGNATURES_TEMP" "$SIGNATURES_FILE" 2>/dev/null; then
-        SIGNATURES_TEMP=""
-        return 0
-    fi
-    /bin/rm -f "$SIGNATURES_TEMP"
-    SIGNATURES_TEMP=""
-    return 1
-}
-
-# Whether KEY's cached touch could cover this signature: its previous one ended
-# less than CACHED_TOUCH_WINDOW seconds ago, its record is missing, unreadable
-# or pending, or the clock moved backwards. The record is set to pending first,
-# and one that cannot be kept counts as a skipped touch too, so a stale record
-# can never open the way.
-touch_skipped() {
-    local key="$1" last now
-    last=$(last_signature "$key")
-    now=$(/bin/date +%s)
-    remember_signature "$key" pending || return 0
-    [[ -z "$last" ]] || [[ "$last" -gt "$now" ]] || [[ $((now - last)) -lt "$CACHED_TOUCH_WINDOW" ]]
 }
 
 # Whether the request names its own home directory, keyring or options file.
@@ -1245,20 +1194,17 @@ if TOUCH_NOTICE=$(touch_policy_notice "$TOUCH_POLICY"); then
     error "note: ${TOUCH_NOTICE//$NEWLINE/ }"
 fi
 # Decided by the policy read from the card, never by whether the notice could
-# be written: the preview gets the notice text directly. Only a policy known to
-# need a touch keeps the touch as the gate; off, and anything that could not be
-# read (a software key, another card, a query that failed or took too long),
-# needs Sign.
+# be written, and never by the notice text: the preview gets that directly.
+# Only on and fixed make every signature wait for its own touch, so only they
+# keep the touch as the gate. Cached lets one touch sign whatever follows for
+# 15 seconds, including touches made outside this tool, which no record here
+# could see; off needs no touch; and anything that could not be read (a
+# software key, another card, a query that failed or took too long) may be
+# either. All of those need Sign.
 case "$TOUCH_POLICY" in
     on|fixed) ;;
-    cached|cached-fixed)
-        TRACK_SIGNATURE=1
-        if touch_skipped "${SIGNING_KEY%% *}"; then
-            SIGN_GATE=1
-            SIGN_NOTICE=$CACHED_TOUCH_NOTICE
-        fi
-        ;;
-    off) SIGN_GATE=1; SIGN_NOTICE=$TOUCH_NOTICE ;;
+    off|cached) SIGN_GATE=1; SIGN_NOTICE=$TOUCH_NOTICE ;;
+    cached-fixed) SIGN_GATE=1; SIGN_NOTICE=$CACHED_FIXED_TOUCH_NOTICE ;;
     *) SIGN_GATE=1; SIGN_NOTICE=$UNKNOWN_TOUCH_NOTICE ;;
 esac
 ATTEMPT=1
@@ -1445,11 +1391,6 @@ while :; do
     fi
     break
 done
-# Still under the lock: the next request reads when this key's touch was used.
-# A record that cannot be written stays pending, so that request needs Sign.
-if [[ "$TRACK_SIGNATURE" -eq 1 && "$GPG_STATUS" -eq 0 ]] && ! remember_signature "${SIGNING_KEY%% *}" "$(/bin/date +%s)"; then
-    error "note: could not record this signature in $SIGNATURES_FILE; the next one with this key will need Sign"
-fi
 release_dialog_lock
 flush_gpg_stderr
 /bin/cat "$GPG_STDOUT"

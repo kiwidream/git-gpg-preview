@@ -463,22 +463,29 @@ TOUCH_POLICIES = ('off', 'on', 'fixed', 'cached', 'cached-fixed')
 # preview's facts pane, which does not wrap.
 # Shown with the Sign button when the policy could not be read.
 UNKNOWN_TOUCH_NOTICE = 'Touch policy unknown: Sign to continue'
-# The policies that need a touch, which stays the gate; any other, off or one
-# that could not be read, needs a click on Sign.
-TOUCHED_POLICIES = ('on', 'fixed', 'cached', 'cached-fixed')
-# A cached key skips the touch within 15 seconds of the last one, so a
-# signature within CACHED_TOUCH_WINDOW seconds of the key's previous one, or
-# one whose previous one cannot be told, needs Sign. Must match the wrapper.
-CACHED_POLICIES = ('cached', 'cached-fixed')
-CACHED_TOUCH_WINDOW = 20
-CACHED_TOUCH_NOTICE = 'Touch cached: this signature would not need a touch; Sign to continue'
-# After Sign, GPG keeps this share of sign_timeout_seconds, at most
-# SIGN_GPG_RESERVE seconds, for a touch or the PIN: a later click is refused.
-SIGN_GPG_RESERVE = 30
+# Cached-fixed gets no notice of its own (it cannot be changed), only this with
+# the Sign button. Must match the wrapper.
+CACHED_FIXED_TOUCH_NOTICE = 'Touch policy cached-fixed: one touch signs for 15 seconds; Sign is required.'
+# Only on and fixed make every signature wait for its own touch, so only they
+# keep the touch as the gate. Cached lets one touch sign whatever follows for 15
+# seconds, including touches made outside this service; off needs no touch; a
+# policy that could not be read may be either. All of those need Sign.
+TOUCHED_POLICIES = ('on', 'fixed')
+
+
+def sign_budget(sign_timeout: float) -> tuple[float, float]:
+    """(reserve, least) for a request with SIGN_TIMEOUT seconds. After Sign,
+    GPG keeps the reserve for pinentry and a touch: a minute, the time to type
+    a PIN, find the key and touch it, or a third of a longer timeout, but never
+    more than half. A request needs at least the reserve plus a short read of
+    the preview (10 seconds, a quarter of a short timeout) when its preview
+    would open; less than that is refused as busy."""
+    reserve = min(max(60, sign_timeout // 3), sign_timeout / 2)
+    return reserve, reserve + min(10, sign_timeout / 4)
 TOUCH_NOTICES = {
     'off': 'Touch policy is off: this key signs with no touch.\n'
            'To require one, run: ykman openpgp keys set-touch sig on',
-    'cached': 'Touch policy is cached: a touch also signs what arrives in the next 15 seconds.\n'
+    'cached': 'Touch policy is cached: one touch signs for 15 seconds, so Sign is required.\n'
               'To require a touch for every signature, run: ykman openpgp keys set-touch sig on',
 }
 
@@ -573,7 +580,6 @@ def card_touch_policy(agent: str, key_fpr: str, timeout: float = 10) -> str:
 class ServeConfig:
     def __init__(self, base: Path) -> None:
         self.spam_file = base / 'spam-subjects'
-        self.signatures_file = base / 'last-signatures'
         wrapper = read_kv(base / 'config')
         own = read_kv(base / 'serve')
         self.real_gpg = own.get('real_gpg') or wrapper.get('real_gpg', '')
@@ -595,55 +601,6 @@ class ServeConfig:
             raise RemoteError('real_gpg must name an executable absolute path (run git-gpg-preview install first)')
         if not self.dialog_runner and (not self.ui_helper.startswith('/') or not Path(self.ui_helper).is_file()):
             raise RemoteError('ui_helper must name the installed dialog (run git-gpg-preview install first)')
-
-
-def signature_field(line: bytes) -> list[bytes]:
-    """A line split the way the wrapper's C-locale awk splits it."""
-    return re.findall(rb'[^ \t]+', line)
-
-
-def last_signature(path: Path, key: str) -> int | None:
-    """When KEY last finished a signature, in epoch seconds, as the wrapper's
-    last_signature reads it: None without a usable record (no file, a link or
-    anything but a regular file, no line for KEY, a malformed or pending one)."""
-    try:
-        if path.is_symlink() or not path.is_file():
-            return None
-        data = path.read_bytes()
-    except OSError:
-        return None
-    found = None
-    for line in data.split(b'\n'):
-        fields = signature_field(line)
-        if fields[:1] == [key.encode()]:
-            found = int(fields[1]) if len(fields) == 2 and re.fullmatch(rb'0|[1-9][0-9]{0,17}', fields[1]) else None
-    return found
-
-
-def remember_signature(path: Path, key: str, value: str) -> bool:
-    """Replaces KEY's line with VALUE (epoch seconds, or 'pending' while a
-    signature is under way), atomically and 0600. False, changing nothing,
-    for a link or anything but a regular file, or a file that cannot be
-    replaced."""
-    try:
-        if path.is_symlink() or (path.exists() and not path.is_file()):
-            return False
-        previous = path.read_bytes() if path.exists() else b''
-        kept = [line for line in previous.split(b'\n') if line and signature_field(line)[:1] != [key.encode()]]
-        fd, name = tempfile.mkstemp(prefix=f'.{path.name}.', dir=path.parent)
-    except OSError:
-        return False
-    temporary = Path(name)
-    try:
-        with os.fdopen(fd, 'wb') as stream:
-            stream.write(b''.join(line + b'\n' for line in kept))
-            stream.write(f'{key} {value}\n'.encode())
-        temporary.replace(path)
-        return True
-    except OSError:
-        return False
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def read_decision(path: Path) -> str:
@@ -894,11 +851,12 @@ class Service:
             self.lock.release()
 
     def _busy(self, info, digest, repo, peer) -> dict:
-        """Another request held the signing Mac for this one's whole time."""
+        """Waiting (behind another request, or for a slow key) left this one
+        too little of its time to show a preview and still sign."""
         self.audit('busy', repo, info['type'], digest, peer)
         return {'status': EX_SOFTWARE, 'decision': 'busy', 'stdout': '',
-                'stderr': f'git-gpg-preview: the signing Mac was busy with another signature for '
-                          f'{int(self.config.sign_timeout)}s; refusing to sign\n'}
+                'stderr': f'git-gpg-preview: the signing Mac was busy for most of {int(self.config.sign_timeout)}s, '
+                          f'leaving too little to review and sign; refusing to sign\n'}
 
     def _summary(self, info, args, payload, digest, context, peer) -> str:
         # dialog.jxa splits the preview at the Message: line, so every line
@@ -969,7 +927,11 @@ class Service:
                     return spam
                 # Read under the lock, as the wrapper does: the card is busy
                 # while another request waits for its touch.
-                key, policy = self._touch_policy(started)
+                policy = self._touch_policy(started)
+                # The preview needs a short read and GPG its reserve: a request
+                # that waited too long shows nothing and starts no GPG.
+                if started + config.sign_timeout - time.monotonic() < sign_budget(config.sign_timeout)[1]:
+                    return self._busy(info, digest, repo, peer)
                 notice = TOUCH_NOTICES.get(policy, '')
                 notes = []
                 if notice:
@@ -977,18 +939,12 @@ class Service:
                     if not self._add_touch_notice(paths, notice, summary, details):
                         error('could not add the touch policy notice to the preview or its details')
                         notes.append('could not add the touch policy notice to the preview or its details')
-                # With touch off, or a policy that could not be read, the key may
-                # sign without a touch, so GPG waits for Sign. That follows the
-                # policy read, not the notice files.
-                sign_notice = '' if policy in TOUCHED_POLICIES else notice or UNKNOWN_TOUCH_NOTICE
-                if policy in CACHED_POLICIES and self._touch_skipped(key):
-                    sign_notice = CACHED_TOUCH_NOTICE
+                # Whether GPG waits for Sign follows the policy read, never the
+                # notice files or whether a notice text exists.
+                require_sign = policy not in TOUCHED_POLICIES
+                sign_notice = notice or (CACHED_FIXED_TOUCH_NOTICE if policy == 'cached-fixed' else UNKNOWN_TOUCH_NOTICE)
                 result = self._run_dialog_and_gpg(args, paths, info, digest, repo, peer, started,
-                                                  sign_notice, policy or 'unknown')
-                if policy in CACHED_POLICIES and result['status'] == 0 and result['decision'] == 'sign' \
-                        and not remember_signature(self.config.signatures_file, key, str(int(time.time()))):
-                    notes.append(f'could not record this signature in {self.config.signatures_file}; '
-                                 'the next one with this key will need Sign')
+                                                  require_sign, sign_notice, policy or 'unknown')
                 result['stderr'] = ''.join(f'git-gpg-preview: note from the signing Mac: {note}\n' for note in notes) + result['stderr']
                 return result
 
@@ -1009,47 +965,36 @@ class Service:
                     pass
             return False
 
-    def _touch_skipped(self, key: str) -> bool:
-        """Whether KEY's cached touch could cover this signature: its previous
-        one ended less than CACHED_TOUCH_WINDOW seconds ago, the record of it
-        is missing, unreadable or pending, or the clock moved backwards. The
-        record is set to pending first, and a record that cannot be kept
-        counts as a skipped touch too, so a stale one can never open the way."""
-        last = last_signature(self.config.signatures_file, key)
-        now = int(time.time())
-        kept = remember_signature(self.config.signatures_file, key, 'pending')
-        return not kept or last is None or last > now or now - last < CACHED_TOUCH_WINDOW
-
-    def _touch_policy(self, started: float) -> tuple[str, str]:
-        """The fingerprint and touch policy of the key this service signs with,
-        which is GPG's pick for --local-user FINGERPRINT; empty when they cannot
-        be told. Both lookups share one deadline: 10 seconds from now, since
-        they hold the dialog lock, and within the request's own."""
+    def _touch_policy(self, started: float) -> str:
+        """The touch policy of the key this service signs with, which is GPG's
+        pick for --local-user FINGERPRINT; empty when it cannot be told. Both
+        lookups share one deadline: 10 seconds from now, since they hold the
+        dialog lock, and within the request's own."""
         deadline = min(time.monotonic() + 10, started + self.config.sign_timeout)
-        nothing = ('', '')
+        if deadline <= time.monotonic():
+            return ''
         agent = gpg_connect_agent(self.config.real_gpg)
         if not agent:
-            return nothing
+            return ''
         try:
             listing = subprocess.run([self.config.real_gpg, '--batch', '--with-colons', '--list-secret-keys', '--',
                                       self.service_fingerprint()],
                                      stdin=subprocess.DEVNULL, capture_output=True, timeout=deadline - time.monotonic())
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            return nothing
+        except (OSError, subprocess.TimeoutExpired):
+            return ''
         if listing.returncode:
-            return nothing
+            return ''
         key = selected_signing_key(listing.stdout.decode('utf-8', 'replace'), time.time())
         if not key.endswith(' card'):
-            return nothing
-        fingerprint = key.split()[0]
-        return fingerprint, card_touch_policy(agent, fingerprint, deadline - time.monotonic())
+            return ''
+        return card_touch_policy(agent, key.split()[0], deadline - time.monotonic())
 
     def _await_sign_click(self, dialog, stop, paths, info, digest, repo, peer, started, policy) -> dict | None:
         """The wrapper's await_sign_click: waits for the preview to close, until
         the request's time less GPG's reserve for a touch or the PIN. None after
         Sign; otherwise the refusal to return, since GPG has not started and
         nothing can be signed."""
-        reserve = min(SIGN_GPG_RESERVE, self.config.sign_timeout / 4)
+        reserve = sign_budget(self.config.sign_timeout)[0]
         while dialog.poll() is None and time.monotonic() - started <= self.config.sign_timeout - reserve:
             time.sleep(0.1)
         if dialog.poll() is None:
@@ -1089,10 +1034,12 @@ class Service:
                 pass
             time.sleep(0.05)
 
-    def _run_dialog_and_gpg(self, args, paths, info, digest, repo, peer, started, sign_notice='', policy='') -> dict:
+    def _run_dialog_and_gpg(self, args, paths, info, digest, repo, peer, started,
+                            require_sign=False, sign_notice='', policy='') -> dict:
         """Shows the preview and runs GPG, both within sign_timeout_seconds of
-        STARTED. With a SIGN_NOTICE (touch POLICY off or unknown) the preview
-        asks for Sign, and GPG starts only after it."""
+        STARTED. With REQUIRE_SIGN (touch POLICY off, cached or unknown) the
+        preview asks for Sign, showing SIGN_NOTICE, and GPG starts only after
+        it."""
         config = self.config
         if config.dialog_runner:
             dialog_cmd = [config.dialog_runner]
@@ -1100,7 +1047,7 @@ class Service:
             dialog_cmd = ['/usr/bin/osascript', '-l', 'JavaScript', config.ui_helper]
         dialog_cmd += [str(paths['summary.txt']), str(paths['details.txt']), str(paths['decision']), str(paths['ready'])]
         dialog_cmd.append('mark-spam' if spam_subject(paths['payload'].read_bytes()) else '')
-        if sign_notice:
+        if require_sign:
             dialog_cmd += ['require-sign', sign_notice]
         dialog = subprocess.Popen(dialog_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         deadline = min(time.monotonic() + 5, started + config.sign_timeout)
@@ -1116,7 +1063,7 @@ class Service:
                     proc.kill()
                     proc.wait()
 
-        if sign_notice:
+        if require_sign:
             refused = self._await_sign_click(dialog, stop, paths, info, digest, repo, peer, started, policy)
             if refused:
                 return refused
@@ -1165,11 +1112,12 @@ class Service:
         if outcome == 'timeout':
             stop(gpg)
             stop(dialog)
-            self.audit('timeout', repo, info['type'], digest, peer)
             # After Sign the preview is closed, so the operator saw nothing wait.
-            message = ('not signed: no touch or PIN before the deadline' if sign_notice
-                       else f'no hardware confirmation within {int(config.sign_timeout)}s; refusing to sign')
-            return {'status': EX_SOFTWARE, 'decision': 'timeout', 'stdout': '', 'stderr': f'git-gpg-preview: {message}\n'}
+            # The audit names match the wrapper's.
+            decision, message = (('gpg-timeout', 'not signed: no touch or PIN before the deadline') if require_sign else
+                                 ('timeout', f'no hardware confirmation within {int(config.sign_timeout)}s; refusing to sign'))
+            self.audit(decision, repo, info['type'], digest, peer)
+            return {'status': EX_SOFTWARE, 'decision': decision, 'stdout': '', 'stderr': f'git-gpg-preview: {message}\n'}
 
         stdout, stderr = gpg.communicate(timeout=30)
         # gpg finishing first does not override the operator: a Cancel pressed

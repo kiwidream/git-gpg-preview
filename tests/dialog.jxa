@@ -169,6 +169,15 @@ function run(argv) {
             if (room < Math.min(lines.length, 12) * factLine + scrollBar) throw new Error('A wide fact leaves no room for the scroll bar: ' + room);
             if (facts.documentView.textContainer.widthTracksTextView) throw new Error('A wide fact wraps');
         });
+    // Past twelve lines a vertical scroll bar narrows the pane: an 80-column fact
+    // then scrolls sideways too, and its scroll bar needs room.
+    const manyFacts = function(count, fact) {
+        const lines = [fact];
+        for (let i = 1; i < count; i++) lines.push('Fact ' + i);
+        return previewPanes(lines.join('\n') + '\n\nMessage:\nSubject').subviews.objectAtIndex(1);
+    };
+    if (Number(manyFacts(13, 'x'.repeat(80)).contentSize.height) < 12 * factLine + scrollBar) throw new Error('No room for the scroll bar beside a vertical one');
+    if (Number(manyFacts(12, 'x'.repeat(80)).frame.size.height) !== Number(manyFacts(12, 'Fact').frame.size.height)) throw new Error('Room for a scroll bar that 12 lines do not need');
     // The scroll bar room starts at 81 columns: 80 fit across the pane.
     const factsHeight = function(fact) {
         return Number(previewPanes(fact + '\n\nMessage:\nSubject').subviews.objectAtIndex(1).frame.size.height);
@@ -216,9 +225,14 @@ function run(argv) {
     });
     // The notice is shown once: when the facts already hold it, the Sign text
     // does not repeat it. A message that quotes it does not count.
+    // Nor does a fact that merely contains it, such as a crafted branch name.
+    const unknownNotice = 'Touch policy unknown: Sign to continue';
     [
-        {summary: notice + '\n\nRequest type: commit\n\nMessage:\nSubject', repeated: false},
-        {summary: 'Request type: commit\n\nMessage:\n' + notice, repeated: true}
+        {summary: notice + '\n\nRequest type: commit\n\nMessage:\nSubject', notice: notice, repeated: false},
+        {summary: 'PIN attempt 2: wrong\n\n' + notice + '\n\nRequest type: commit\n\nMessage:\nSubject', notice: notice, repeated: false},
+        {summary: 'Request type: commit\n\nMessage:\n' + notice, notice: notice, repeated: true},
+        {summary: 'Request type: commit\nBranch: x ' + unknownNotice + '\n\nMessage:\nSubject', notice: unknownNotice, repeated: true},
+        {summary: 'Request type: commit\nBranch: ' + unknownNotice + '\n\nMessage:\nSubject', notice: unknownNotice, repeated: true}
     ].forEach(function(test) {
         $.NSString.stringWithString(test.summary).writeToFileAtomicallyEncodingError(summary, true, $.NSUTF8StringEncoding, null);
         $.NSData.data.writeToFileAtomically(decision, true);
@@ -226,11 +240,20 @@ function run(argv) {
         expectedSign = true;
         responses = [1002];
         panesSeen = [];
-        runPreview([summary, details, decision, ready, '', 'require-sign', notice]);
+        runPreview([summary, details, decision, ready, '', 'require-sign', test.notice]);
         expectedSign = false;
         const info = panesSeen[0].info;
-        if ((info.indexOf(notice) >= 0) !== test.repeated || info.indexOf('until you click Sign') < 0) throw new Error('Notice shown twice or not at all: ' + info);
+        if ((info.indexOf(test.notice) >= 0) !== test.repeated || info.indexOf('until you click Sign') < 0) throw new Error('Notice shown twice or not at all: ' + info);
     });
+    // The signer decides that Sign is required; an empty notice changes only the text.
+    $.NSString.stringWithString('Request type: commit\n\nMessage:\nSubject').writeToFileAtomicallyEncodingError(summary, true, $.NSUTF8StringEncoding, null);
+    $.NSData.data.writeToFileAtomically(decision, true);
+    expectedSign = true;
+    responses = [1002];
+    panesSeen = [];
+    runPreview([summary, details, decision, ready, '', 'require-sign', '']);
+    expectedSign = false;
+    if (readText(decision) !== 'sign' || panesSeen[0].info.indexOf('Your key may sign') !== 0) throw new Error('An empty notice: ' + JSON.stringify(panesSeen[0].info));
     $.NSString.stringWithString('Request type: commit\n\nMessage:\nNoisy subject').writeToFileAtomicallyEncodingError(summary, true, $.NSUTF8StringEncoding, null);
     // Only the exact argument require-sign asks for Sign.
     ['require-sign ', 'Require-Sign', 'yes'].forEach(function(flag) {
@@ -302,5 +325,5 @@ function run(argv) {
             if (!seen.secure) throw new Error(where + 'PIN field is not secure');
         });
     });
-    return 'Dialog actions passed (51 cases)';
+    return 'Dialog actions passed (57 cases)';
 }
