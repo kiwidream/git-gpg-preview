@@ -49,12 +49,25 @@ if signing and '--verify' not in args and os.environ.get('FAKE_TOUCH_FILE'):
         f.write('before\n' if touch.exists() else 'after\n')
     # FAKE_GPG_SLOW: seconds the operator takes over the PIN and touch.
     time.sleep(float(os.environ.get('FAKE_GPG_SLOW', '0')))
+    # FAKE_CARD_QUEUE: the card's operations, one payload hash per line. A call
+    # stopped before the touch leaves its line, as gpg-agent and scdaemon keep a
+    # stopped GPG's request, until SCD KILLSCD clears it; a touch completes the
+    # oldest one, whoever asked.
+    queue = os.environ.get('FAKE_CARD_QUEUE')
+    if queue:
+        with open(queue, 'a') as f:
+            f.write(hashlib.sha256(payload).hexdigest() + '\n')
     deadline = time.monotonic() + 10
     while not touch.exists():
         if time.monotonic() > deadline:
             sys.stderr.write('fake-gpg: timed out waiting for touch\n')
             sys.exit(2)
         time.sleep(0.05)
+    if queue:
+        lines = Path(queue).read_text().splitlines()
+        Path(queue).write_text(''.join(line + '\n' for line in lines[1:]))
+        sys.stdout.write(f'signed:{lines[0] if lines else ""}')
+        sys.exit(0)
 sys.stdout.write(os.environ.get('FAKE_GPG_STDOUT', ''))
 sys.stdout.flush()
 sys.stderr.write(os.environ.get('FAKE_GPG_STDERR', ''))

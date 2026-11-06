@@ -1034,6 +1034,18 @@ GATE_WRAPPER="$TMP/short-wrapper" gate_case --status-fd=2 -bsau TEST
     fail "touch off, no touch after Sign: $pin_status after $((SECONDS - gate_started))s"
 grep -qxF 'git-gpg-preview: not signed: no touch or PIN before the deadline' "$TMP/pin.stderr" || fail "no touch after Sign: $(cat "$TMP/pin.stderr")"
 grep -qF 'decision=gpg-timeout' "$TMP/audit.log" || fail 'no touch after Sign: not audited'
+# The card operation the stopped GPG left behind ends with it, before the next
+# request: that request's touch signs that request, not the stale one.
+export FAKE_CARD_QUEUE="$TMP/card-queue"
+: > "$FAKE_CARD_QUEUE"
+GATE_WRAPPER="$TMP/short-wrapper" gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 70 ]] || fail "a stopped signature: $pin_status"
+grep -qxF 'SCD KILLSCD /bye' "$FAKE_GPG_CALL_DIR/connect-agent-calls" || fail 'the stopped signature was left pending at the card'
+export FAKE_DIALOG_DECISION=sign
+GATE_PAYLOAD="$TMP/initial.payload" gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 0 && "$pin_output" == "signed:$(shasum -a 256 "$TMP/initial.payload" | awk '{print $1}')" ]] ||
+    fail "the next touch went to the stopped signature: $pin_status, $pin_output"
+unset FAKE_CARD_QUEUE
 # A slow PIN and touch within SIGN_GPG_SECONDS sign, and the real allowance
 # leaves a person time to type a PIN, find the key and touch it.
 [[ $(sed -n 's/^SIGN_GPG_SECONDS=//p' "$ROOT/git-gpg-preview") -ge 60 ]] || fail 'too little time after Sign for a PIN and a touch'

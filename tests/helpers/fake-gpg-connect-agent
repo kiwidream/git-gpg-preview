@@ -5,6 +5,7 @@
 # signature slot (unset: no card) and FAKE_CARD_UIF the raw UIF-1 value as
 # scdaemon escapes it, such as "%01+" for touch policy on. Until SERIALNO
 # selects the OpenPGP application, another one (PIV, say) answers GETATTR.
+# SCD KILLSCD empties FAKE_CARD_QUEUE, the card's pending operations.
 # FAKE_CONNECT_AGENT_EXIT is the exit status after answering.
 
 set -u
@@ -36,6 +37,11 @@ for command in "$@"; do
             else
                 printf 'ERR 100663354 No such object <SCD>\n'
             fi
+            ;;
+        'SCD KILLSCD')
+            # scdaemon stops: every operation queued at the card ends.
+            [[ -z "${FAKE_CARD_QUEUE-}" ]] || : > "$FAKE_CARD_QUEUE"
+            printf 'OK\n'
             ;;
         *) printf 'ERR 69 Unknown IPC command <User defined source 1>\n' ;;
     esac

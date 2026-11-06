@@ -1023,23 +1023,35 @@ class Service:
         return decision.with_name(decision.name + '.deciding')
 
     def _await_pending_decision(self, paths) -> None:
+        """Gives an answer the preview began to write, as its marker shows, a
+        moment to land. Read with the one rule for answers, read_decision."""
         if not self._deciding_marker(paths).exists():
             return
         deadline = time.monotonic() + DECISION_GRACE_SECONDS
         while time.monotonic() < deadline:
-            try:
-                if paths['decision'].read_text().strip():
-                    return
-            except OSError:
-                pass
+            if read_decision(paths['decision']):
+                return
             time.sleep(0.05)
+
+    def _cancel_card_operation(self) -> None:
+        """The wrapper's cancel_card_operation: a GPG stopped mid-signature
+        leaves its request, and any PIN request, with gpg-agent and scdaemon,
+        and the next touch would complete it or find the card busy. Stopping
+        scdaemon ends both, before the dialog lock goes to the next request."""
+        agent = gpg_connect_agent(self.config.real_gpg)
+        if not agent:
+            return
+        try:
+            subprocess.run([agent, 'SCD KILLSCD', '/bye'], stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
     def _run_dialog_and_gpg(self, args, paths, info, digest, repo, peer, started,
                             require_sign=False, sign_notice='', policy='') -> dict:
         """Shows the preview and runs GPG, both within sign_timeout_seconds of
-        STARTED. With REQUIRE_SIGN (touch POLICY off, cached or unknown) the
-        preview asks for Sign, showing SIGN_NOTICE, and GPG starts only after
-        it."""
+        STARTED. With REQUIRE_SIGN (touch POLICY off, cached, cached-fixed or
+        unknown; only on and fixed keep the touch as the gate) the preview asks
+        for Sign, showing SIGN_NOTICE, and GPG starts only after it."""
         config = self.config
         if config.dialog_runner:
             dialog_cmd = [config.dialog_runner]
@@ -1112,6 +1124,7 @@ class Service:
         if outcome == 'timeout':
             stop(gpg)
             stop(dialog)
+            self._cancel_card_operation()
             # After Sign the preview is closed, so the operator saw nothing wait.
             # The audit names match the wrapper's.
             decision, message = (('gpg-timeout', 'not signed: no touch or PIN before the deadline') if require_sign else

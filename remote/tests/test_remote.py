@@ -666,7 +666,7 @@ class TouchPolicyTests(unittest.TestCase):
         (self.gnupg / 'gpg').symlink_to(HELPERS / 'fake-gpg.py')
         (self.gnupg / 'gpg-connect-agent').symlink_to(HELPERS / 'fake-gpg-connect-agent.py')
         self.card = self.tmp / 'card'
-        self.repo, _, self.payload = fixture_repo(self.tmp)
+        self.repo, self.initial, self.payload = fixture_repo(self.tmp)
 
     def harness(self, name: str, real_gpg: Path | None = None, card_keys: str = CARD_SUB, extra_env: dict | None = None,
                 serve_extra: str = '') -> Harness:
@@ -1016,6 +1016,53 @@ class TouchPolicyTests(unittest.TestCase):
         self.assertLess(elapsed, 8.6, 'the wait for the lock was not counted')
         self.assertEqual((result.returncode, result.stdout), (remote.EX_SOFTWARE, b''))
         self.assertIn(b'no hardware confirmation within 8s', result.stderr)
+
+    def test_a_stopped_signature_does_not_wait_at_the_card_for_the_next_touch(self):
+        """After GPG is stopped for want of a touch, with Sign or without, the
+        operation it left at the card is cancelled: the next request's touch
+        signs that request, not the stale one."""
+        for uif in ('%00+', '%01+'):
+            with self.subTest(uif=uif):
+                queue = self.tmp / f'card-queue{uif[2]}'
+                queue.write_text('')
+                h = self.harness(f'stopped{uif[2]}', extra_env={'FAKE_CARD_QUEUE': str(queue)})
+                h.decision.write_text('approve-no-touch')
+                self.card.write_text(f'{self.CARD_SUB} {uif}')
+                result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+                self.assertEqual((result.returncode, result.stdout), (remote.EX_SOFTWARE, b''))
+                self.assertIn('SCD KILLSCD /bye', (h.calls / 'connect-agent-calls').read_text().splitlines())
+                h.decision.write_text('sign')
+                result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.initial, self.repo)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, f'signed:{remote.hashlib.sha256(self.initial).hexdigest()}'.encode(),
+                                 'the next touch went to the stopped signature')
+
+    def test_a_pending_answer_is_read_with_the_one_rule(self):
+        """An answer the preview began (its marker exists) is awaited as
+        read_decision reads it: 'sign ' and 'sign\\n' are answers but no Sign,
+        an empty file is none yet, and bytes that are not UTF-8 do not break
+        the wait. Such an answer after a touch releases nothing."""
+        service = remote.Service.__new__(remote.Service)
+        decision = self.tmp / 'decision'
+        (self.tmp / 'decision.deciding').write_text('')
+        for data, waits, read in ((b'sign ', False, 'invalid'), (b'sign\n', False, 'invalid'),
+                                  (b'\xff\xfe', False, '\ufffd\ufffd'), (b'', True, '')):
+            with self.subTest(data=data):
+                decision.write_bytes(data)
+                started = time.monotonic()
+                service._await_pending_decision({'decision': decision})
+                self.assertEqual(time.monotonic() - started >= remote.DECISION_GRACE_SECONDS * 0.9, waits)
+                self.assertEqual(remote.read_decision(decision), read)
+        for index, answer in enumerate(('marker-raw:sign ', 'marker-raw:sign\\n')):
+            with self.subTest(answer=answer):
+                h = self.harness(f'pending{index}')
+                h.decision.write_text(answer)
+                self.card.write_text(f'{self.CARD_SUB} %01+')
+                result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+                # Refused as unfinished or as no valid answer, whichever of the
+                # preview and GPG ends first; never signed.
+                self.assertEqual((result.returncode, result.stdout), (remote.EX_SOFTWARE, b''), result.stderr)
+                self.assertNotIn('decision=sign\n', h.audit.read_text())
 
     def test_too_little_time_left_after_the_queue_is_refused_as_busy(self):
         """A lock wait that leaves less than a short read of the preview plus

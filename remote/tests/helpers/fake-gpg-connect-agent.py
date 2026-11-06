@@ -33,6 +33,11 @@ for command in sys.argv[1:]:
         print(f'S KEY-FPR 1 {card}\nS KEY-FPR 2 DDDD000000000000000000000000000000000002\nOK')
     elif command == 'SCD GETATTR UIF-1':
         print(f'S UIF-1 {uif}\nOK' if uif else 'ERR 100663354 No such object <SCD>')
+    elif command == 'SCD KILLSCD':
+        # scdaemon stops: every operation queued at the card ends.
+        if os.environ.get('FAKE_CARD_QUEUE'):
+            Path(os.environ['FAKE_CARD_QUEUE']).write_text('')
+        print('OK')
     else:
         print('ERR 69 Unknown IPC command <User defined source 1>')
 sys.exit(int(os.environ.get('FAKE_CONNECT_AGENT_EXIT', '0')))

@@ -314,9 +314,10 @@ function run(argv) {
     const readyPath = argv.length > 3 ? argv[3] : '';
     // Explicit capabilities from the signer; never infer them from payload text.
     const canMarkSpam = argv.length > 4 && argv[4] === 'mark-spam';
-    // With touch policy off, or one the signer could not read, the key may sign
-    // without a touch, so the signer starts GPG only after Sign here; the notice
-    // comes with the request.
+    // With touch policy off, cached, cached-fixed, or one the signer could not
+    // read, the key may sign without a touch of its own, so the signer starts
+    // GPG only after Sign here; the notice comes with the request. Only on and
+    // fixed keep the touch as the gate, and get no Sign button.
     const requireSign = argv.length > 5 && argv[5] === 'require-sign';
     const signNotice = argv.length > 6 ? String(argv[6]) : '';
     // Shown once: above the facts when the signer could write it there, and

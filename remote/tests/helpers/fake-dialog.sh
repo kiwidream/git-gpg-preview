@@ -34,6 +34,7 @@ touched() {
 case "$choice" in
     raw:*) touched; printf '%b' "${choice#raw:}" > "$decision" ;;   # exactly these bytes, no marker
     marker-sign) touched; : > "$decision.deciding"; printf 'sign' > "$decision" ;;
+    marker-raw:*) touched; : > "$decision.deciding"; printf '%b' "${choice#marker-raw:}" > "$decision" ;;
     early-sign) touched; printf 'sign' > "$decision"; sleep 30 ;;   # answers, but the window stays open
     sign)
         sha=$(sed -n 's/^SHA-256: //p' "$summary" | head -n 1)

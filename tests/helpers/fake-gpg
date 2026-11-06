@@ -119,6 +119,14 @@ if [[ "$signing" -eq 1 && "$verify" -eq 0 ]]; then
 fi
 # FAKE_GPG_SLOW: seconds the operator takes over the PIN and touch.
 [[ -z "${FAKE_GPG_SLOW-}" ]] || sleep "$FAKE_GPG_SLOW"
+# FAKE_CARD_QUEUE: the card's operations, one payload hash per line. Each
+# signing call queues its own; a call stopped before the touch leaves its line
+# there, as gpg-agent and scdaemon keep a stopped GPG's request, until
+# SCD KILLSCD clears it. A touch completes the oldest one, whoever asked.
+if [[ "$signing" -eq 1 && "$verify" -eq 0 && -n "${FAKE_CARD_QUEUE-}" && -n "${FAKE_TOUCH_FILE-}" ]]; then
+    queued=$(shasum -a 256 "$payload" | awk '{print $1}')
+    printf '%s\n' "$queued" >> "$FAKE_CARD_QUEUE"
+fi
 if [[ "$signing" -eq 1 && "$verify" -eq 0 && -n "${FAKE_TOUCH_FILE-}" ]]; then
     sha=$(shasum -a 256 "$payload" | awk '{print $1}')
     touch_file="$FAKE_TOUCH_FILE.$sha"
@@ -131,6 +139,12 @@ if [[ "$signing" -eq 1 && "$verify" -eq 0 && -n "${FAKE_TOUCH_FILE-}" ]]; then
             exit 2
         fi
     done
+    if [[ -n "${FAKE_CARD_QUEUE-}" ]]; then
+        completed=$(head -n 1 "$FAKE_CARD_QUEUE")
+        sed -i.old 1d "$FAKE_CARD_QUEUE" && rm -f "$FAKE_CARD_QUEUE.old"
+        printf 'signed:%s' "$completed"
+        exit 0
+    fi
 fi
 
 printf '%s\0' "$@" > "$args"

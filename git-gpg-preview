@@ -639,6 +639,18 @@ prepend_touch_notice() {
     error "note: could not add the touch policy notice to the preview or its details"
 }
 
+# Ends what a GPG stopped mid-signature left at the card. gpg-agent and
+# scdaemon keep its request, and any PIN request scdaemon made, alive: the next
+# touch would complete that stale operation, or find the card busy. Stopping
+# scdaemon, as gpgconf --kill scdaemon does, ends both; gpg-agent starts it
+# again for the next request, which may ask for the PIN again. Bounded, and
+# done before the dialog lock goes to the next request.
+cancel_card_operation() {
+    local agent
+    agent=$(gpg_connect_agent) || return 0
+    run_query /dev/null "$agent" 'SCD KILLSCD' /bye || true
+}
+
 # Whether the request names its own home directory, keyring or options file.
 # What this wrapper looks up would then describe keys GPG does not use.
 names_own_gnupg_files() {
@@ -725,9 +737,10 @@ read_decision() {
     fi
 }
 
-# With touch off or unknown, GPG starts only after the operator clicks Sign:
-# the key could otherwise sign the moment GPG asked it, before anyone could
-# read the preview.
+# With touch off, cached, cached-fixed or unknown, GPG starts only after the
+# operator clicks Sign: the key could otherwise sign the moment GPG asked it,
+# before anyone could read the preview. Only on and fixed keep the touch as
+# the gate.
 # Waits for the preview to close, at most SIGN_CLICK_SECONDS. Anything but Sign
 # (Cancel, Mark as Spam, a window closed without an answer, or no answer in
 # time) ends the request unsigned, and GPG never started.
@@ -1154,11 +1167,12 @@ reject_spam_subject
 # GPG before it can produce a signature, so Git aborts. The physical
 # confirmation, not a software button, is the authorization gate.
 #
-# Except with touch policy off, or one that could not be read: then the key may
-# need no touch, and GPG would sign before the preview could be read. The
-# preview then has a Sign button, which is the gate: GPG starts only after Sign
-# is clicked, and Cancel, a closed window or no click within SIGN_CLICK_SECONDS
-# leaves the request unsigned.
+# Except with touch policy off, cached, cached-fixed, or one that could not be
+# read: then the key may sign without a touch of its own, and GPG would sign
+# before the preview could be read. The preview then has a Sign button, which
+# is the gate: GPG starts only after Sign is clicked, and Cancel, a closed
+# window or no click within SIGN_CLICK_SECONDS leaves the request unsigned.
+# Only on and fixed keep the touch as the gate.
 #
 # The preview is started first and reports readiness; only then is GPG
 # engaged. This ordering means the PIN prompt (the PIN window or pinentry) launches last and
@@ -1308,6 +1322,7 @@ while :; do
                         wait "$GPG_PID" 2>/dev/null || true
                         CHILD_PID=""
                         dismiss_pin_entry
+                        cancel_card_operation
                         release_dialog_lock
                         audit_decision "gpg-timeout" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
                         error "not signed: no touch or PIN before the deadline"
