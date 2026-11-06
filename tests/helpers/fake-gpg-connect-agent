@@ -11,7 +11,9 @@
 # the card's pending operations, and that cache. Options (--hex, --homedir DIR)
 # are skipped. FAKE_KILLSCD_SLEEP delays SCD KILLSCD (a wedged scdaemon), and
 # FAKE_CARD_APDU_SW is the status word the APDU reply ends with (90 00: done).
-# FAKE_CONNECT_AGENT_EXIT is the exit status after answering.
+# FAKE_CONNECT_AGENT_EXIT is the exit status after answering. FAKE_CARD_LIST holds
+# the serial numbers GETINFO card_list reports; unset, the command is refused, as
+# GnuPG 2.2 does.
 
 set -u
 umask 077
@@ -58,6 +60,14 @@ for command in "$@"; do
                 printf 'D[0000]  %s 20 %s                                         . ..\nOK\n' "${BASH_REMATCH[1]}" "${FAKE_CARD_APDU_SW:-90 00}"
             else
                 printf 'ERR 100663354 No such object <SCD>\n'
+            fi
+            ;;
+        'SCD GETINFO card_list')
+            if [[ -n "${FAKE_CARD_LIST+set}" ]]; then
+                for serial in $FAKE_CARD_LIST; do printf 'S SERIALNO %s\n' "$serial"; done
+                printf 'OK\n'
+            else
+                printf 'ERR 69 Unknown IPC command <User defined source 1>\n'
             fi
             ;;
         'SCD KILLSCD')

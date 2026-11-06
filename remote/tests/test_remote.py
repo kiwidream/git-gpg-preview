@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import unittest.mock
@@ -589,6 +590,39 @@ class RemoteSigningTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(b'--local-user', b'\0'.join(self.h.gpg_calls()[-1][0]))
 
+    def test_a_request_names_one_key_and_u_ends_its_bundle(self):
+        """GPG reads -ub as -u b and signs with every key named, so any other
+        shape could add a signer of the request's own choosing beside the pinned
+        key, and the touch would authorize a key nobody was shown."""
+        key = '3DB3F5612E33B6BC'
+        for args in (['--status-fd=2', '-ub', '-bsau', key],
+                     ['--status-fd=2', '-bsaub', key],
+                     ['--status-fd=2', '-bsua', key],
+                     ['--status-fd=2', '-uu', key],
+                     ['--status-fd=2', '-bsau', key, '-u', key],
+                     ['--status-fd=2', '-u', key, '-u', key],
+                     ['--status-fd=2', '-bsau', key, '--local-user', key],
+                     ['--status-fd=2', '-bsau', key, '--local-user=x'],
+                     ['--status-fd=2', '--local-user=x', '-bsau', key],
+                     ['--status-fd=2', '-bsau', key, f'--local-user={key}'],
+                     ['--status-fd=2', '-bsau', key, '--default-key', key],
+                     ['--status-fd=2', '-bsau', key, f'--default-key={key}']):
+            with self.subTest(args=args):
+                code, body = self.h.post({'version': 1, 'args': args, 'payload': base64.b64encode(self.second).decode(), 'context': {}})
+                self.assertEqual((code, body['status'], body['decision']), (200, 65, 'refused'), body)
+                self.assertEqual(self.h.gpg_calls(), [], 'GPG started')
+                self.assertEqual(list(self.h.captures.iterdir()), [], 'a preview opened')
+                with self.assertRaises(remote.RemoteError):
+                    remote.validate_signing_args(args)
+        # The shapes Git sends and the README documents still pass.
+        for args in (['--status-fd=2', '-bsau', key], ['--status-fd', '2', '-bsau', key], ['--status-fd=2', '-bsa', '-u', key],
+                     ['--detach-sign', '--armor', '--local-user', key], ['--detach-sign', '--armor', f'--local-user={key}'],
+                     ['--status-fd=2', '-bsa']):
+            with self.subTest(args=args):
+                remote.validate_signing_args(args)
+                self.assertEqual(remote.pin_key_selector(args, '041CE6A7BED57FE579D43B6C3DB3F5612E33B6BC')[-2:],
+                                 ['--local-user', '041CE6A7BED57FE579D43B6C3DB3F5612E33B6BC'])
+
     def test_service_refuses_arguments_git_never_sends(self):
         for args in (['--status-fd=2', '-bsau', 'K', '--homedir', '/tmp/x'],
                      ['--status-fd=2', '-bsau', '--output'],
@@ -677,7 +711,7 @@ class TouchPolicyTests(unittest.TestCase):
         self.addCleanup(h.stop)
         return h
 
-    def sign(self, h: Harness, card: str) -> tuple[str, str]:
+    def sign(self, h: Harness, card: str, selector: str = '3DB3F5612E33B6BC') -> tuple[str, str]:
         """Signs through the client with CARD in the reader: its signature key
         and raw UIF-1 value, or '' for no card. Returns the preview summary
         and the client's stderr, after checking that neither they nor the
@@ -686,7 +720,7 @@ class TouchPolicyTests(unittest.TestCase):
             self.card.write_text(card)
         else:
             self.card.unlink(missing_ok=True)
-        result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+        result = h.client(['--status-fd=2', '-bsau', selector], self.payload, self.repo)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, b'signature:remote')
         summary, details = h.latest_capture()
@@ -850,6 +884,112 @@ class TouchPolicyTests(unittest.TestCase):
                 self.assertIn(f'not signed: touch policy is {policy} and Sign was not clicked'.encode(), result.stderr)
                 self.assertEqual((h.gpg_calls(), self.touch_at_start(h)), ([], []))
 
+    def test_any_other_signing_key_in_the_certificate_needs_sign(self):
+        """GnuPG 2.3 and later may sign with the certificate's software signing
+        key, whose passphrase may be cached, with no touch, and a key on another
+        card signs under that card's policy: on and fixed keep the touch as the
+        gate only when the card's slot-1 key, whose policy was read, is the only
+        usable signing key. A key GPG cannot pick does not count, and that takes in
+        a primary key while a subkey can sign, whatever its kind. Kind mixed says
+        so whatever the policy, with no advice to change it, and its refusal
+        says so too."""
+        soft, other_card = '5' * 40, 'B' * 40
+        mixed = f'{self.PRIMARY}/{self.CARD_SUB}/{soft}'
+        needs_sign = 'require-sign\n' + remote.OTHER_KEY_NOTICE
+        for name, keys, extra, uif, gate in (
+                ('on', mixed, {}, '%01+', needs_sign),
+                ('fixed', mixed, {}, '%02+', needs_sign),
+                ('stub primary', f'{self.PRIMARY}/{self.CARD_SUB}', {'FAKE_GPG_STUB_KEYS': self.PRIMARY}, '%01+', '\n'),
+                ('card primary', f'{self.PRIMARY}/{self.CARD_SUB}',
+                 {'FAKE_GPG_CARD_KEYS': f'{self.PRIMARY},{self.CARD_SUB}'}, '%01+', '\n'),
+                ('two card subkeys', f'{self.PRIMARY}/{self.CARD_SUB}/{other_card}',
+                 {'FAKE_GPG_CARD_KEYS': f'{self.CARD_SUB},{other_card}'}, '%01+', needs_sign),
+                ('off', mixed, {}, '%00+', needs_sign),
+                ('cached', mixed, {}, '%03+', needs_sign),
+                ('cached-fixed', mixed, {}, '%04+', needs_sign),
+                ('software pick', f'{self.PRIMARY}/{soft}/{self.CARD_SUB}', {}, '%01+', needs_sign),
+                ('software primary', f'{self.PRIMARY}/{self.CARD_SUB}', {}, '%01+', '\n')):
+            with self.subTest(name):
+                h = self.harness(name.replace(' ', '-'), extra_env={'FAKE_GPG_SECRET_KEYS': keys, **extra})
+                h.decision.write_text('delayed-sign')
+                summary, stderr = self.sign(h, f'{self.CARD_SUB} {uif}')
+                self.assertEqual(self.gate(h), gate)
+                self.assertEqual(self.touch_at_start(h), ['after' if gate == '\n' else 'before'])
+                self.assertNotIn('ykman', summary + stderr)
+        for uif, in (('%01+',), ('%00+',)):
+            with self.subTest(refused=uif):
+                h = self.harness(f'cancel-{uif[1:3]}', extra_env={'FAKE_GPG_SECRET_KEYS': mixed})
+                h.decision.write_text('cancel')
+                self.card.write_text(f'{self.CARD_SUB} {uif}')
+                result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+                self.assertEqual((result.returncode, result.stdout), (remote.EX_CANCELLED, b''))
+                self.assertIn(b'git-gpg-preview: not signed: GPG could sign with more than one key '
+                              b'and Sign was not clicked\n', result.stderr)
+                self.assertNotIn(b'touch policy is', result.stderr)
+                self.assertEqual((h.gpg_calls(), self.touch_at_start(h)), ([], []))
+
+    def test_every_certificate_the_selector_matches_counts(self):
+        """GPG need not choose the first certificate a selector matches, so
+        another with a different signing key, in software or on another card, needs
+        Sign. One listing only the same key leaves the touch as the gate. The
+        service names a fingerprint and refuses a user ID, so this takes a second
+        certificate listed for that fingerprint once the service has started."""
+        soft, other_card = '5' * 40, 'B' * 40
+        for name, also, card_keys, gate in (
+                ('software', f'{self.OTHER}/{soft}', self.CARD_SUB, 'require-sign\n' + remote.OTHER_KEY_NOTICE),
+                ('another-card', f'{self.OTHER}/{other_card}', f'{self.CARD_SUB},{other_card}',
+                 'require-sign\n' + remote.OTHER_KEY_NOTICE),
+                ('same-key', f'{self.OTHER}/{self.CARD_SUB}', self.CARD_SUB, '\n')):
+            with self.subTest(name):
+                listed = self.tmp / f'also-{name}'
+                h = self.harness(f'also-{name}-home', card_keys=card_keys, extra_env={'FAKE_GPG_ALSO_MATCHES': str(listed)})
+                listed.write_text(also)
+                h.decision.write_text('delayed-sign')
+                self.sign(h, f'{self.CARD_SUB} %01+')
+                self.assertEqual(self.gate(h), gate)
+                self.assertEqual(self.touch_at_start(h), ['after' if gate == '\n' else 'before'])
+
+    def test_a_trailing_bang_does_not_narrow_the_certificate(self):
+        """The service drops a selector's !, so GPG may sign with any usable
+        signing key in the certificate, and the whole certificate decides even
+        when a card key was named exactly."""
+        soft = '5' * 40
+        for name, keys, card_keys, named, gate in (
+                ('card only', f'{self.PRIMARY}/{self.CARD_SUB}', self.CARD_SUB, self.CARD_SUB, '\n'),
+                ('mixed', f'{self.PRIMARY}/{self.CARD_SUB}/{soft}', self.CARD_SUB, self.CARD_SUB,
+                 'require-sign\n' + remote.OTHER_KEY_NOTICE),
+                ('software', f'{self.PRIMARY}/{soft}', '', soft, 'require-sign\n' + remote.UNKNOWN_TOUCH_NOTICE)):
+            with self.subTest(name):
+                h = self.harness(name.replace(' ', '-'), card_keys=card_keys, extra_env={'FAKE_GPG_SECRET_KEYS': keys},
+                                 serve_extra=f'signing_key={named}!\n')
+                h.decision.write_text('delayed-sign')
+                self.sign(h, f'{self.CARD_SUB} %01+', selector=f'{named}!')
+                self.assertEqual(self.gate(h), gate)
+                self.assertEqual(self.touch_at_start(h), ['after' if gate == '\n' else 'before'])
+                self.assertEqual(h.gpg_calls()[-1][0][-2:], [b'--local-user', named.encode()], 'GPG was handed no !')
+
+    def test_more_than_one_card_makes_the_policy_unknown(self):
+        """The same key may be on two inserted cards, and GPG may sign on the one
+        whose policy was not read: where scdaemon lists more than one card, Sign
+        is needed. One card, or a scdaemon that refuses the command, changes
+        nothing."""
+        for name, cards, gate in (('two', 'D2760001240100000006000000010000 D2760001240100000006000000020000',
+                                   'require-sign\n' + remote.UNKNOWN_TOUCH_NOTICE),
+                                  ('one', 'D2760001240100000006000000010000', '\n'),
+                                  ('none-listed', '', '\n'),
+                                  ('refused', None, '\n')):
+            with self.subTest(name):
+                h = self.harness(name, extra_env={} if cards is None else {'FAKE_CARD_LIST': cards})
+                h.decision.write_text('delayed-sign')
+                self.sign(h, f'{self.CARD_SUB} %01+')
+                self.assertEqual(self.gate(h), gate)
+                self.assertEqual(self.touch_at_start(h), ['after' if gate == '\n' else 'before'])
+
+    def test_the_other_key_notice_matches_the_wrapper(self):
+        wrapper = (ROOT.parent / 'git-gpg-preview').read_text()
+        self.assertEqual(re.search(r'^OTHER_KEY_NOTICE="(.*)"$', wrapper, re.M).group(1), remote.OTHER_KEY_NOTICE)
+        self.assertLessEqual(len(remote.OTHER_KEY_NOTICE), 80)
+
     def test_the_gate_follows_require_sign_not_the_notice(self):
         """In process: an empty notice still asks for Sign and still holds GPG
         back until it comes."""
@@ -972,13 +1112,16 @@ class TouchPolicyTests(unittest.TestCase):
     def test_sign_timeout_must_be_positive_and_finite(self):
         h = self.harness('h')
         serve = (h.serve_dir / 'serve').read_text()
-        for value in ('nan', 'inf', '-inf', '0', '-5', 'soon'):
+        self.assertLess(remote.MAX_SIGN_TIMEOUT, threading.TIMEOUT_MAX, 'Lock.acquire would raise OverflowError')
+        for value in ('nan', 'inf', '-inf', '0', '-5', 'soon', '3600.5', '1e12', '1e400'):
             with self.subTest(value=value):
                 (h.serve_dir / 'serve').write_text(f'{serve}sign_timeout_seconds={value}\n')
-                with self.assertRaisesRegex(remote.RemoteError, 'sign_timeout_seconds must be a positive, finite'):
+                with self.assertRaisesRegex(remote.RemoteError, 'sign_timeout_seconds must be a positive, finite.*at most 3600'):
                     remote.ServeConfig(h.serve_dir)
-        (h.serve_dir / 'serve').write_text(f'{serve}sign_timeout_seconds=7.5\n')
-        self.assertEqual(remote.ServeConfig(h.serve_dir).sign_timeout, 7.5)
+        for value, expected in (('7.5', 7.5), ('3600', 3600), ('', 120)):
+            with self.subTest(value=value):
+                (h.serve_dir / 'serve').write_text(f'{serve}sign_timeout_seconds={value}\n')
+                self.assertEqual(remote.ServeConfig(h.serve_dir).sign_timeout, expected)
 
     def test_touch_off_mark_as_spam_saves_the_subject_without_gpg(self):
         h = self.harness('h')
@@ -1342,6 +1485,18 @@ class TouchPolicyTests(unittest.TestCase):
         self.assertIn('Branch: facts?a?b?c?d?e?f?g?h?i?j?k?l?m?n?o\u00e9', facts)
         self.assertFalse(set(summary) & set(unsafe), summary)
 
+    def test_a_branch_name_holds_no_c1_control(self):
+        """U+009B is the 8-bit CSI, and the rest of U+0080-U+009F is no safer in
+        a fact or the audit log: each becomes '?', as in the wrapper. U+00A0,
+        just past them, stays."""
+        c1 = ''.join(map(chr, range(0x80, 0xa0)))
+        info = {'type': 'commit', 'message': 'Subject'}
+        summary = remote.Service._summary(None, info, ['-u', 'KEY'], b'payload', 'a' * 64,
+                                          {'branch': f'c1\u009b{c1}\u00a0\u00e9'}, 'peer')
+        facts = summary.partition('\n\nMessage:\n')[0].split('\n')
+        self.assertIn('Branch: c1' + '?' * 33 + '\u00a0\u00e9', facts)
+        self.assertFalse(set(summary) & set(c1), summary)
+
     def test_a_failed_slow_or_late_card_query_gives_no_policy(self):
         agent = str(HELPERS / 'fake-gpg-connect-agent.py')
         self.card.write_text(f'{self.CARD_SUB} %01+')
@@ -1421,6 +1576,27 @@ class TouchPolicyTests(unittest.TestCase):
             'tie goes to the first listed': cert(primary, 'cSC', '+', (sub1, 'u', '300', card), (sub2, 'u', '300', '+')),
             'subkey from the future': cert(primary, 'cSC', '+', (sub1, 'u', '200', card), (sub2, 'u', future, '+')),
             'primary when no subkey signs': cert(primary, 'scSC', card, (sub1, 'r', '300', '+')),
+            'software primary that can sign': cert(primary, 'scSC', '+', (sub1, 'u', '300', card)),
+            'stub primary that can sign': cert(primary, 'scSC', '#', (sub1, 'u', '300', card)),
+            'card primary with a software subkey': cert(primary, 'scSC', card, (sub1, 'u', '300', '+')),
+            'software primary when no subkey signs': cert(primary, 'scSC', '+', (sub1, 'e', '300', card)),
+            'one card subkey': cert(primary, 'cSC', '+', (sub1, 'u', '300', card)),
+            'two card subkeys': cert(primary, 'cSC', '+', (sub1, 'u', '300', card), (sub2, 'u', '200', card)),
+            'one card key in two certificates': cert(primary, 'cSC', '+', (sub1, 'u', '300', card))
+                                                + cert('D' * 40, 'cSC', '+', (sub1, 'u', '300', card)),
+            'no signing key on a card': cert(primary, 'cSC', card, (sub1, 'u', '300', '+')),
+            'a card certificate, then a software one': cert(primary, 'cSC', '+', (sub1, 'u', '300', card))
+                                                       + cert('D' * 40, 'cSC', '+', (sub2, 'u', '200', '+')),
+            'a software certificate, then a card one': cert(primary, 'cSC', '+', (sub1, 'u', '300', '+'))
+                                                       + cert('D' * 40, 'cSC', '+', (sub2, 'u', '200', card)),
+            'two card certificates': cert(primary, 'cSC', '+', (sub1, 'u', '300', card))
+                                     + cert('D' * 40, 'cSC', '+', (sub2, 'u', '200', card)),
+            'two software certificates': cert(primary, 'cSC', '+', (sub1, 'u', '300', '+'))
+                                         + cert('D' * 40, 'cSC', '+', (sub2, 'u', '200', '')),
+            'a later certificate that cannot sign': cert(primary, 'cSC', '+', (sub1, 'u', '300', card))
+                                                    + cert('D' * 40, 'cSC', '+', (sub2, 'e', '200', '+')),
+            'a later certificate from the future': cert(primary, 'cSC', '+', (sub1, 'u', '300', card))
+                                                   + cert('D' * 40, 'cSC', '+', (sub2, 'u', future, '+')),
             'nothing can sign': cert(primary, 'cSC', '+', (sub1, 'e', '300', card)),
             'first certificate that can sign': cert(primary, 'cSC', '+', (sub1, 'e', '300', '+'))
                                               + cert('D' * 40, 'cSC', '+', (sub2, 'u', '200', card)),
@@ -1437,6 +1613,20 @@ class TouchPolicyTests(unittest.TestCase):
                                          str(listing), primary], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(remote.selected_signing_key(text, time.time()), result.stdout.strip())
+        kinds = {'newest subkey on the card': 'mixed', 'newest subkey in software': 'mixed',
+                 'tie goes to the first listed': 'mixed', 'software primary that can sign': 'card',
+                 'stub primary that can sign': 'card', 'card primary with a software subkey': 'software',
+                 'software primary when no subkey signs': 'software',
+                 'expired newest subkey': 'card', 'stub without its secret': 'card',
+                 'primary when no subkey signs': 'card', 'one card subkey': 'card', 'two card subkeys': 'mixed',
+                 'one card key in two certificates': 'card',
+                 'empty token is software': 'software', 'no signing key on a card': 'software',
+                 'a card certificate, then a software one': 'mixed', 'a software certificate, then a card one': 'mixed',
+                 'two card certificates': 'mixed', 'two software certificates': 'software',
+                 'a later certificate that cannot sign': 'card', 'a later certificate from the future': 'mixed'}
+        for name, kind in kinds.items():
+            with self.subTest(name):
+                self.assertEqual(remote.selected_signing_key(listings[name], time.time()).split()[-1], kind)
 
 
 class SigningKeyTests(unittest.TestCase):

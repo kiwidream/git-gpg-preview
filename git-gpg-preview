@@ -40,10 +40,11 @@ PIN_PROMPT="builtin"
 # Upper bound on PIN attempts per request, even when the card reports more.
 PIN_ATTEMPT_LIMIT=10
 # With touch policy off or cached, or one that could not be read, the key may
-# sign as soon as GPG asks it, so GPG waits for Sign in the preview instead, at
-# most SIGN_CLICK_SECONDS. The preview is closed after Sign, so the PIN window
-# (or pinentry) and a touch then get SIGN_GPG_SECONDS: time to type a PIN, look
-# for the key and touch it. Git waits for the wrapper without a timeout of its
+# sign as soon as GPG asks it, and where GPG could sign with any other key it may
+# do so without that key's touch, so GPG waits for Sign in the preview instead,
+# at most SIGN_CLICK_SECONDS. The preview is closed after Sign, so the
+# PIN window (or pinentry) and a touch then get SIGN_GPG_SECONDS: time to type a
+# PIN, look for the key and touch it. Git waits for the wrapper without a timeout of its
 # own, so unlike the remote service, which must answer within its client's
 # timeout, these need not share one budget. Tests read these lines; keep the
 # format.
@@ -55,6 +56,10 @@ UNKNOWN_TOUCH_NOTICE="Touch policy unknown: Sign to continue"
 # Cached-fixed gets no notice of its own (it cannot be changed), only this
 # with the Sign button.
 CACHED_FIXED_TOUCH_NOTICE="Touch policy cached-fixed: one touch signs for 15 seconds; Sign is required."
+# Certificate kind mixed, where GPG could sign with a key other than the one in
+# the card's signature slot, gets only this with the Sign button, whatever the
+# card's policy: no change to that policy could remove the need for Sign.
+OTHER_KEY_NOTICE="GPG could sign with more than one key: Sign to continue"
 TOUCH_NOTICE=""
 REQUEST_HOMEDIR=""
 # The rest of the wrapper's own state, set before anything can read it: cleanup
@@ -106,14 +111,19 @@ SPAM_SUBJECT_FILE=""
 TEMP_BASE=""
 NEWLINE=""
 unset GPG_ARGS PREVIEW_ARGS BASES PARENTS
-# sanitize_one_line's sed script: UTF-8 for characters that break a line or
-# reorder text where a fact is shown, though none of their bytes is a control.
-# NSTextView starts a new line at U+0085, U+2028 and U+2029; U+061C, U+200E,
-# U+200F, U+202A-U+202E and U+2066-U+2069 are bidirectional controls. One
-# command per character, of plain bytes (LC_ALL=C), so macOS's sed reads it
-# exactly as GNU sed does.
+# sanitize_one_line's sed script: UTF-8 for characters that break a line, reorder
+# text or drive a terminal where a fact is shown or logged, though none of their
+# bytes is an ASCII control. These are the C1 controls U+0080-U+009F, of which
+# U+009B is the 8-bit CSI and NSTextView starts a new line at U+0085, as it does
+# at U+2028 and U+2029; and U+061C, U+200E, U+200F, U+202A-U+202E and
+# U+2066-U+2069, the bidirectional controls. One command per character, of plain
+# bytes (LC_ALL=C), so macOS's sed reads it exactly as GNU sed does.
 ONE_LINE_UNSAFE_SED=$(
-    printf 's/\302\205/?/g;s/\342\200\250/?/g;s/\342\200\251/?/g;s/\330\234/?/g;'
+    for c1 in 200 201 202 203 204 205 206 207 210 211 212 213 214 215 216 217 \
+        220 221 222 223 224 225 226 227 230 231 232 233 234 235 236 237; do
+        printf "s/\\302\\$c1/?/g;"
+    done
+    printf 's/\342\200\250/?/g;s/\342\200\251/?/g;s/\330\234/?/g;'
     printf 's/\342\200\216/?/g;s/\342\200\217/?/g;s/\342\200\252/?/g;s/\342\200\253/?/g;s/\342\200\254/?/g;'
     printf 's/\342\200\255/?/g;s/\342\200\256/?/g;s/\342\201\246/?/g;s/\342\201\247/?/g;s/\342\201\250/?/g;'
     printf 's/\342\201\251/?/g'
@@ -342,8 +352,19 @@ sanitize_stream() {
     /usr/bin/tr '\000-\010\013\014\016-\037\177' '?'
 }
 
+# The sed matches whole characters, so it is only for a fact that is valid UTF-8.
+# In any other, such as a branch holding a lone 0x85 or 0x9B, which Git allows and
+# the dialog's Latin-1 fallback would read as a C1 control, every byte from 0x80 up
+# becomes '?'. Nothing is deleted: 'ma\xffin' must not read as 'main'. An iconv
+# that cannot run counts as invalid.
 sanitize_one_line() {
-    sanitize_stream | /usr/bin/tr '\n\r\t' '   ' | /usr/bin/sed "$ONE_LINE_UNSAFE_SED"
+    local fact
+    fact=$(sanitize_stream | /usr/bin/tr '\n\r\t' '   ')
+    if printf '%s' "$fact" | /usr/bin/iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+        printf '%s' "$fact" | /usr/bin/sed "$ONE_LINE_UNSAFE_SED"
+    else
+        printf '%s' "$fact" | /usr/bin/tr '\200-\377' '?'
+    fi
 }
 
 valid_object_id() {
@@ -559,16 +580,26 @@ card_pin_retries() {
 
 # The key GPG will sign with, judged from a --with-colons secret key listing:
 # "<fingerprint> <kind> <certificate kind>", or nothing when no key can sign.
-# Each kind is card or software; the certificate's is card when any usable
-# signing key in it is on a card (for a key named with !, that key's own). A selector ending in ! names that exact primary key or subkey.
+# A key's kind is card or software. The certificate kind is about every key GPG
+# could pick, across every matching certificate: in each, its usable signing
+# subkeys, or its primary key only when no subkey can sign. It is card when that
+# is one key, on a card; mixed when there are several and any is on a card;
+# software when none is. So only with card can one key's touch, the key whose
+# policy card_touch_policy reads, stand for all GPG could sign with. A selector
+# ending in ! names that exact primary key or subkey, and GPG signs with exactly
+# that key, so that key's own kind is the certificate kind too.
 # Any other selector, a subkey's own fingerprint included, takes the first
 # matching certificate that can sign, and from it the newest usable signing
-# subkey, or the primary key when no subkey can sign: GnuPG 2.2's choice.
+# subkey, or the primary key when no subkey can sign: GnuPG 2.2's choice. Such a
+# selector, a user ID say, can match several certificates, and GPG need not
+# choose the first, so all of them count towards the kind.
 # GnuPG 2.3 and later rank a key on a card above a software key whose
-# passphrase is not cached, so whenever this picks a card key, GPG signs with
-# a card key or asks for nothing. Any other pick keeps pinentry, which
-# handles both. A listing always shows whole certificates, so the other keys
-# in it never decide.
+# passphrase is not cached, but may sign with one whose passphrase is cached.
+# So whenever this picks a card key, GPG signs with a card key or asks for no
+# PIN at all, and the PIN window is safe; but with kind mixed that key's touch
+# may never be asked for, which the Sign gate answers. Any other
+# pick keeps pinentry, which handles both. A listing shows each matching
+# certificate whole, so only their keys decide.
 selected_signing_key() {
     local exact=""
     if [[ "$2" == *! ]]; then
@@ -590,19 +621,22 @@ selected_signing_key() {
             if (length(f) == 64) return substr(f, 1, length(e)) == e
             return substr(f, length(f) - length(e) + 1) == e
         }
-        function decide(    i, best, unclear, cert) {
+        function candidate(i) {
+            if (kind(i) == "card") on_card = 1
+            if (only == "") only = fpr[i]; else if (fpr[i] != only) several = 1
+        }
+        function decide(    i, best, unclear) {
             for (i = 2; i <= n; i++) {
                 if (!usable(i)) continue
                 # GPG skips a subkey from the future unless ignore-valid-from is set.
                 if (created[i] + 0 > now + 0) unclear = 1
+                candidate(i)
                 if (!best || created[i] + 0 > created[best] + 0) best = i
             }
-            if (!best && usable(1)) best = 1
-            if (!best) return
+            if (!best && usable(1)) { best = 1; candidate(1) }
+            if (!best || finished) return
             finished = 1
-            for (i = 1; i <= n; i++) if (usable(i) && kind(i) == "card") cert = "card"
-            if (!unclear) print fpr[best], kind(best), cert ? cert : "software"
-            exit
+            if (!unclear) pick = fpr[best] " " kind(best)
         }
         $1 == "sec" { if (n && exact == "") decide(); n = 0 }
         $1 == "sec" || $1 == "ssb" {
@@ -612,13 +646,16 @@ selected_signing_key() {
         $1 == "fpr" && key {
             fpr[key] = toupper($10)
             if (exact != "" && named(fpr[key]) && usable(key)) {
-                finished = 1
                 print fpr[key], kind(key), kind(key)
                 exit
             }
         }
         { key = 0 }
-        END { if (!finished && n && exact == "") decide() }
+        END {
+            if (exact != "") exit
+            if (n) decide()
+            if (pick != "") print pick, (on_card ? (several ? "mixed" : "card") : "software")
+        }
     ' "$1" 2>/dev/null
 }
 
@@ -668,7 +705,10 @@ gpg_connect_agent() {
 # told: a software key, another card or none, a card without the setting, or
 # no gpg-connect-agent. It is asked through gpg-agent because scdaemon holds
 # the card; ykman would kill scdaemon to reach it. SERIALNO selects the card's
-# OpenPGP application, as gpg does before it uses a card.
+# OpenPGP application, as gpg does before it uses a card. Nothing either when
+# scdaemon lists more than one card (GETINFO card_list, GnuPG 2.3 and later; an
+# older one refuses the command, and nothing changes): the same key may be on
+# both, and GPG may sign on the other one, under its policy.
 card_touch_policy() {
     local agent
     TOUCH_POLICY=""
@@ -682,13 +722,15 @@ card_touch_policy() {
     # check scdaemon makes after it finds the OpenPGP application still
     # selected. --hex prints the reply as hex: the policy byte, 0x20, and the
     # status word 90 00. Anything else is a policy that cannot be read.
-    run_query "$REQUEST_DIR/card-touch" "$agent" --hex 'SCD SERIALNO openpgp' 'SCD GETATTR KEY-FPR' 'SCD APDU 00CA00D600' /bye ||
+    run_query "$REQUEST_DIR/card-touch" "$agent" --hex 'SCD SERIALNO openpgp' 'SCD GETATTR KEY-FPR' 'SCD APDU 00CA00D600' 'SCD GETINFO card_list' /bye ||
         return 0
     TOUCH_POLICY=$(/usr/bin/awk -v key="${SIGNING_KEY%% *}" '
         $1 == "S" && $2 == "KEY-FPR" && $3 == "1" { card = toupper($4) }
+        # After the reply, a SERIALNO line can only be from card_list.
+        reply != "" && $1 == "S" && $2 == "SERIALNO" { cards++ }
         $1 == "D[0000]" { reply = $2 " " $3 " " $4 " " $5 }
         END {
-            if (card != key || reply !~ /^0[0-4] [0-9A-F][0-9A-F] 90 00$/) exit
+            if (cards > 1 || card != key || reply !~ /^0[0-4] [0-9A-F][0-9A-F] 90 00$/) exit
             split("off on fixed cached cached-fixed", policy, " ")
             print policy[substr(reply, 2, 1) + 1]
         }
@@ -753,8 +795,8 @@ prepend_touch_notice() {
 # or need a second touch. gpg-agent starts scdaemon again for the next
 # request, which may ask for the PIN again. Bounded at 3s, and done before the
 # dialog lock goes to the next request. Only for a GPG stopped while it ran
-# (stop_gpg) that may have used a card: when the certificate it signs from has
-# no signing key on a card, nothing waits there, and stopping scdaemon would
+# (stop_gpg) that may have used a card: when no signing key GPG could pick is on
+# a card, nothing waits there, and stopping scdaemon would
 # only drop the PIN it holds and disturb its other users. A certificate with a
 # card signing key gets the cancel even when a software key is the pick, as
 # GnuPG 2.3 and later may sign on the card instead; so does a key that could
@@ -952,7 +994,11 @@ await_sign_click() {
     fi
     DIALOG_PID=""
     [[ "$DECISION_VALUE" == sign && ! -e "$DECIDING" ]] && return 0
-    error "not signed: touch policy is ${TOUCH_POLICY:-unknown} and Sign was not clicked"
+    if [[ "$SIGNING_CERT" == mixed ]]; then
+        error "not signed: GPG could sign with more than one key and Sign was not clicked"
+    else
+        error "not signed: touch policy is ${TOUCH_POLICY:-unknown} and Sign was not clicked"
+    fi
     handle_operator_rejection
     release_dialog_lock
     audit_decision "sign-not-clicked" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
@@ -1384,7 +1430,10 @@ reject_spam_subject
 # before the preview could be read. The preview then has a Sign button, which
 # is the gate: GPG starts only after Sign is clicked, and Cancel, a closed
 # window or no click within SIGN_CLICK_SECONDS leaves the request unsigned.
-# Only on and fixed keep the touch as the gate.
+# Only on and fixed keep the touch as the gate, and only when the key whose
+# policy was read is the only usable signing key GPG could pick: GnuPG 2.3 and
+# later may sign with a software key whose passphrase is cached, with no touch at
+# all, and a key on another card signs under that card's own policy.
 #
 # The preview is started first and reports readiness; only then is GPG
 # engaged. This ordering means the PIN prompt (the PIN window or pinentry) launches last and
@@ -1413,25 +1462,30 @@ fi
 # shows only when signing fails. Advisory: signing goes ahead under the key's
 # current policy.
 names_own_gnupg_files "$@" || card_touch_policy
-if TOUCH_NOTICE=$(touch_policy_notice "$TOUCH_POLICY"); then
+if [[ "$SIGNING_CERT" != mixed ]] && TOUCH_NOTICE=$(touch_policy_notice "$TOUCH_POLICY"); then
     prepend_touch_notice "$TOUCH_NOTICE" "$SUMMARY" "$DETAILS"
     # The newline goes through a variable, which keeps the pattern plain for
     # macOS's bash 3.2: no $'...' quoting inside a double-quoted expansion.
     NEWLINE=$'\n'
     error "note: ${TOUCH_NOTICE//$NEWLINE/ }"
 fi
-# Decided by the policy read from the card, never by whether the notice could
-# be written, and never by the notice text: the preview gets that directly.
-# Only on and fixed make every signature wait for its own touch, so only they
-# keep the touch as the gate. Cached lets one touch sign whatever follows for
-# 15 seconds, including touches made outside this tool, which no record here
-# could see; off needs no touch; and anything that could not be read (a
-# software key, another card, a query that failed or took too long) may be
-# either. All of those need Sign.
-case "$TOUCH_POLICY" in
-    on|fixed) ;;
-    off|cached) SIGN_GATE=1; SIGN_NOTICE=$TOUCH_NOTICE ;;
-    cached-fixed) SIGN_GATE=1; SIGN_NOTICE=$CACHED_FIXED_TOUCH_NOTICE ;;
+# Decided by the policy read from the card and the certificate kind, never by
+# whether the notice could be written, and never by the notice text: the preview
+# gets that directly. Only on and fixed make every signature wait for its own
+# touch, so only they keep the touch as the gate, and only with kind card, where
+# the key in the card's signature slot, whose policy was read, is the only one GPG
+# could sign with. With kind mixed GPG may sign with another key, without that
+# touch, so it needs Sign and says why, whatever the policy. Anything else that
+# is not card falls through to the unknown notice.
+# Cached lets one touch sign whatever follows for 15 seconds, including touches
+# made outside this tool, which no record here could see; off needs no touch;
+# and anything that could not be read (a software key, another card, a query
+# that failed or took too long) may be either. All of those need Sign.
+case "$SIGNING_CERT:$TOUCH_POLICY" in
+    mixed:*) SIGN_GATE=1; SIGN_NOTICE=$OTHER_KEY_NOTICE ;;
+    card:on|card:fixed) ;;
+    *:off|*:cached) SIGN_GATE=1; SIGN_NOTICE=$TOUCH_NOTICE ;;
+    *:cached-fixed) SIGN_GATE=1; SIGN_NOTICE=$CACHED_FIXED_TOUCH_NOTICE ;;
     *) SIGN_GATE=1; SIGN_NOTICE=$UNKNOWN_TOUCH_NOTICE ;;
 esac
 ATTEMPT=1

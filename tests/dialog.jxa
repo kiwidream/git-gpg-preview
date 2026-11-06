@@ -43,6 +43,13 @@ function previewModalResponse(alert) {
     return modalResponse(alert, true);
 }
 
+// The details window: record the text it shows, then answer.
+var detailsSeen = [];
+function detailModalResponse(alert) {
+    detailsSeen.push(ObjC.unwrap(alert.accessoryView.documentView.string));
+    return modalResponse(alert);
+}
+
 var pinResponses = [];
 var expectedPinButtons = [];
 function pinModalResponse(alert) {
@@ -95,7 +102,7 @@ function run(argv) {
         ['function run(argv)', 'function runPreview(argv)'],
         ['app.activateIgnoringOtherApps(true);', ''],
         ['Number(alert.runModal)', 'previewModalResponse(alert)'],
-        ['Number(detailAlert.runModal)', 'modalResponse(detailAlert)'],
+        ['Number(detailAlert.runModal)', 'detailModalResponse(detailAlert)'],
         ['pinApp.activateIgnoringOtherApps(true);', ''],
         ['Number(pinAlert.runModal)', 'pinModalResponse(pinAlert)'],
         ['pinEntryApp.activateIgnoringOtherApps(true);', ''],
@@ -256,6 +263,25 @@ function run(argv) {
         runPreview([summary, details, decision, ready]);
         if (panesSeen.length !== 1 || panesSeen[0].facts !== test.facts) throw new Error('A fact drew a line of its own: ' + JSON.stringify(panesSeen));
     });
+    // View Details is cleaned the same way, so nothing in it can draw a line that
+    // poses as a fact: raw 0x85 and 0x9B bytes that Latin-1 decoding makes C1
+    // controls of, and the same characters in valid UTF-8. U+00A0 and U+00E9 stay.
+    $.NSString.stringWithString('Request type: commit\n\nMessage:\nNoisy subject').writeToFileAtomicallyEncodingError(summary, true, $.NSUTF8StringEncoding, null);
+    [
+        {bytes: 'QnJhbmNoOiBhhVNIQS0yNTY9Rk9SR0VEm2I=',
+         text: 'Branch: a?SHA-256=FORGED?b'},
+        {bytes: 'QnJhbmNoOiBhwoViwptjwoBkwp9l4oCoZuKAqWfYnGjigI5p4oCuauKBpmvCoMOp',
+         text: 'Branch: a?b?c?d?e?f?g?h?i?j?k\u00a0\u00e9'}
+    ].forEach(function(test) {
+        $.NSData.alloc.initWithBase64EncodedStringOptions(test.bytes, 0).writeToFileAtomically(details, true);
+        $.NSData.data.writeToFileAtomically(decision, true);
+        expectedSpam = false;
+        responses = [1000, 1001];
+        detailsSeen = [];
+        runPreview([summary, details, decision, ready]);
+        if (detailsSeen.length !== 1 || detailsSeen[0] !== test.text) throw new Error('The details drew a line of their own: ' + JSON.stringify(detailsSeen));
+    });
+    $.NSString.stringWithString('Exact payload and details').writeToFileAtomicallyEncodingError(details, true, $.NSUTF8StringEncoding, null);
     // The notice is shown once: when the facts already hold it, the Sign text
     // does not repeat it. A message that quotes it does not count.
     // Nor does a fact that merely contains it, such as a crafted branch name.
@@ -377,5 +403,5 @@ function run(argv) {
             if (seen.info.indexOf('review window') >= 0 || seen.info.indexOf('touch the key if it blinks') < 0) throw new Error(where + 'text: ' + seen.info);
         });
     });
-    return 'Dialog actions passed (61 cases)';
+    return 'Dialog actions passed (63 cases)';
 }

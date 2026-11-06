@@ -87,9 +87,10 @@ const MESSAGE_MARKER = '\n\nMessage:\n';
 // Characters NSTextView starts a new line at, or that reorder text, though the
 // signers' sanitizers pass them or never see them: the C1 controls
 // U+0080-U+009F (among them NEL, which Latin-1 decoding makes of a raw 0x85
-// byte in a summary that is not valid UTF-8), U+2028, U+2029 and the
-// bidirectional controls. In the facts each becomes '?', so no fact can draw a
-// line of its own.
+// byte in text that is not valid UTF-8), U+2028, U+2029 and the bidirectional
+// controls. In the facts and in View Details each becomes '?', so no fact can
+// draw a line of its own and nothing in the details can pose as one; the hex
+// view there keeps the payload's exact bytes.
 const FACT_UNSAFE = /[\u0080-\u009f\u2028\u2029\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 function splitSummary(summary) {
     const at = summary.indexOf(MESSAGE_MARKER);
@@ -347,15 +348,16 @@ function run(argv) {
         throw new Error('Expected summary, details, and decision paths.');
     }
     const summary = readText(argv[0]);
-    const details = readText(argv[1]);
+    const details = readText(argv[1]).replace(FACT_UNSAFE, '?');
     const decisionPath = argv[2];
     const readyPath = argv.length > 3 ? argv[3] : '';
     // Explicit capabilities from the signer; never infer them from payload text.
     const canMarkSpam = argv.length > 4 && argv[4] === 'mark-spam';
     // With touch policy off, cached, cached-fixed, or one the signer could not
     // read, the key may sign without a touch of its own, so the signer starts
-    // GPG only after Sign here; the notice comes with the request. Only on and
-    // fixed keep the touch as the gate, and get no Sign button.
+    // GPG only after Sign here; the notice comes with the request. Any other key
+    // GPG could sign with is treated the same. Only on and fixed, with no such
+    // key, keep the touch as the gate, and get no Sign button.
     const requireSign = argv.length > 5 && argv[5] === 'require-sign';
     const signNotice = argv.length > 6 ? String(argv[6]) : '';
     // Shown once: above the facts when the signer could write it there, and

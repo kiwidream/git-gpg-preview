@@ -676,6 +676,7 @@ TOUCH_CACHED=$'Touch policy is cached: one touch signs for 15 seconds, so Sign i
 CACHED_HINT='set-touch[[:space:]]+sig[[:space:]]+cached|use cached'
 TOUCH_UNKNOWN='Touch policy unknown: Sign to continue'
 TOUCH_CACHED_FIXED='Touch policy cached-fixed: one touch signs for 15 seconds; Sign is required.'
+TOUCH_MIXED="GPG could sign with more than one key: Sign to continue"
 DETAILS_TITLE='GIT OPENPGP SIGNING REVIEW — FULL DETAILS'
 # note_line NOTICE: the one stderr line that carries NOTICE.
 note_line() {
@@ -712,7 +713,10 @@ assert_touch_notice() {
     # A policy read as on or fixed keeps the touch as the gate. Off and cached
     # ask for Sign with their notice, cached-fixed with its own; a policy that
     # was not read (every case here that does not read one) with the unknown one.
-    if [[ "$expected" == "$TOUCH_OFF" || "$expected" == "$TOUCH_CACHED" ]]; then
+    # EXPECTED_SIGN_NOTICE: a Sign window of another kind.
+    if [[ -n "${EXPECTED_SIGN_NOTICE-}" ]]; then
+        [[ $(cat "${summary%.summary}.gate") == require-sign$'\n'"$EXPECTED_SIGN_NOTICE" ]] || fail "$label: the preview was not asked for Sign"
+    elif [[ "$expected" == "$TOUCH_OFF" || "$expected" == "$TOUCH_CACHED" ]]; then
         [[ $(cat "${summary%.summary}.gate") == require-sign$'\n'"$expected" ]] || fail "$label: the preview was not asked for Sign"
     elif [[ "$uif" == %04+ ]]; then
         [[ $(cat "${summary%.summary}.gate") == require-sign$'\n'"$TOUCH_CACHED_FIXED" ]] || fail "$label: the preview was not asked for Sign"
@@ -766,8 +770,13 @@ export FAKE_CONNECT_AGENT_EXIT=2
 assert_touch_notice 'gpg-connect-agent that failed' '%00+' '' --status-fd=2 -bsau TEST
 unset FAKE_CONNECT_AGENT_EXIT
 secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 200 "$CARD" "$SOFT_SUB" u 300 + > "$FAKE_SECRET_KEYS"
-assert_touch_notice 'software key signs' '%00+' '' --status-fd=2 -bsau TEST
+EXPECTED_SIGN_NOTICE=$TOUCH_MIXED assert_touch_notice 'software key signs' '%00+' '' --status-fd=2 -bsau TEST
 [[ $(connect_agent_calls) -eq 0 ]] || fail 'touch policy read for a software key'
+# A mixed certificate needs Sign whatever the card's policy, so it gets no advice
+# to change that policy, above the facts or on stderr.
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" "$SOFT_SUB" u 200 + > "$FAKE_SECRET_KEYS"
+EXPECTED_SIGN_NOTICE=$TOUCH_MIXED assert_touch_notice 'mixed certificate, touch off' '%00+' '' --status-fd=2 -bsau TEST
+EXPECTED_SIGN_NOTICE=$TOUCH_MIXED assert_touch_notice 'mixed certificate, touch cached' '%03+' '' --status-fd=2 -bsau TEST
 secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" > "$FAKE_SECRET_KEYS"
 use_real_gpg "$TMP/linked-bin/gpg"
 assert_touch_notice 'gpg-connect-agent beside the linked real GPG' '%00+' "$TOUCH_OFF" --status-fd=2 -bsau TEST
@@ -927,6 +936,100 @@ done
 export FAKE_CARD_UIF=%00+
 gate_case -bsau TEST
 [[ "$pin_status" -eq 0 && $(touch_at_start) == before ]] || fail "touch off, pinentry path: GPG did not wait for Sign ($pin_status, $(touch_at_start))"
+# On and fixed keep the touch as the gate only when the card's slot-1 key, whose
+# policy was read, is the only usable signing key GPG could pick: GnuPG 2.3 and
+# later may sign with a software key whose passphrase is cached, with no touch,
+# and a key on another card signs under its own policy. So any other key needs
+# Sign, even when the slot-1 key is the pick. A key GPG cannot pick does not
+# count, and that takes in a primary key while a subkey can sign, whatever its
+# kind. A key named with ! is the only one GPG can pick, so its own kind decides.
+# assert_gate LABEL UIF SIGN-NOTICE SELECTOR; an empty notice means no Sign.
+assert_gate() {
+    local label="$1" notice="$3" gate
+    export FAKE_CARD_UIF="$2"
+    gate_case --status-fd=2 -bsau "$4"
+    [[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "$label: not signed ($pin_status)"
+    gate=$(cat "$(latest_capture | sed 's/\.summary$//').gate")
+    if [[ -n "$notice" ]]; then
+        [[ "$gate" == require-sign$'\n'"$notice" ]] || fail "$label: the preview was not asked for Sign: $gate"
+        [[ $(touch_at_start) == before ]] || fail "$label: GPG started before Sign ($(touch_at_start))"
+    else
+        [[ -z "$gate" ]] || fail "$label: the preview was asked for Sign: $gate"
+        [[ $(touch_at_start) == after ]] || fail "$label: GPG waited for a click ($(touch_at_start))"
+    fi
+}
+cp "$FAKE_SECRET_KEYS" "$TMP/secret-keys.card-only"
+assert_gate 'on, card-only certificate' %01+ '' TEST
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" "$SOFT_SUB" u 200 + > "$FAKE_SECRET_KEYS"
+assert_gate 'on, card and software certificate' %01+ "$TOUCH_MIXED" TEST
+assert_gate 'fixed, card and software certificate' %02+ "$TOUCH_MIXED" TEST
+assert_gate 'on, its card subkey named without !' %01+ "$TOUCH_MIXED" "$CARD_SUB"
+assert_gate 'on, its card key named with !' %01+ '' "$CARD_SUB!"
+assert_gate 'fixed, its card key named with !' %02+ '' "$CARD_SUB!"
+assert_gate 'on, its software key named with !' %01+ "$TOUCH_UNKNOWN" "$SOFT_SUB!"
+assert_gate 'off, card and software certificate' %00+ "$TOUCH_MIXED" TEST
+assert_gate 'cached, card and software certificate' %03+ "$TOUCH_MIXED" TEST
+assert_gate 'cached-fixed, card and software certificate' %04+ "$TOUCH_MIXED" TEST
+# That refusal names the other key, not the policy.
+export FAKE_DIALOG_DECISION=cancel
+for uif in %01+ %00+; do
+    export FAKE_CARD_UIF=$uif
+    gate_case --status-fd=2 -bsau TEST
+    [[ "$pin_status" -eq 1 && -z "$pin_output" && -z $(touch_at_start) ]] || fail "$uif, card and software certificate, Cancel: $pin_status, GPG $(touch_at_start)"
+    grep -qxF "git-gpg-preview: not signed: GPG could sign with more than one key and Sign was not clicked" "$TMP/pin.stderr" &&
+        ! grep -q 'touch policy is' "$TMP/pin.stderr" || fail "$uif, card and software certificate, Cancel: $(cat "$TMP/pin.stderr")"
+done
+export FAKE_DIALOG_DECISION=sign
+# A selector such as a user ID can match several certificates, and GPG need not
+# choose the first, so any that can sign counts: two certificates on two cards
+# need Sign, since only the first card's policy was read. A ! still names one key.
+{ secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD"; secret_keys "$OTHER" cSC + "$SOFT_SUB" u 200 +; } > "$FAKE_SECRET_KEYS"
+assert_gate 'on, a user ID matching a card and a software certificate' %01+ "$TOUCH_MIXED" TEST
+assert_gate 'on, its card key named with !, among both certificates' %01+ '' "$CARD_SUB!"
+{ secret_keys "$OTHER" cSC + "$SOFT_SUB" u 300 +; secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 200 "$CARD"; } > "$FAKE_SECRET_KEYS"
+assert_gate 'on, a user ID matching a software and a card certificate' %01+ "$TOUCH_MIXED" TEST
+{ secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD"; secret_keys "$OTHER" cSC + "$OTHER_CARD" u 200 "$CARD"; } > "$FAKE_SECRET_KEYS"
+assert_gate 'on, a user ID matching two card certificates' %01+ "$TOUCH_MIXED" TEST
+assert_gate 'on, the read key named with !, among two card certificates' %01+ '' "$CARD_SUB!"
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" "$OTHER_CARD" u 200 "$CARD" > "$FAKE_SECRET_KEYS"
+assert_gate 'on, two card subkeys in one certificate' %01+ "$TOUCH_MIXED" TEST
+# The one key is on a card, but not in the slot whose policy was read: unread.
+cp "$TMP/secret-keys.card-only" "$FAKE_SECRET_KEYS"
+export FAKE_CARD_SIG_KEY=$OTHER_CARD
+assert_gate 'on, another key in the card signature slot' %01+ "$TOUCH_UNKNOWN" TEST
+export FAKE_CARD_SIG_KEY=$CARD_SUB
+# The same key may be on two inserted cards, and GPG may sign on the one whose
+# policy was not read: where scdaemon lists more than one card, Sign is needed.
+# One card, or a scdaemon that refuses the command (all the cases above), changes
+# nothing.
+export FAKE_CARD_LIST="D2760001240100000006000000010000 D2760001240100000006000000020000"
+assert_gate 'on, scdaemon lists two cards' %01+ "$TOUCH_UNKNOWN" TEST
+assert_gate 'fixed, scdaemon lists two cards' %02+ "$TOUCH_UNKNOWN" TEST
+export FAKE_CARD_LIST=D2760001240100000006000000010000
+assert_gate 'on, scdaemon lists one card' %01+ '' TEST
+export FAKE_CARD_LIST=''
+assert_gate 'on, scdaemon lists no card' %01+ '' TEST
+unset FAKE_CARD_LIST
+{ secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD"; secret_keys "$OTHER" cSC + "$SOFT_SUB" e 200 +; } > "$FAKE_SECRET_KEYS"
+assert_gate 'on, a user ID also matching a certificate that cannot sign' %01+ '' TEST
+secret_keys "$PRIMARY" scSC + "$CARD_SUB" u 300 "$CARD" > "$FAKE_SECRET_KEYS"
+assert_gate 'on, a software primary that can sign and one card subkey' %01+ '' TEST
+assert_gate 'on, that software primary named with !' %01+ "$TOUCH_UNKNOWN" "$PRIMARY!"
+secret_keys "$PRIMARY" scSC '#' "$CARD_SUB" u 300 "$CARD" > "$FAKE_SECRET_KEYS"
+assert_gate 'on, a stub primary that can sign and one card subkey' %01+ '' TEST
+# With no subkey that can sign, the primary key is what GPG picks.
+secret_keys "$PRIMARY" scSC "$CARD" "$SOFT_SUB" e 200 + > "$FAKE_SECRET_KEYS"
+export FAKE_CARD_SIG_KEY=$PRIMARY
+assert_gate 'on, a card primary and an expired software subkey' %01+ '' TEST
+export FAKE_CARD_SIG_KEY=$CARD_SUB
+secret_keys "$PRIMARY" scSC + "$CARD_SUB" e 300 "$CARD" > "$FAKE_SECRET_KEYS"
+assert_gate 'on, a software primary and an expired card subkey' %01+ "$TOUCH_UNKNOWN" TEST
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" "$SOFT_SUB" e 200 + > "$FAKE_SECRET_KEYS"
+assert_gate 'on, an expired software subkey' %01+ '' TEST
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" "$SOFT_SUB" u 200 '#' > "$FAKE_SECRET_KEYS"
+assert_gate 'on, a software subkey without its secret' %01+ '' TEST
+cp "$TMP/secret-keys.card-only" "$FAKE_SECRET_KEYS"
+export FAKE_CARD_UIF=%00+
 # Cancel, a window closed without an answer, and no answer in time sign nothing:
 # GPG never starts.
 export FAKE_DIALOG_DECISION=cancel
@@ -1432,8 +1535,12 @@ grep -qxF 'Signing key: TEST  Message: FORGED selector' <<< "$facts" || fail 'a 
 ! grep -qF 'FORGED fact' <<< "$facts" || fail 'the message reached the facts'
 grep -qF 'FORGED fact in the body' "$summary" || fail 'the message lost its own text'
 # Nor a character at which the facts pane would start a new line or reorder the
-# text, though none of their bytes is a control: U+0085, U+2028, U+2029 and the
-# bidirectional controls in a branch name each become '?'. Other text stays.
+# text, though none of their bytes is an ASCII control: U+0085, U+2028, U+2029
+# and the bidirectional controls in a branch name each become '?'. So do all the
+# C1 controls, U+009B (the 8-bit CSI) among them. Other text stays, U+00A0 too.
+# In a fact that is not valid UTF-8 every byte from 0x80 up becomes '?', so a lone
+# 0x85 or 0x9B cannot become a C1 control when the dialog falls back to Latin-1
+# and nothing is deleted: 'ma\xffin' must not read as 'main'. iconv says nothing.
 unsafe_branch=$(printf 'facts\302\205a\342\200\250b\342\200\251c\330\234d\342\200\216e\342\200\217f\342\200\252g')
 unsafe_branch=$unsafe_branch$(printf '\342\200\253h\342\200\254i\342\200\255j\342\200\256k\342\201\246l\342\201\247m\342\201\250n\342\201\251o\303\251')
 git -C "$FIXTURE" checkout -q -b "$unsafe_branch"
@@ -1443,6 +1550,32 @@ git -C "$FIXTURE" checkout -q -
 git -C "$FIXTURE" branch -q -D "$unsafe_branch"
 grep -qxF "Branch: facts?a?b?c?d?e?f?g?h?i?j?k?l?m?n?o$(printf '\303\251')" "$(latest_capture)" ||
     fail "a branch name drew past its fact line: $(grep '^Branch: ' "$(latest_capture)" | od -c | head -3)"
+c1_branch=c1$(printf '\302\233')
+for ((code = 128; code < 160; code++)); do
+    c1_branch=$c1_branch$(printf "\\302\\$(printf '%o' "$code")")
+done
+c1_branch=$c1_branch$(printf '\302\240\303\251')
+git -C "$FIXTURE" checkout -q -b "$c1_branch"
+reset_pin_state
+"$ROOT/git-gpg-preview" --status-fd=2 -bsau TEST < "$TMP/forged-message.payload" > /dev/null 2>&1 || fail 'signing on a branch with C1 controls'
+git -C "$FIXTURE" checkout -q -
+git -C "$FIXTURE" branch -q -D "$c1_branch"
+grep -qxF "Branch: c1$(printf '?%.0s' {1..33})$(printf '\302\240\303\251')" "$(latest_capture)" ||
+    fail "a C1 control reached the facts: $(grep '^Branch: ' "$(latest_capture)" | od -c | head -3)"
+# Through HEAD alone, which needs no file of that name for a filesystem to refuse.
+fixture_head=$(git -C "$FIXTURE" symbolic-ref HEAD)
+for lone in "ma$(printf '\377')in:ma?in" "x$(printf '\205')y:x?y" "x$(printf '\233')y:x?y" \
+    "x$(printf '\205')$(printf '\303\251'):x???" "trail$(printf '\302'):trail?"; do
+    git -C "$FIXTURE" symbolic-ref HEAD "refs/heads/${lone%%:*}"
+    reset_pin_state
+    "$ROOT/git-gpg-preview" --status-fd=2 -bsau TEST < "$TMP/forged-message.payload" > /dev/null 2> "$TMP/lone.stderr" || fail "signing on a branch with lone bytes: $(cat "$TMP/lone.stderr")"
+    git -C "$FIXTURE" symbolic-ref HEAD "$fixture_head"
+    summary=$(latest_capture)
+    grep -qxF "Branch: ${lone#*:}" "$summary" || fail "a lone byte reached the facts: $(grep '^Branch: ' "$summary" | od -c | head -3)"
+    grep -qxF "Branch: ${lone#*:}" "$(details_of "$summary")" || fail "a lone byte reached the details: $(grep '^Branch: ' "$(details_of "$summary")" | od -c | head -3)"
+    /usr/bin/iconv -f UTF-8 -t UTF-8 < "$summary" > /dev/null 2>&1 || fail 'a summary with lone bytes in its facts is not valid UTF-8'
+    ! grep -q iconv "$TMP/lone.stderr" || fail "iconv reached stderr: $(cat "$TMP/lone.stderr")"
+done
 git -C "$FIXTURE" commit -q --allow-empty -F - >/dev/null <<< "$(printf 'A long message\n\n'; printf 'body line of a long commit message\n%.0s' {1..100})"
 git -C "$FIXTURE" cat-file commit HEAD > "$TMP/long-message.payload"
 "$ROOT/git-gpg-preview" --status-fd=2 -bsau TEST < "$TMP/long-message.payload" > /dev/null 2>&1 || fail 'signing a long message'
