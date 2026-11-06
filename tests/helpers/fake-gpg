@@ -3,6 +3,9 @@
 set -u
 umask 077
 
+# FAKE_GPG_IGNORE_SIGNALS: ignore INT and TERM, as GPG may while it waits on
+# gpg-agent; only KILL stops it then.
+[[ -z "${FAKE_GPG_IGNORE_SIGNALS-}" ]] || trap '' INT TERM
 CALL_DIR=${FAKE_GPG_CALL_DIR:?}
 mkdir -p "$CALL_DIR"
 id="$$.$RANDOM"
@@ -38,7 +41,9 @@ for arg in "$@"; do
         fi
         # FAKE_KEY_TOKEN: a card serial (default), + for a software key.
         printf 'sec:u:255:22:AAAA:1:::::::cSC:::%s:::ed25519:::0:\n' '+'
+        printf 'fpr:::::::::CCCC000000000000000000000000000000000001:\n'
         printf 'ssb:u:255:22:BBBB:1::::::s:::%s:::ed25519::\n' "${FAKE_KEY_TOKEN-D2760001240100000006000000010000}"
+        printf 'fpr:::::::::CCCC000000000000000000000000000000000002:\n'
         exit 0
     fi
     if [[ "$arg" == --card-status ]]; then
@@ -82,6 +87,14 @@ for arg in "$@"; do
             ;;
     esac
 done
+# Whether the fake dialog had already reported its answer (and so the touch)
+# when this signing call started: "before" means GPG was engaged only after the
+# preview was answered, as the Sign gate for touch off requires.
+if [[ "$signing" -eq 1 && "$verify" -eq 0 && -n "${FAKE_TOUCH_FILE-}" ]]; then
+    sha=$(shasum -a 256 "$payload" | awk '{print $1}')
+    [[ -e "$FAKE_TOUCH_FILE.$sha" ]] && touched=before || touched=after
+    printf '%s\n' "$touched" >> "$CALL_DIR/touch-at-start"
+fi
 # A wrong PIN fails before any touch, the way the card rejects VERIFY first.
 # pinentry path: the first FAKE_GPG_BAD_PINS signing calls get a wrong PIN.
 # Loopback path (--command-fd): when FAKE_GPG_PIN is set, ask for the PIN on
@@ -107,11 +120,22 @@ if [[ "$signing" -eq 1 && "$verify" -eq 0 ]]; then
         fail_bad_pin "${FAKE_GPG_BAD_PIN_COUNTED:-counted}"
     fi
 fi
+# FAKE_GPG_SLOW: seconds the operator takes over the PIN and touch.
+[[ -z "${FAKE_GPG_SLOW-}" ]] || sleep "$FAKE_GPG_SLOW"
+# FAKE_CARD_QUEUE: the card's operations, one payload hash per line. Each
+# signing call queues its own; a call stopped before the touch leaves its line
+# there, as gpg-agent and scdaemon keep a stopped GPG's request, until
+# SCD KILLSCD clears it. A touch completes the oldest one, whoever asked.
+if [[ "$signing" -eq 1 && "$verify" -eq 0 && -n "${FAKE_CARD_QUEUE-}" && -n "${FAKE_TOUCH_FILE-}" ]]; then
+    queued=$(shasum -a 256 "$payload" | awk '{print $1}')
+    printf '%s\n' "$queued" >> "$FAKE_CARD_QUEUE"
+fi
 if [[ "$signing" -eq 1 && "$verify" -eq 0 && -n "${FAKE_TOUCH_FILE-}" ]]; then
     sha=$(shasum -a 256 "$payload" | awk '{print $1}')
     touch_file="$FAKE_TOUCH_FILE.$sha"
     waited=0
-    while [[ ! -e "$touch_file" ]]; do
+    # "$FAKE_TOUCH_FILE.any": a touch made while the waiting window is up.
+    while [[ ! -e "$touch_file" && ! -e "$FAKE_TOUCH_FILE.any" ]]; do
         sleep 0.05
         waited=$((waited + 1))
         if [[ "$waited" -ge 200 ]]; then
@@ -119,6 +143,12 @@ if [[ "$signing" -eq 1 && "$verify" -eq 0 && -n "${FAKE_TOUCH_FILE-}" ]]; then
             exit 2
         fi
     done
+    if [[ -n "${FAKE_CARD_QUEUE-}" ]]; then
+        completed=$(head -n 1 "$FAKE_CARD_QUEUE")
+        sed -i.old 1d "$FAKE_CARD_QUEUE" && rm -f "$FAKE_CARD_QUEUE.old"
+        printf 'signed:%s' "$completed"
+        exit 0
+    fi
 fi
 
 printf '%s\0' "$@" > "$args"

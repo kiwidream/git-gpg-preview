@@ -1,33 +1,54 @@
 #!/bin/bash
 # Stand-in for dialog.jxa: captures what the operator would see, reports
-# readiness, then decides per the control file (sign | cancel | hang). The touch
-# policy windows append to touch-dialogs in the capture directory, and the offer
-# answers per its own control file (apply | dismiss | hang; default dismiss).
+# readiness, then decides per the control file (sign | cancel | hang). The
+# preview is the only window the service may open, so any other request is
+# recorded in other-windows in the capture directory and refused.
 set -u
 capture=${FAKE_DIALOG_CAPTURE_DIR:?}
 mkdir -p "$capture"
-if [[ "${1-}" == --touch-offer ]]; then
-    printf 'touch-offer %s %s\n' "$3" "$4" >> "$capture/touch-dialogs"
-    answer=$(cat "${FAKE_TOUCH_OFFER_FILE:-}" 2>/dev/null || echo dismiss)
-    [[ "$answer" == hang ]] && exec sleep 30
-    printf '%s' "$answer" > "$2"
-    exit 0
+if [[ "${1-}" == --waiting ]]; then
+    # The window after Sign: FAKE_WAITING_FILE says cancel (press Cancel) or
+    # touch (touch the key); otherwise it stays up until the service closes it.
+    printf 'waiting %s\n' "$$" >> "$capture/waiting-windows"
+    [[ -n "${3-}" ]] && : > "$3"
+    waiting=$(cat "${FAKE_WAITING_FILE:-/nonexistent}" 2>/dev/null || true)
+    sleep 0.3
+    case "$waiting" in
+        cancel) : > "$2.deciding"; printf 'cancel' > "$2"; exit 0 ;;
+        touch) : > "${FAKE_TOUCH_FILE:?}.any" ;;
+    esac
+    exec sleep 30
 fi
-if [[ "${1-}" == --touch-unchanged ]]; then
-    printf 'touch-unchanged %s\n' "${2-}" >> "$capture/touch-dialogs"
-    exit 0
+if [[ "${1-}" == --* ]]; then
+    printf '%s\n' "$*" >> "$capture/other-windows"
+    exit 64
 fi
 summary=$1 details=$2 decision=$3 ready=${4:-} spam_action=${5:-}
 cp "$summary" "$capture/$$.summary"
 cp "$details" "$capture/$$.details"
 printf '%s' "$spam_action" > "$capture/$$.spam-action"
-[[ -n "$ready" ]] && : > "$ready"
+# require-sign and the touch policy notice, when the service asks for Sign.
+printf '%s\n%s' "${6-}" "${7-}" > "$capture/$$.gate"
 choice=$(cat "${FAKE_DIALOG_DECISION_FILE:?}" 2>/dev/null || echo sign)
-if [[ "$choice" == delayed-spam ]]; then
+[[ "$choice" == never-ready ]] && exec sleep 30            # never shows, never answers
+[[ -n "$ready" ]] && : > "$ready"
+if [[ "$choice" == delayed-* ]]; then                   # answers after GPG has started
     sleep 0.5
-    choice=spam
+    choice=${choice#delayed-}
+elif [[ "$choice" == late-sign:* ]]; then                 # Sign after that many seconds
+    sleep "${choice#late-sign:}"
+    choice=sign
 fi
+touched() {
+    local sha
+    sha=$(sed -n 's/^SHA-256: //p' "$summary" | head -n 1)
+    : > "${FAKE_TOUCH_FILE:?}.$sha"
+}
 case "$choice" in
+    raw:*) touched; printf '%b' "${choice#raw:}" > "$decision" ;;   # exactly these bytes, no marker
+    marker-sign) touched; : > "$decision.deciding"; printf 'sign' > "$decision" ;;
+    marker-raw:*) touched; : > "$decision.deciding"; printf '%b' "${choice#marker-raw:}" > "$decision" ;;
+    early-sign) touched; printf 'sign' > "$decision"; sleep 30 ;;   # answers, but the window stays open
     sign)
         sha=$(sed -n 's/^SHA-256: //p' "$summary" | head -n 1)
         : > "${FAKE_TOUCH_FILE:?}.$sha"   # the "touch" completes the signature
@@ -41,6 +62,8 @@ case "$choice" in
         printf 'cancel' > "$decision"
         ;;
     cancel) : > "$decision.deciding"; printf 'cancel' > "$decision" ;;
+    touch-then-late-cancel)                             # Cancel begun, the key confirms, and Cancel lands after GPG ends
+        : > "$decision.deciding"; touched; sleep 0.5; printf 'cancel' > "$decision" ;;
     spam) : > "$decision.deciding"; printf 'spam' > "$decision" ;;
     touch-then-spam)
         sha=$(sed -n 's/^SHA-256: //p' "$summary" | head -n 1)

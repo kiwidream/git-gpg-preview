@@ -84,29 +84,61 @@ function scrollableText(text, width, height, options) {
 // message can pass itself off as one of them.
 const MESSAGE_MARKER = '\n\nMessage:\n';
 
+// Characters NSTextView starts a new line at, or that reorder text, though the
+// signers' sanitizers pass them or never see them: the C1 controls
+// U+0080-U+009F (among them NEL, which Latin-1 decoding makes of a raw 0x85
+// byte in text that is not valid UTF-8), U+2028, U+2029 and the bidirectional
+// controls. In the facts and in View Details each becomes '?', so no fact can
+// draw a line of its own and nothing in the details can pose as one; the hex
+// view there keeps the payload's exact bytes.
+const FACT_UNSAFE = /[\u0080-\u009f\u2028\u2029\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 function splitSummary(summary) {
     const at = summary.indexOf(MESSAGE_MARKER);
     if (at < 0) return {facts: '', message: summary};
-    return {facts: summary.slice(0, at), message: summary.slice(at + MESSAGE_MARKER.length)};
+    return {facts: summary.slice(0, at).replace(FACT_UNSAFE, '?'), message: summary.slice(at + MESSAGE_MARKER.length)};
 }
 
 const PREVIEW_WIDTH = 560;
 const MESSAGE_PANE_HEIGHT = 240;
-const FACTS_PANE_HEIGHT = 112;
+// The facts pane has room for each of its lines, so none is cut off: at 11
+// points a line takes about 13, and 14 leaves a margin. It never wraps, so a
+// long fact cannot pose as two; past the maximum it scrolls. Tests read these
+// lines; keep the format.
+const FACTS_LINE_HEIGHT = 14;
+const FACTS_MIN_LINES = 8;
+const FACTS_MAX_LINES = 12;
+// A fact wider than this many columns of the 11-point font scrolls sideways,
+// and a legacy horizontal scroll bar then takes this much of the pane's height.
+// Past FACTS_MAX_LINES a vertical scroll bar takes about two columns more.
+const FACTS_COLUMNS = 80;
+const FACTS_SCROLLED_COLUMNS = 78;
+const FACTS_SCROLLER_HEIGHT = 16;
 const PANE_GAP = 8;
+
+// Room for the facts' lines, kept between the minimum and the maximum, plus
+// the border, plus a horizontal scroll bar when a fact is wider than the pane.
+// Characters outside ASCII count twice: a fallback font may draw them wide.
+function factsPaneHeight(facts) {
+    const rows = facts.split('\n');
+    const lines = Math.min(Math.max(rows.length, FACTS_MIN_LINES), FACTS_MAX_LINES);
+    const columns = rows.length > FACTS_MAX_LINES ? FACTS_SCROLLED_COLUMNS : FACTS_COLUMNS;
+    const wide = rows.some(function(row) { return row.replace(/[^\x00-\x7f]/g, '  ').length > columns; });
+    return lines * FACTS_LINE_HEIGHT + 4 + (wide ? FACTS_SCROLLER_HEIGHT : 0);
+}
 
 // The message is what the reader came to check, so it comes first, gets the
 // most room and wraps. The facts have a pane of their own, because a long
 // message must not be able to scroll them out of sight.
 function previewPanes(summary) {
     const parts = splitSummary(summary);
-    const total = MESSAGE_PANE_HEIGHT + PANE_GAP + FACTS_PANE_HEIGHT;
+    const factsHeight = factsPaneHeight(parts.facts);
+    const total = MESSAGE_PANE_HEIGHT + PANE_GAP + factsHeight;
     if (!parts.facts) return scrollableText(parts.message, PREVIEW_WIDTH, total, {wrap: true});
     const panes = $.NSView.alloc.initWithFrame($.NSMakeRect(0, 0, PREVIEW_WIDTH, total));
     const message = scrollableText(parts.message.trim() ? parts.message : '(no message)',
                                    PREVIEW_WIDTH, MESSAGE_PANE_HEIGHT, {wrap: true, fontSize: 13});
-    message.frame = $.NSMakeRect(0, FACTS_PANE_HEIGHT + PANE_GAP, PREVIEW_WIDTH, MESSAGE_PANE_HEIGHT);
-    const facts = scrollableText(parts.facts, PREVIEW_WIDTH, FACTS_PANE_HEIGHT, {fontSize: 11});
+    message.frame = $.NSMakeRect(0, factsHeight + PANE_GAP, PREVIEW_WIDTH, MESSAGE_PANE_HEIGHT);
+    const facts = scrollableText(parts.facts, PREVIEW_WIDTH, factsHeight, {fontSize: 11});
     panes.addSubview(message);
     panes.addSubview(facts);
     return panes;
@@ -240,7 +272,7 @@ function runPinEntry(argv) {
         pinEntryAlert.alertStyle = $.NSAlertStyleInformational;
         pinEntryAlert.messageText = attempt > 1 ? 'Enter your security key PIN again' : 'Enter your security key PIN';
         pinEntryAlert.informativeText = (attempt > 1 ? 'The previous PIN was incorrect. ' : '') +
-            'Git is asking your key to sign the request in the review window. Enter the PIN, then touch the key when it blinks.';
+            'Git is asking your key to sign the request shown for your review. Enter the PIN, then touch the key if it blinks.';
         const parts = problem
             ? pinEntryView(problem + ' ' + status.text + '.', true)
             : pinEntryView(status.text, status.warn);
@@ -265,70 +297,45 @@ function runPinEntry(argv) {
     }
 }
 
-// Wording for the offer of the cached touch policy. `left` counts this window
-// among the dismissals the key has left.
-function touchOfferText(policy, left) {
-    const more = left === 2 ? 'one more time' : (left - 1) + ' more times';
-    const notNow = left > 1 ? 'Not Now asks again in a day, ' + more + ' at most.' : 'Not Now stops asking about this key.';
-    const next = '\n\nUse Cached asks for your Admin PIN, then changes the setting on the key. ' + notNow +
-        ' Signing continues once you answer, or after 30 seconds.';
-    if (policy === 'off') {
-        return {
-            title: 'This key signs without a touch',
-            info: 'Its touch policy is off, so it signs as soon as a request arrives, before you can review it in the preview. ' +
-                'With the cached policy it needs a touch, and that touch also covers every signature in the next 15 seconds.' + next
-        };
+// Shown by the signer after Sign while GPG runs, as the preview stays up when
+// the touch is the gate: the key may still want a touch or the PIN. Cancel
+// writes 'cancel'; nothing else is ever written. The signer closes the window
+// when GPG ends.
+function runWaiting(argv) {
+    if (argv.length < 1) {
+        throw new Error('Expected a decision path.');
     }
-    return {
-        title: 'Let one touch cover 15 seconds?',
-        info: 'Its touch policy is on, so every signature waits for its own touch. With the cached policy, a touch also covers ' +
-            'every signature in the next 15 seconds: a rebase signs all its commits on one touch, and a request queued behind ' +
-            'one you touched signs as soon as its preview opens.' + next
-    };
-}
+    const waitingApp = $.NSApplication.sharedApplication;
+    waitingApp.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
+    waitingApp.activateIgnoringOtherApps(true);
 
-// Shown by the signer before the preview. Writes 'apply' only when the user
-// picks Use Cached; the signer changes the key, never this window.
-function runTouchOffer(argv) {
-    if (argv.length < 3) {
-        throw new Error('Expected result path, touch policy and dismissals left.');
-    }
-    const policy = String(argv[1]);
-    const text = touchOfferText(policy, Number(argv[2]) || 1);
-
-    const offerApp = $.NSApplication.sharedApplication;
-    offerApp.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
-    offerApp.activateIgnoringOtherApps(true);
-
-    const offerAlert = $.NSAlert.alloc.init;
-    offerAlert.alertStyle = policy === 'off' ? $.NSAlertStyleWarning : $.NSAlertStyleInformational;
-    offerAlert.messageText = text.title;
-    offerAlert.informativeText = text.info;
-    offerAlert.addButtonWithTitle('Use Cached');
-    offerAlert.addButtonWithTitle('Not Now');
-    const response = Number(offerAlert.runModal);
-    writeDecision(argv[0], response === Number($.NSAlertFirstButtonReturn) ? 'apply' : 'dismiss');
-}
-
-// Shown by the signer when Use Cached did not take effect.
-function runTouchUnchanged(argv) {
-    const reason = argv.length > 0 ? String(argv[0]) : '';
-
-    const unchangedApp = $.NSApplication.sharedApplication;
-    unchangedApp.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
-    unchangedApp.activateIgnoringOtherApps(true);
-
-    const unchangedAlert = $.NSAlert.alloc.init;
-    unchangedAlert.alertStyle = $.NSAlertStyleWarning;
-    unchangedAlert.messageText = 'Could not set the cached touch policy';
-    unchangedAlert.informativeText = (reason ? 'gpg-agent reported: ' + reason + '.' : 'The key did not confirm the change.') +
-        ' Signing continues under the policy the key has now.\n\nTo change it yourself, run: ykman openpgp keys set-touch sig cached. ' +
-        'Cached needs YubiKey firmware 5.2.1 or later. On an older key, ykman openpgp keys set-touch sig on turns touch on.';
-    unchangedAlert.addButtonWithTitle('OK');
-    Number(unchangedAlert.runModal);
+    const waitingAlert = $.NSAlert.alloc.init;
+    waitingAlert.alertStyle = $.NSAlertStyleInformational;
+    // A key with touch off never blinks: the title must not ask for a touch.
+    waitingAlert.messageText = 'Finishing the signature (touch the key if it blinks)';
+    waitingAlert.informativeText = 'GPG is signing the request you approved. If your key blinks or asks for the PIN, ' +
+        'answer it now; otherwise this window closes by itself. Cancel stops the signature.';
+    // The only button would get Return as the first one, and a stray Return
+    // must not cancel a signature just approved: Escape is its only key.
+    const waitingCancel = waitingAlert.addButtonWithTitle('Cancel');
+    waitingCancel.keyEquivalent = '\u001b';
+    markReady(argv.length > 1 ? argv[1] : '');
+    Number(waitingAlert.runModal);
+    rejectSignature(argv[0], 'cancel');
 }
 
 function run(argv) {
+    // A signing service from before the cached touch policy offer was removed
+    // asks for its window this way. Refuse it plainly instead of reading the
+    // flag as a summary path; that service then signs on without the offer.
+    if (argv.length > 0 && (argv[0] === '--touch-offer' || argv[0] === '--touch-unchanged')) {
+        throw new Error('The cached touch policy offer was removed. Restart the signing service ' +
+                        '(git-gpg-preview-setup serve-install) so it runs the version installed with this dialog.');
+    }
+    if (argv.length > 0 && argv[0] === '--waiting') {
+        runWaiting(argv.slice(1));
+        return;
+    }
     if (argv.length > 0 && argv[0] === '--pin-error') {
         runPinError(argv.slice(1));
         return;
@@ -337,23 +344,28 @@ function run(argv) {
         runPinEntry(argv.slice(1));
         return;
     }
-    if (argv.length > 0 && argv[0] === '--touch-offer') {
-        runTouchOffer(argv.slice(1));
-        return;
-    }
-    if (argv.length > 0 && argv[0] === '--touch-unchanged') {
-        runTouchUnchanged(argv.slice(1));
-        return;
-    }
     if (argv.length < 3) {
         throw new Error('Expected summary, details, and decision paths.');
     }
     const summary = readText(argv[0]);
-    const details = readText(argv[1]);
+    const details = readText(argv[1]).replace(FACT_UNSAFE, '?');
     const decisionPath = argv[2];
     const readyPath = argv.length > 3 ? argv[3] : '';
-    // Explicit capability from the signer; never infer it from payload text.
+    // Explicit capabilities from the signer; never infer them from payload text.
     const canMarkSpam = argv.length > 4 && argv[4] === 'mark-spam';
+    // With touch policy off, cached, cached-fixed, or one the signer could not
+    // read, the key may sign without a touch of its own, so the signer starts
+    // GPG only after Sign here; the notice comes with the request. Any other key
+    // GPG could sign with is treated the same. Only on and fixed, with no such
+    // key, keep the touch as the gate, and get no Sign button.
+    const requireSign = argv.length > 5 && argv[5] === 'require-sign';
+    const signNotice = argv.length > 6 ? String(argv[6]) : '';
+    // Shown once: above the facts when the signer could write it there, and
+    // otherwise with the Sign text. It counts as there only as a paragraph of its
+    // own before the facts, where the signer puts it: never inside a fact, such
+    // as a branch name, nor in the message.
+    const factParagraphs = splitSummary(summary).facts.split('\n\n');
+    const noticeInFacts = !!signNotice && factParagraphs.slice(0, -1).indexOf(signNotice) >= 0;
 
     const app = $.NSApplication.sharedApplication;
     app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
@@ -367,11 +379,17 @@ function run(argv) {
         const alert = $.NSAlert.alloc.init;
         alert.alertStyle = $.NSAlertStyleInformational;
         alert.messageText = 'Confirm signature on your key';
-        alert.informativeText = 'Touch your key to sign; this closes when done. View Details for the full payload, or Cancel to abort.';
+        alert.informativeText = requireSign
+            ? (noticeInFacts || !signNotice ? '' : signNotice + '\n\n') +
+              'Your key may sign without a touch, so nothing is signed until you click Sign. ' +
+              'View Details for the full payload, or Cancel to abort.'
+            : 'Touch your key to sign; this closes when done. View Details for the full payload, or Cancel to abort.';
         alert.accessoryView = previewPanes(summary);
         alert.addButtonWithTitle('View Details');
         alert.addButtonWithTitle('Cancel');
         if (canMarkSpam) alert.addButtonWithTitle('Mark as Spam');
+        // Last, so Return (View Details) never signs by accident.
+        if (requireSign) alert.addButtonWithTitle('Sign');
         // Report readiness only once, as the first preview is about to show,
         // so the wrapper engages GPG after this window is already up.
         if (first) {
@@ -387,11 +405,16 @@ function run(argv) {
             rejectSignature(decisionPath, 'spam');
             return;
         }
+        if (requireSign && response === Number($.NSAlertThirdButtonReturn) + (canMarkSpam ? 1 : 0)) {
+            writeDecision(decisionPath, 'sign');
+            return;
+        }
 
         const detailAlert = $.NSAlert.alloc.init;
         detailAlert.alertStyle = $.NSAlertStyleInformational;
         detailAlert.messageText = 'Exact Payload and Derived Review Report';
-        detailAlert.informativeText = 'The exact GPG input is explicitly marked between the payload markers. The full diff is derived from Git objects and is not literal signed input. Touch your security key to sign, or return and Cancel to abort.';
+        detailAlert.informativeText = 'The exact GPG input is explicitly marked between the payload markers. The full diff is derived from Git objects and is not literal signed input. ' +
+            (requireSign ? 'Return and click Sign to sign, or Cancel to abort.' : 'Touch your security key to sign, or return and Cancel to abort.');
         detailAlert.accessoryView = scrollableText(details, 920, 600);
         detailAlert.addButtonWithTitle('Back');
         detailAlert.addButtonWithTitle('Cancel');

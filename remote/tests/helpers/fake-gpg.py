@@ -16,19 +16,30 @@ with (call_dir / 'calls').open('a') as f:
     f.write(ident + '\n')
 
 if '--list-secret-keys' in args:
+    # FAKE_GPG_LIST_FAIL: a file whose existence makes the listing fail, as a
+    # lookup can after the service has started.
+    if os.environ.get('FAKE_GPG_LIST_FAIL') and Path(os.environ['FAKE_GPG_LIST_FAIL']).exists():
+        sys.exit(2)
     # FAKE_GPG_SECRET_KEYS: comma-separated keys, each `PRIMARY[/SUBKEY...]`
     # fingerprints. A selector after the option lists only the key it names,
     # by any of its fingerprints' suffix, as gpg does. FAKE_GPG_CARD_KEYS:
-    # comma-separated fingerprints of the keys stored on a card.
+    # comma-separated fingerprints of the keys stored on a card. FAKE_GPG_STUB_KEYS:
+    # the same, of keys listed without their secret part.
+    # FAKE_GPG_ALSO_MATCHES: a file whose existence adds the certificate it holds,
+    # in the same form, to whatever the selector lists, as can happen once the
+    # service has started.
     keys = [k.split('/') for k in os.environ.get('FAKE_GPG_SECRET_KEYS', '041CE6A7BED57FE579D43B6C3DB3F5612E33B6BC').split(',') if k]
     on_card = set(os.environ.get('FAKE_GPG_CARD_KEYS', '').split(','))
     rest = [a for a in args[args.index('--list-secret-keys') + 1:] if a != '--']
     selector = rest[0].upper().removeprefix('0X') if rest else ''
-    for fingerprints in keys:
-        if selector and not any(fpr.endswith(selector) for fpr in fingerprints):
+    stubs = set(os.environ.get('FAKE_GPG_STUB_KEYS', '').split(','))
+    also = os.environ.get('FAKE_GPG_ALSO_MATCHES')
+    also_matches = [Path(also).read_text().strip().split('/')] if also and Path(also).exists() else []
+    for fingerprints in [*keys, *also_matches]:
+        if selector and fingerprints not in also_matches and not any(fpr.endswith(selector) for fpr in fingerprints):
             continue
         for index, fpr in enumerate(fingerprints):
-            token = 'D2760001240100000006000000010000' if fpr in on_card else '+'
+            token = '#' if fpr in stubs else 'D2760001240100000006000000010000' if fpr in on_card else '+'
             print(f"{'sec' if index == 0 else 'ssb'}:u:255:22:{fpr[-16:]}:1789650000:::u:::{'scESC' if index == 0 else 's'}:::{token}:::ed25519:::0:")
             print(f'fpr:::::::::{fpr}:')
     sys.exit(0)
@@ -43,12 +54,32 @@ if '--export' in args:
 signing = any(a in ('--sign', '--detach-sign') or (a.startswith('-') and not a.startswith('--') and ('s' in a[1:] or 'b' in a[1:])) for a in args)
 if signing and '--verify' not in args and os.environ.get('FAKE_TOUCH_FILE'):
     touch = Path(os.environ['FAKE_TOUCH_FILE'] + '.' + hashlib.sha256(payload).hexdigest())
+    # Whether the fake dialog had already answered (and touched) when this
+    # call started: "before" means GPG was engaged only after the preview.
+    with (call_dir / 'touch-at-start').open('a') as f:
+        f.write('before\n' if touch.exists() else 'after\n')
+    # FAKE_GPG_SLOW: seconds the operator takes over the PIN and touch.
+    time.sleep(float(os.environ.get('FAKE_GPG_SLOW', '0')))
+    # FAKE_CARD_QUEUE: the card's operations, one payload hash per line. A call
+    # stopped before the touch leaves its line, as gpg-agent and scdaemon keep a
+    # stopped GPG's request, until SCD KILLSCD clears it; a touch completes the
+    # oldest one, whoever asked.
+    queue = os.environ.get('FAKE_CARD_QUEUE')
+    if queue:
+        with open(queue, 'a') as f:
+            f.write(hashlib.sha256(payload).hexdigest() + '\n')
     deadline = time.monotonic() + 10
-    while not touch.exists():
+    # FAKE_TOUCH_FILE.any: a touch made while the waiting window is up.
+    while not touch.exists() and not Path(os.environ['FAKE_TOUCH_FILE'] + '.any').exists():
         if time.monotonic() > deadline:
             sys.stderr.write('fake-gpg: timed out waiting for touch\n')
             sys.exit(2)
         time.sleep(0.05)
+    if queue:
+        lines = Path(queue).read_text().splitlines()
+        Path(queue).write_text(''.join(line + '\n' for line in lines[1:]))
+        sys.stdout.write(f'signed:{lines[0] if lines else ""}')
+        sys.exit(0)
 sys.stdout.write(os.environ.get('FAKE_GPG_STDOUT', ''))
 sys.stdout.flush()
 sys.stderr.write(os.environ.get('FAKE_GPG_STDERR', ''))
