@@ -787,6 +787,9 @@ class TouchPolicyTests(unittest.TestCase):
         self.assertEqual(self.touch_at_start(h), ['before'], 'GPG started before Sign')
         self.assertEqual(self.gate(h), 'require-sign\n' + remote.TOUCH_NOTICES['off'])
         self.assertNotIn('not signed', stderr)
+        # The client cannot know the policy, so its hint names both answers.
+        self.assertIn('on that machine, touch the key when its preview appears (touch policy on or fixed), '
+                      'or click Sign in the preview (off, cached, cached-fixed or unknown)\n', stderr)
 
     def test_an_unknown_policy_needs_sign_too(self):
         """A policy that cannot be read (an unknown value, no setting, no card,
@@ -862,7 +865,8 @@ class TouchPolicyTests(unittest.TestCase):
                 paths['details.txt'].write_text('details')
                 paths['decision'].write_text('')
                 result = service._run_dialog_and_gpg(['--status-fd=2', '-bsau', self.PRIMARY], paths, info, digest,
-                                                     'repo', 'peer', time.monotonic(), True, '', 'off')
+                                                     'repo', 'peer', time.monotonic(),
+                                                     require_sign=True, sign_notice='', policy='off')
                 self.assertEqual(result['status'], status, result)
                 self.assertEqual(self.gate(h), 'require-sign\n')
                 self.assertEqual(self.touch_at_start(h), ['before'] if status == 0 else [])
@@ -904,6 +908,75 @@ class TouchPolicyTests(unittest.TestCase):
         h.decision.write_text('raw:sign')
         self.sign(h, f'{self.CARD_SUB} %00+')
         self.assertEqual(self.touch_at_start(h), ['before'])
+
+    def test_only_exact_answers_cancel_or_mark_as_spam(self):
+        """' cancel', 'cancel\\0' and 'spam\\n' are no answer the preview gives:
+        refused as Sign not clicked, with the wrapper's status and audit name,
+        neither as Cancel nor as Mark as Spam."""
+        for index, answer in enumerate(('raw: cancel', 'raw:cancel\\0', 'raw:spam\\n')):
+            with self.subTest(answer=answer):
+                h = self.harness(f'x{index}')
+                self.refused(h, answer)
+                self.assertEqual(re.findall(r'decision=(\S+)', h.audit.read_text()), ['sign-not-clicked'])
+                self.assertFalse((h.serve_dir / 'spam-subjects').exists())
+
+    def test_after_sign_a_window_waits_for_the_touch_and_offers_cancel(self):
+        """After Sign the preview has closed, and a key that still wants a touch
+        gets a window that says so while GPG runs: a touch signs and closes it;
+        Cancel in it stops GPG, cancels the card operation and signs nothing.
+        When the touch is the gate the preview stays up instead, so no such
+        window opens."""
+        waiting = self.tmp / 'waiting'
+        h = self.harness('touch', extra_env={'FAKE_WAITING_FILE': str(waiting)})
+        waiting.write_text('touch')
+        h.decision.write_text('approve-no-touch')
+        self.sign(h, f'{self.CARD_SUB} %00+')
+        self.assertEqual(self.touch_at_start(h), ['after'], 'GPG did not wait for the touch')
+        windows = (h.captures / 'waiting-windows').read_text().split('\n')
+        self.assertEqual((len(windows), windows[0].split()[0]), (2, 'waiting'))
+        with self.assertRaises(ProcessLookupError, msg='the waiting window outlived the signature'):
+            os.kill(int(windows[0].split()[1]), 0)
+        queue = self.tmp / 'card-queue'
+        queue.write_text('')
+        h = self.harness('cancel', extra_env={'FAKE_WAITING_FILE': str(waiting), 'FAKE_CARD_QUEUE': str(queue)})
+        waiting.write_text('cancel')
+        h.decision.write_text('approve-no-touch')
+        self.card.write_text(f'{self.CARD_SUB} %00+')
+        result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+        self.assertEqual((result.returncode, result.stdout), (remote.EX_CANCELLED, b''), result.stderr)
+        self.assertIn(b'signing cancelled by operator', result.stderr)
+        self.assertEqual(self.touch_at_start(h), ['after'], 'GPG did not run after Sign')
+        self.assertIn('SCD KILLSCD /bye', (h.calls / 'connect-agent-calls').read_text().splitlines())
+        self.assertEqual(queue.read_text(), '', 'the stopped signature still waits at the card')
+        self.assertEqual(re.findall(r'decision=(\S+)', h.audit.read_text()), ['cancel'])
+        h = self.harness('on', extra_env={'FAKE_WAITING_FILE': str(waiting)})
+        self.sign(h, f'{self.CARD_SUB} %01+')
+        self.assertFalse((h.captures / 'waiting-windows').exists())
+
+    def test_the_policy_is_read_from_the_card_not_scdaemons_copy(self):
+        """scdaemon answers GETATTR UIF-1 from the card data it read first, so a
+        policy changed since (ykman openpgp keys set-touch) would read as the
+        old one. The service asks the card itself: a key turned from on to off
+        asks for Sign on the next request."""
+        h = self.harness('h', extra_env={'FAKE_SCD_CACHE': str(self.tmp / 'scd-cache')})
+        h.decision.write_text('delayed-sign')
+        self.sign(h, f'{self.CARD_SUB} %01+')
+        self.assertEqual(self.gate(h), '\n')
+        self.untouch(h)
+        self.sign(h, f'{self.CARD_SUB} %00+')
+        self.assertEqual(self.gate(h), 'require-sign\n' + remote.TOUCH_NOTICES['off'])
+        self.assertEqual(self.touch_at_start(h), ['before'], 'GPG started before Sign')
+
+    def test_sign_timeout_must_be_positive_and_finite(self):
+        h = self.harness('h')
+        serve = (h.serve_dir / 'serve').read_text()
+        for value in ('nan', 'inf', '-inf', '0', '-5', 'soon'):
+            with self.subTest(value=value):
+                (h.serve_dir / 'serve').write_text(f'{serve}sign_timeout_seconds={value}\n')
+                with self.assertRaisesRegex(remote.RemoteError, 'sign_timeout_seconds must be a positive, finite'):
+                    remote.ServeConfig(h.serve_dir)
+        (h.serve_dir / 'serve').write_text(f'{serve}sign_timeout_seconds=7.5\n')
+        self.assertEqual(remote.ServeConfig(h.serve_dir).sign_timeout, 7.5)
 
     def test_touch_off_mark_as_spam_saves_the_subject_without_gpg(self):
         h = self.harness('h')
@@ -1044,14 +1117,18 @@ class TouchPolicyTests(unittest.TestCase):
 
     def test_a_pending_answer_is_read_with_the_one_rule(self):
         """An answer the preview began (its marker exists) is awaited as
-        read_decision reads it: 'sign ' and 'sign\\n' are answers but no Sign,
-        an empty file is none yet, and bytes that are not UTF-8 do not break
-        the wait. Such an answer after a touch releases nothing."""
+        read_decision reads it: only exactly sign, cancel and spam count, so
+        'sign ', 'sign\\n', ' cancel', 'cancel\\0' and bytes that are not UTF-8
+        are answers but invalid, and an empty file is none yet. Such an answer
+        after a touch releases nothing."""
         service = remote.Service.__new__(remote.Service)
         decision = self.tmp / 'decision'
         (self.tmp / 'decision.deciding').write_text('')
         for data, waits, read in ((b'sign ', False, 'invalid'), (b'sign\n', False, 'invalid'),
-                                  (b'\xff\xfe', False, '\ufffd\ufffd'), (b'', True, '')):
+                                  (b' cancel', False, 'invalid'), (b'cancel\0', False, 'invalid'),
+                                  (b'\xff\xfe', False, 'invalid'), (b'', True, ''),
+                                  (b'sign', False, 'sign'), (b'cancel', False, 'cancel'),
+                                  (b'spam', False, 'spam')):
             with self.subTest(data=data):
                 decision.write_bytes(data)
                 started = time.monotonic()

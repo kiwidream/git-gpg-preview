@@ -6,6 +6,19 @@
 set -u
 capture=${FAKE_DIALOG_CAPTURE_DIR:?}
 mkdir -p "$capture"
+if [[ "${1-}" == --waiting ]]; then
+    # The window after Sign: FAKE_WAITING_FILE says cancel (press Cancel) or
+    # touch (touch the key); otherwise it stays up until the service closes it.
+    printf 'waiting %s\n' "$$" >> "$capture/waiting-windows"
+    [[ -n "${3-}" ]] && : > "$3"
+    waiting=$(cat "${FAKE_WAITING_FILE:-/nonexistent}" 2>/dev/null || true)
+    sleep 0.3
+    case "$waiting" in
+        cancel) : > "$2.deciding"; printf 'cancel' > "$2"; exit 0 ;;
+        touch) : > "${FAKE_TOUCH_FILE:?}.any" ;;
+    esac
+    exec sleep 30
+fi
 if [[ "${1-}" == --* ]]; then
     printf '%s\n' "$*" >> "$capture/other-windows"
     exit 64

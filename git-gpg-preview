@@ -55,6 +55,7 @@ UNKNOWN_TOUCH_NOTICE="Touch policy unknown: Sign to continue"
 # with the Sign button.
 CACHED_FIXED_TOUCH_NOTICE="Touch policy cached-fixed: one touch signs for 15 seconds; Sign is required."
 TOUCH_NOTICE=""
+REQUEST_HOMEDIR=""
 
 error() {
     printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
@@ -62,12 +63,11 @@ error() {
 
 cleanup() {
     [[ -z "$SPAM_TEMP" ]] || /bin/rm -f "$SPAM_TEMP"
+    # A GPG still running when the wrapper ends is stopped, with what it left
+    # at the card, before the dialog lock below goes to the next request.
+    [[ -z "${GPG_PID:-}" ]] || ! /bin/kill -0 "$GPG_PID" 2>/dev/null || stop_gpg "$GPG_PID"
     flush_gpg_stderr
-    if [[ -n "$DIALOG_PID" ]] && /bin/kill -0 "$DIALOG_PID" 2>/dev/null; then
-        /bin/kill -s TERM "$DIALOG_PID" 2>/dev/null || true
-        wait "$DIALOG_PID" 2>/dev/null || true
-        DIALOG_PID=""
-    fi
+    dismiss_dialog
     dismiss_pin_entry
     if [[ "$LOCK_HELD" -eq 1 && -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
         local owner=""
@@ -83,22 +83,29 @@ cleanup() {
 }
 
 on_signal() {
-    local signal="$1"
-    if [[ -n "$CHILD_PID" ]]; then
-        /bin/kill -s "$signal" "$CHILD_PID" 2>/dev/null || true
-        wait "$CHILD_PID" 2>/dev/null || true
+    local signal="$1" number="$2"
+    # GPG may ignore the signal while it waits on gpg-agent: stop_gpg ends it
+    # without a blocking wait, and cancels what it left at the card, so a signal
+    # cannot hang the wrapper. Any other child (a bounded query) is just ended.
+    if [[ -n "${GPG_PID:-}" ]] && /bin/kill -0 "$GPG_PID" 2>/dev/null; then
+        stop_gpg "$GPG_PID"
+    elif [[ -n "$CHILD_PID" ]]; then
+        /bin/kill -s KILL "$CHILD_PID" 2>/dev/null || true
         CHILD_PID=""
     fi
     cleanup
     trap - "$signal"
     /bin/kill -s "$signal" "$$"
+    # bash does not act on a SIGINT it sends itself from its INT trap, and the
+    # script must not carry on: end it with the status the signal would give.
+    exit $((128 + number))
 }
 
 trap cleanup EXIT
-trap 'on_signal HUP' HUP
-trap 'on_signal INT' INT
-trap 'on_signal QUIT' QUIT
-trap 'on_signal TERM' TERM
+trap 'on_signal HUP 1' HUP
+trap 'on_signal INT 2' INT
+trap 'on_signal QUIT 3' QUIT
+trap 'on_signal TERM 15' TERM
 
 read_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -430,25 +437,33 @@ bad_pin_failure() {
     /usr/bin/grep -Eq '^\[GNUPG:\] SC_OP_FAILURE 2$|signing failed: Bad PIN$' "$GPG_STDERR"
 }
 
-# Runs a read-only query into a file. Bounded, so a wedged card or agent
-# cannot hold the dialog lock forever. Fails when the query fails or is cut off.
-run_query() {
-    local output="$1" pid waited=0 status=0
-    shift
+# Runs a command into a file for at most TICKS twentieths of a second, so a
+# wedged card or agent cannot hold the dialog lock forever: TERM, then KILL
+# half a second later. Fails when the command fails or is cut off.
+run_bounded() {
+    local ticks="$1" output="$2" pid waited=0 status=0
+    shift 2
     "$@" < /dev/null > "$output" 2>/dev/null 4>&- &
     pid=$!
     CHILD_PID=$pid
     while /bin/kill -0 "$pid" 2>/dev/null; do
         /bin/sleep 0.05
         waited=$((waited + 1))
-        if [[ "$waited" -ge 200 ]]; then   # 10s
+        if [[ "$waited" -eq "$ticks" ]]; then
             /bin/kill -s TERM "$pid" 2>/dev/null || true
+        elif [[ "$waited" -ge $((ticks + 10)) ]]; then
+            /bin/kill -s KILL "$pid" 2>/dev/null || true
             break
         fi
     done
     wait "$pid" 2>/dev/null || status=$?
     CHILD_PID=""
     return "$status"
+}
+
+# Runs a read-only query into a file, bounded at 10s.
+run_query() {
+    run_bounded 200 "$@"
 }
 
 run_gpg_query() {
@@ -576,16 +591,22 @@ card_touch_policy() {
     agent=$(gpg_connect_agent) || return 0
     look_up_signing_key
     [[ "$SIGNING_KEY" == *" card" ]] || return 0
-    run_query "$REQUEST_DIR/card-touch" "$agent" 'SCD SERIALNO openpgp' 'SCD GETATTR KEY-FPR' 'SCD GETATTR UIF-1' /bye ||
+    # scdaemon caches GETATTR UIF-1 (with the rest of the card's Application
+    # Related Data) for as long as it runs, so after ykman changed the policy it
+    # can report the old one. A raw GET DATA for DO D6 through SCD APDU reads the
+    # card itself; it leaves PIN verification and that cache alone, and the AID
+    # check scdaemon makes after it finds the OpenPGP application still
+    # selected. --hex prints the reply as hex: the policy byte, 0x20, and the
+    # status word 90 00. Anything else is a policy that cannot be read.
+    run_query "$REQUEST_DIR/card-touch" "$agent" --hex 'SCD SERIALNO openpgp' 'SCD GETATTR KEY-FPR' 'SCD APDU 00CA00D600' /bye ||
         return 0
-    # scdaemon escapes the raw UIF bytes: the policy byte, then 0x20 ("+").
     TOUCH_POLICY=$(/usr/bin/awk -v key="${SIGNING_KEY%% *}" '
         $1 == "S" && $2 == "KEY-FPR" && $3 == "1" { card = toupper($4) }
-        $1 == "S" && $2 == "UIF-1" { uif = $3 }
+        $1 == "D[0000]" { reply = $2 " " $3 " " $4 " " $5 }
         END {
-            if (card != key || uif !~ /^%0[0-4]/) exit
+            if (card != key || reply !~ /^0[0-4] [0-9A-F][0-9A-F] 90 00$/) exit
             split("off on fixed cached cached-fixed", policy, " ")
-            print policy[substr(uif, 3, 1) + 1]
+            print policy[substr(reply, 2, 1) + 1]
         }
     ' "$REQUEST_DIR/card-touch" 2>/dev/null)
 }
@@ -640,25 +661,54 @@ prepend_touch_notice() {
 # and scdaemon keep its request, and any PIN request scdaemon made, alive: the next
 # touch would complete that stale operation, or find the card busy. Stopping
 # scdaemon, as gpgconf --kill scdaemon does, ends both; gpg-agent starts it
-# again for the next request, which may ask for the PIN again. Bounded, and
-# done before the dialog lock goes to the next request.
+# again for the next request, which may ask for the PIN again. Bounded at 3s,
+# and done before the dialog lock goes to the next request.
 cancel_card_operation() {
     local agent
     agent=$(gpg_connect_agent) || return 0
-    run_query /dev/null "$agent" 'SCD KILLSCD' /bye || true
+    if [[ -n "$REQUEST_HOMEDIR" ]]; then
+        run_bounded 60 /dev/null "$agent" --homedir "$REQUEST_HOMEDIR" 'SCD KILLSCD' /bye || true
+    else
+        run_bounded 60 /dev/null "$agent" 'SCD KILLSCD' /bye || true
+    fi
+}
+
+# The home directory a request names with --homedir, whose gpg-agent and
+# scdaemon its GPG uses; nothing for the default one (GNUPGHOME is inherited).
+requested_homedir() {
+    local arg expect=0
+    for arg in "$@"; do
+        if [[ "$expect" -eq 1 ]]; then
+            printf '%s' "$arg"
+            return 0
+        fi
+        case "$arg" in
+            --homedir) expect=1 ;;
+            --homedir=*) printf '%s' "${arg#--homedir=}"; return 0 ;;
+            --) break ;;
+        esac
+    done
 }
 
 # Stops GPG at PID and, when it was still running, the operation it may have
 # left waiting at the card, before the dialog lock goes to the next request.
 stop_gpg() {
-    local pid="$1"
+    local pid="$1" waited=0
     if /bin/kill -0 "$pid" 2>/dev/null; then
         /bin/kill -s TERM "$pid" 2>/dev/null || true
+        # Never a blocking wait on a GPG that ignores TERM: KILL it after 1s.
+        while /bin/kill -0 "$pid" 2>/dev/null && [[ "$waited" -lt 10 ]]; do
+            /bin/sleep 0.1
+            waited=$((waited + 1))
+        done
+        /bin/kill -s KILL "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
         cancel_card_operation
     else
         wait "$pid" 2>/dev/null || true
     fi
+    # Reaped: its number may go to another process, which must never be stopped.
+    [[ "$pid" != "${GPG_PID:-}" ]] || GPG_PID=""
     CHILD_PID=""
 }
 
@@ -699,6 +749,15 @@ uses_builtin_pin_entry() {
     [[ "$status_on_stderr" -eq 1 ]] && signing_key_on_card
 }
 
+# Closes the preview, or the window after Sign, if it is still open.
+dismiss_dialog() {
+    if [[ -n "$DIALOG_PID" ]] && /bin/kill -0 "$DIALOG_PID" 2>/dev/null; then
+        /bin/kill -s TERM "$DIALOG_PID" 2>/dev/null || true
+        wait "$DIALOG_PID" 2>/dev/null || true
+    fi
+    DIALOG_PID=""
+}
+
 dismiss_pin_entry() {
     if [[ -n "$PIN_DIALOG_PID" ]] && /bin/kill -0 "$PIN_DIALOG_PID" 2>/dev/null; then
         /bin/kill -s TERM "$PIN_DIALOG_PID" 2>/dev/null || true
@@ -737,15 +796,21 @@ poll_pin_entry() {
     return 0
 }
 
-# Reads the preview's answer into DECISION_VALUE. Only the exact bytes "sign"
-# count as Sign: no case folding, no whitespace, and nothing that a command
-# substitution would quietly drop, such as a trailing newline or a NUL. Other
-# answers keep the plain read, so a rejection can never be read as no answer.
+# Reads the preview's answer into DECISION_VALUE, as the remote service's
+# read_decision does: only the exact bytes "sign", "cancel" or "spam" count,
+# with no case folding, no whitespace and nothing a command substitution would
+# quietly drop, such as a trailing newline or a NUL. Anything else is invalid,
+# and an empty file is no answer yet.
 read_decision() {
-    { DECISION_VALUE=$(/bin/cat "$DECISION" 2>/dev/null || true); } 2>/dev/null
-    if [[ "$DECISION_VALUE" == sign ]] && ! printf sign | /usr/bin/cmp -s - "$DECISION"; then
-        DECISION_VALUE=invalid
-    fi
+    local answer
+    for answer in sign cancel spam; do
+        if printf '%s' "$answer" | /usr/bin/cmp -s - "$DECISION"; then
+            DECISION_VALUE=$answer
+            return 0
+        fi
+    done
+    DECISION_VALUE=""
+    [[ ! -s "$DECISION" ]] || DECISION_VALUE=invalid
 }
 
 # With touch off, cached, cached-fixed or unknown, GPG starts only after the
@@ -778,6 +843,29 @@ await_sign_click() {
     handle_operator_rejection
     release_dialog_lock
     audit_decision "sign-not-clicked" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+    exit 70
+}
+
+# Waits, at most 5s, for the window at DIALOG_PID to report that it is up, so
+# GPG, and with it the PIN prompt, starts after it and stays in front.
+await_ready() {
+    local waited=0
+    while [[ ! -e "$READY" ]] && /bin/kill -0 "$DIALOG_PID" 2>/dev/null && [[ "$waited" -lt 100 ]]; do
+        /bin/sleep 0.05
+        waited=$((waited + 1))
+    done
+}
+
+# After Sign nothing but the key is left to answer: a GPG still waiting for a
+# touch or the PIN after SIGN_GPG_SECONDS is stopped, with what it left at the
+# card, and the request ends unsigned.
+refuse_gpg_timeout() {
+    stop_gpg "$GPG_PID"
+    dismiss_dialog
+    dismiss_pin_entry
+    release_dialog_lock
+    audit_decision "gpg-timeout" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+    error "not signed: no touch or PIN before the deadline"
     exit 70
 }
 
@@ -1199,6 +1287,7 @@ SPAM_ACTION=""
 [[ -s "$SPAM_SUBJECT_FILE" ]] && SPAM_ACTION="mark-spam"
 PREVIEW_SUMMARY="$SUMMARY"
 GPG_ARGS=("$@")
+REQUEST_HOMEDIR=$(requested_homedir "$@")
 BUILTIN_PIN=0
 if uses_builtin_pin_entry "$@"; then
     BUILTIN_PIN=1
@@ -1261,18 +1350,18 @@ while :; do
     /usr/bin/osascript -l JavaScript "$UI_HELPER" "${PREVIEW_ARGS[@]}" >/dev/null 2>&1 4>&- &
     DIALOG_PID=$!
 
-    ready_waited=0
-    while [[ ! -e "$READY" ]]; do
-        if ! /bin/kill -0 "$DIALOG_PID" 2>/dev/null; then
-            break
-        fi
-        /bin/sleep 0.05
-        ready_waited=$((ready_waited + 1))
-        if [[ "$ready_waited" -ge 100 ]]; then
-            break
-        fi
-    done
-    [[ "$SIGN_GATE" -eq 0 ]] || await_sign_click
+    await_ready
+    if [[ "$SIGN_GATE" -eq 1 ]]; then
+        await_sign_click
+        # The preview has closed. The key may still want a touch or the PIN,
+        # so a window that says so, with Cancel, stays up while GPG runs, as the
+        # preview does when the touch is the gate. It closes when GPG ends.
+        : > "$DECISION"
+        /bin/rm -f "$DECIDING" "$READY"
+        /usr/bin/osascript -l JavaScript "$UI_HELPER" --waiting "$DECISION" "$READY" >/dev/null 2>&1 4>&- &
+        DIALOG_PID=$!
+        await_ready
+    fi
 
     # Hold the output until the final decision check, so a simultaneous touch
     # and rejection cannot leak a signature to Git.
@@ -1288,15 +1377,12 @@ while :; do
     OUTCOME=""
     DECISION_VALUE=""
     GPG_STATUS=0
-    if [[ "$SIGN_GATE" -eq 1 ]]; then
-        # Sign was clicked and the preview has closed: only GPG is left to wait for.
-        OUTCOME="dialog"
-        DECISION_VALUE="sign"
-    fi
+    gpg_waited=0
     while [[ -z "$OUTCOME" ]]; do
         if ! /bin/kill -0 "$GPG_PID" 2>/dev/null; then
             wait "$GPG_PID"
             GPG_STATUS=$?
+            GPG_PID=""
             OUTCOME="signed"
             break
         fi
@@ -1311,7 +1397,10 @@ while :; do
             OUTCOME="pin-window"
             break
         fi
+        # After Sign, a key that never answers is stopped in time.
+        [[ "$SIGN_GATE" -eq 0 || "$gpg_waited" -lt $((SIGN_GPG_SECONDS * 10)) ]] || refuse_gpg_timeout
         /bin/sleep 0.1
+        gpg_waited=$((gpg_waited + 1))
     done
 
     if [[ "$OUTCOME" == "dialog" ]]; then
@@ -1328,20 +1417,14 @@ while :; do
                         OUTCOME="pin-window"
                         break
                     fi
-                    if [[ "$gpg_waited" -ge $((SIGN_GPG_SECONDS * 10)) ]]; then
-                        stop_gpg "$GPG_PID"
-                        dismiss_pin_entry
-                        release_dialog_lock
-                        audit_decision "gpg-timeout" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
-                        error "not signed: no touch or PIN before the deadline"
-                        exit 70
-                    fi
+                    [[ "$gpg_waited" -lt $((SIGN_GPG_SECONDS * 10)) ]] || refuse_gpg_timeout
                     /bin/sleep 0.1
                     gpg_waited=$((gpg_waited + 1))
                 done
                 if [[ "$OUTCOME" != "pin-window" ]]; then
                     wait "$GPG_PID"
                     GPG_STATUS=$?
+                    GPG_PID=""
                     CHILD_PID=""
                     OUTCOME="signed"
                 fi
@@ -1381,11 +1464,7 @@ while :; do
     # A rejection already in flight has to land before its writer is terminated.
     await_pending_decision
     # Dismiss the review window if it is still open.
-    if [[ -n "$DIALOG_PID" ]] && /bin/kill -0 "$DIALOG_PID" 2>/dev/null; then
-        /bin/kill -s TERM "$DIALOG_PID" 2>/dev/null || true
-        wait "$DIALOG_PID" 2>/dev/null || true
-    fi
-    DIALOG_PID=""
+    dismiss_dialog
     dismiss_pin_entry
     CHILD_PID=""
     read_decision

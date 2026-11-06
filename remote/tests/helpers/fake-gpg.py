@@ -58,7 +58,8 @@ if signing and '--verify' not in args and os.environ.get('FAKE_TOUCH_FILE'):
         with open(queue, 'a') as f:
             f.write(hashlib.sha256(payload).hexdigest() + '\n')
     deadline = time.monotonic() + 10
-    while not touch.exists():
+    # FAKE_TOUCH_FILE.any: a touch made while the waiting window is up.
+    while not touch.exists() and not Path(os.environ['FAKE_TOUCH_FILE'] + '.any').exists():
         if time.monotonic() > deadline:
             sys.stderr.write('fake-gpg: timed out waiting for touch\n')
             sys.exit(2)

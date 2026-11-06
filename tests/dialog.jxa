@@ -56,6 +56,16 @@ function pinModalResponse(alert) {
 }
 var lastPinText = '';
 
+// The window after Sign: record what it says and which buttons it has.
+var waitingSeen = [];
+function waitingModalResponse(alert) {
+    const buttons = alert.buttons;
+    const titles = [];
+    for (let i = 0; i < Number(buttons.count); i++) titles.push(ObjC.unwrap(buttons.objectAtIndex(i).title));
+    waitingSeen.push({buttons: titles.join('|'), message: ObjC.unwrap(alert.messageText), info: ObjC.unwrap(alert.informativeText)});
+    return 1000;
+}
+
 // PIN window: record what the user would see, type the scripted PIN, answer.
 var pinEntryScript = [];
 var pinEntrySeen = [];
@@ -86,7 +96,9 @@ function run(argv) {
         ['pinApp.activateIgnoringOtherApps(true);', ''],
         ['Number(pinAlert.runModal)', 'pinModalResponse(pinAlert)'],
         ['pinEntryApp.activateIgnoringOtherApps(true);', ''],
-        ['Number(pinEntryAlert.runModal)', 'pinEntryModalResponse(pinEntryAlert)']
+        ['Number(pinEntryAlert.runModal)', 'pinEntryModalResponse(pinEntryAlert)'],
+        ['waitingApp.activateIgnoringOtherApps(true);', ''],
+        ['Number(waitingAlert.runModal)', 'waitingModalResponse(waitingAlert)']
     ];
     let instrumented = source;
     substitutions.forEach(function(pair) {
@@ -231,6 +243,7 @@ function run(argv) {
         {summary: notice + '\n\nRequest type: commit\n\nMessage:\nSubject', notice: notice, repeated: false},
         {summary: 'PIN attempt 2: wrong\n\n' + notice + '\n\nRequest type: commit\n\nMessage:\nSubject', notice: notice, repeated: false},
         {summary: 'Request type: commit\n\nMessage:\n' + notice, notice: notice, repeated: true},
+        {summary: 'Request type: commit\n\nMessage:\nSubject\n\n' + notice + '\n\nBody', notice: notice, repeated: true},
         {summary: 'Request type: commit\nBranch: x ' + unknownNotice + '\n\nMessage:\nSubject', notice: unknownNotice, repeated: true},
         {summary: 'Request type: commit\nBranch: ' + unknownNotice + '\n\nMessage:\nSubject', notice: unknownNotice, repeated: true}
     ].forEach(function(test) {
@@ -275,6 +288,18 @@ function run(argv) {
         refused = error.message;
     }
     if (refused.indexOf('The cached touch policy offer was removed.') !== 0 || modalCount !== 0 || readText(decision) !== '') throw new Error('The touch offer was answered: ' + refused);
+    // After Sign the preview has closed: a window says the key may still want a
+    // touch or the PIN, reports that it is up, and has only Cancel, whose
+    // answer is a rejection like the preview's.
+    $.NSData.data.writeToFileAtomically(decision, true);
+    $.NSFileManager.defaultManager.removeItemAtPathError(ready, null);
+    $.NSFileManager.defaultManager.removeItemAtPathError(decision + '.deciding', null);
+    waitingSeen = [];
+    runPreview(['--waiting', decision, ready]);
+    if (waitingSeen.length !== 1 || waitingSeen[0].buttons !== 'Cancel' || waitingSeen[0].message !== 'Touch the key to finish signing' ||
+        waitingSeen[0].info.indexOf('Cancel stops the signature') < 0) throw new Error('Wrong window after Sign: ' + JSON.stringify(waitingSeen));
+    if (readText(decision) !== 'cancel' || !$.NSFileManager.defaultManager.fileExistsAtPath(decision + '.deciding') ||
+        !$.NSFileManager.defaultManager.fileExistsAtPath(ready)) throw new Error('Cancel after Sign was not a marked rejection, or the window never reported');
     // Wrong-PIN dialog: Try Again only while attempts remain and the signer allows it.
     [
         {args: ['2', 'retry'], buttons: ['Try Again', 'Cancel'], response: 1000, decision: 'retry', text: '2 attempts remaining'},
@@ -325,5 +350,5 @@ function run(argv) {
             if (!seen.secure) throw new Error(where + 'PIN field is not secure');
         });
     });
-    return 'Dialog actions passed (57 cases)';
+    return 'Dialog actions passed (59 cases)';
 }

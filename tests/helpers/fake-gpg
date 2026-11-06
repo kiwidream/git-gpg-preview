@@ -3,6 +3,9 @@
 set -u
 umask 077
 
+# FAKE_GPG_IGNORE_SIGNALS: ignore INT and TERM, as GPG may while it waits on
+# gpg-agent; only KILL stops it then.
+[[ -z "${FAKE_GPG_IGNORE_SIGNALS-}" ]] || trap '' INT TERM
 CALL_DIR=${FAKE_GPG_CALL_DIR:?}
 mkdir -p "$CALL_DIR"
 id="$$.$RANDOM"
@@ -131,7 +134,8 @@ if [[ "$signing" -eq 1 && "$verify" -eq 0 && -n "${FAKE_TOUCH_FILE-}" ]]; then
     sha=$(shasum -a 256 "$payload" | awk '{print $1}')
     touch_file="$FAKE_TOUCH_FILE.$sha"
     waited=0
-    while [[ ! -e "$touch_file" ]]; do
+    # "$FAKE_TOUCH_FILE.any": a touch made while the waiting window is up.
+    while [[ ! -e "$touch_file" && ! -e "$FAKE_TOUCH_FILE.any" ]]; do
         sleep 0.05
         waited=$((waited + 1))
         if [[ "$waited" -ge 200 ]]; then

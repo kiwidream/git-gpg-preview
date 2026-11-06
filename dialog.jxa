@@ -289,6 +289,29 @@ function runPinEntry(argv) {
     }
 }
 
+// Shown by the signer after Sign while GPG runs, as the preview stays up when
+// the touch is the gate: the key may still want a touch or the PIN. Cancel
+// writes 'cancel'; nothing else is ever written. The signer closes the window
+// when GPG ends.
+function runWaiting(argv) {
+    if (argv.length < 1) {
+        throw new Error('Expected a decision path.');
+    }
+    const waitingApp = $.NSApplication.sharedApplication;
+    waitingApp.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
+    waitingApp.activateIgnoringOtherApps(true);
+
+    const waitingAlert = $.NSAlert.alloc.init;
+    waitingAlert.alertStyle = $.NSAlertStyleInformational;
+    waitingAlert.messageText = 'Touch the key to finish signing';
+    waitingAlert.informativeText = 'GPG is signing the request you approved. If your key asks for a touch or the PIN, ' +
+        'give it now; if it needs neither, this window closes by itself. Cancel stops the signature.';
+    waitingAlert.addButtonWithTitle('Cancel');
+    markReady(argv.length > 1 ? argv[1] : '');
+    Number(waitingAlert.runModal);
+    rejectSignature(argv[0], 'cancel');
+}
+
 function run(argv) {
     // A signing service from before the cached touch policy offer was removed
     // asks for its window this way. Refuse it plainly instead of reading the
@@ -296,6 +319,10 @@ function run(argv) {
     if (argv.length > 0 && (argv[0] === '--touch-offer' || argv[0] === '--touch-unchanged')) {
         throw new Error('The cached touch policy offer was removed. Restart the signing service ' +
                         '(git-gpg-preview-setup serve-install) so it runs the version installed with this dialog.');
+    }
+    if (argv.length > 0 && argv[0] === '--waiting') {
+        runWaiting(argv.slice(1));
+        return;
     }
     if (argv.length > 0 && argv[0] === '--pin-error') {
         runPinError(argv.slice(1));

@@ -24,6 +24,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import shutil
@@ -556,24 +557,28 @@ def card_touch_policy(agent: str, key_fpr: str, timeout: float = 10) -> str:
     """The touch policy of KEY_FPR when it is the signature key of the card in
     the reader, asked through gpg-agent because scdaemon holds the card; empty
     when that cannot be told. ykman would kill scdaemon to reach the card.
-    SERIALNO selects the card's OpenPGP application, as gpg does."""
+    SERIALNO selects the card's OpenPGP application, as gpg does. As in the
+    wrapper's card_touch_policy, the policy comes from a raw GET DATA for DO D6
+    (SCD APDU), never from GETATTR UIF-1, which scdaemon answers from a cache
+    that can predate a change made with ykman."""
     if timeout <= 0:
         return ''
     try:
-        result = subprocess.run([agent, 'SCD SERIALNO openpgp', 'SCD GETATTR KEY-FPR', 'SCD GETATTR UIF-1', '/bye'],
+        result = subprocess.run([agent, '--hex', 'SCD SERIALNO openpgp', 'SCD GETATTR KEY-FPR', 'SCD APDU 00CA00D600', '/bye'],
                                 stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return ''
     if result.returncode:
         return ''
-    card = uif = ''
+    card = reply = ''
     for line in result.stdout.decode('ascii', 'replace').splitlines():
         fields = line.split()
         if fields[:3] == ['S', 'KEY-FPR', '1'] and len(fields) > 3:
             card = fields[3].upper()
-        elif fields[:2] == ['S', 'UIF-1'] and len(fields) > 2:
-            uif = fields[2]
-    match = re.match(r'%0([0-4])', uif)
+        elif fields[:1] == ['D[0000]']:
+            reply = ' '.join(fields[1:5])
+    # The policy byte, 0x20, and the status word 90 00.
+    match = re.fullmatch(r'0([0-4]) [0-9A-F]{2} 90 00', reply)
     return TOUCH_POLICIES[int(match.group(1))] if match and card == key_fpr else ''
 
 
@@ -595,27 +600,33 @@ class ServeConfig:
         self.allow_node_prefixes = tuple(x.strip().lower() for x in prefixes.split(',') if x.strip())
         self.port = int(own.get('port') or DEFAULT_PORT)
         self.bind = own.get('bind', '')
-        self.sign_timeout = float(own.get('sign_timeout_seconds') or 120)
+        try:
+            self.sign_timeout = float(own.get('sign_timeout_seconds') or 120)
+        except ValueError:
+            self.sign_timeout = math.nan
         self.signing_key = own.get('signing_key', '')
         if not self.real_gpg.startswith('/') or not os.access(self.real_gpg, os.X_OK):
             raise RemoteError('real_gpg must name an executable absolute path (run git-gpg-preview install first)')
         if not self.dialog_runner and (not self.ui_helper.startswith('/') or not Path(self.ui_helper).is_file()):
             raise RemoteError('ui_helper must name the installed dialog (run git-gpg-preview install first)')
+        # Every deadline and the wait for the lock count from it: nan or inf
+        # would leave them unbounded.
+        if not 0 < self.sign_timeout < math.inf:
+            raise RemoteError('sign_timeout_seconds must be a positive, finite number of seconds')
 
 
 def read_decision(path: Path) -> str:
-    """The preview's answer. Only the exact bytes b'sign' count as Sign: no
-    stripping, no case folding, nothing dropped. Other answers are read with
-    surrounding space stripped, so a rejection can never be read as no answer.
-    Empty when the file cannot be read."""
+    """The preview's answer, as the wrapper's read_decision reads it: only the
+    exact bytes b'sign', b'cancel' or b'spam' count, with no stripping, no case
+    folding and nothing dropped. Anything else is 'invalid'; an empty or
+    unreadable file is no answer yet, ''."""
     try:
         data = path.read_bytes()
     except OSError:
         return ''
-    if data == b'sign':
-        return 'sign'
-    answer = data.decode('utf-8', 'replace').strip()
-    return 'invalid' if answer == 'sign' else answer
+    if data in (b'sign', b'cancel', b'spam'):
+        return data.decode()
+    return 'invalid' if data else ''
 
 
 class DialogLock:
@@ -946,7 +957,8 @@ class Service:
                         notes.append('could not add the touch policy notice to the preview or its details')
                 sign_notice = notice or (CACHED_FIXED_TOUCH_NOTICE if policy == 'cached-fixed' else UNKNOWN_TOUCH_NOTICE)
                 result = self._run_dialog_and_gpg(args, paths, info, digest, repo, peer, started,
-                                                  require_sign, sign_notice, policy or 'unknown')
+                                                  require_sign=require_sign, sign_notice=sign_notice,
+                                                  policy=policy or 'unknown')
                 result['stderr'] = ''.join(f'git-gpg-preview: note from the signing Mac: {note}\n' for note in notes) + result['stderr']
                 return result
 
@@ -1045,29 +1057,34 @@ class Service:
         if not agent:
             return
         try:
-            subprocess.run([agent, 'SCD KILLSCD', '/bye'], stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+            subprocess.run([agent, 'SCD KILLSCD', '/bye'], stdin=subprocess.DEVNULL, capture_output=True, timeout=3)
         except (OSError, subprocess.TimeoutExpired):
             pass
 
-    def _run_dialog_and_gpg(self, args, paths, info, digest, repo, peer, started,
-                            require_sign=False, sign_notice='', policy='') -> dict:
+    def _run_dialog_and_gpg(self, args, paths, info, digest, repo, peer, started, *,
+                            require_sign: bool, sign_notice: str = '', policy: str = '') -> dict:
         """Shows the preview and runs GPG, both within sign_timeout_seconds of
         STARTED. With REQUIRE_SIGN (touch POLICY off, cached, cached-fixed or
         unknown; only on and fixed keep the touch as the gate) the preview asks
-        for Sign, showing SIGN_NOTICE, and GPG starts only after it."""
+        for Sign, showing SIGN_NOTICE, and GPG starts only after it. It has no
+        default, so no caller can open the gate by leaving it out."""
         config = self.config
         if config.dialog_runner:
-            dialog_cmd = [config.dialog_runner]
+            ui = [config.dialog_runner]
         else:
-            dialog_cmd = ['/usr/bin/osascript', '-l', 'JavaScript', config.ui_helper]
-        dialog_cmd += [str(paths['summary.txt']), str(paths['details.txt']), str(paths['decision']), str(paths['ready'])]
+            ui = ['/usr/bin/osascript', '-l', 'JavaScript', config.ui_helper]
+        dialog_cmd = ui + [str(paths['summary.txt']), str(paths['details.txt']), str(paths['decision']), str(paths['ready'])]
         dialog_cmd.append('mark-spam' if spam_subject(paths['payload'].read_bytes()) else '')
         if require_sign:
             dialog_cmd += ['require-sign', sign_notice]
         dialog = subprocess.Popen(dialog_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        deadline = min(time.monotonic() + 5, started + config.sign_timeout)
-        while not paths['ready'].exists() and dialog.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.05)
+
+        def await_ready(window):
+            deadline = min(time.monotonic() + 5, started + config.sign_timeout)
+            while not paths['ready'].exists() and window.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+
+        await_ready(dialog)
 
         def stop(proc):
             if proc.poll() is None:
@@ -1082,6 +1099,15 @@ class Service:
             refused = self._await_sign_click(dialog, stop, paths, info, digest, repo, peer, started, policy)
             if refused:
                 return refused
+            # The preview has closed. The key may still want a touch or the PIN,
+            # so a window that says so, with Cancel, stays up while GPG runs, as
+            # the preview does when the touch is the gate. It closes when GPG ends.
+            paths['decision'].write_text('')
+            self._deciding_marker(paths).unlink(missing_ok=True)
+            paths['ready'].unlink(missing_ok=True)
+            dialog = subprocess.Popen([*ui, '--waiting', str(paths['decision']), str(paths['ready'])],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            await_ready(dialog)
         with paths['payload'].open('rb') as stdin:
             gpg = subprocess.Popen([config.real_gpg, *args], stdin=stdin,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1393,7 +1419,8 @@ def cmd_client(gpg_args: list[str], config_dir: str | None) -> int:
     context = describe_locally(info)
     context['host'] = os.uname().nodename
     url = server_url(config)
-    error(f'requesting signature from {config.server or url}; touch the key on that machine when its preview appears')
+    error(f'requesting signature from {config.server or url}; on that machine, touch the key when its preview appears '
+          f'(touch policy on or fixed), or click Sign in the preview (off, cached, cached-fixed or unknown)')
     reply = post_json(f'{url}/sign', {'version': PROTOCOL_VERSION, 'args': gpg_args,
                                       'payload': base64.b64encode(payload).decode('ascii'),
                                       'context': context}, config.timeout)

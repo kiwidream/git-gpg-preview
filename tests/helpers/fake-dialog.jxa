@@ -55,6 +55,24 @@ function run(argv) {
         write(argv[2], 'entered');
         return;
     }
+    if (argv[0] === '--waiting') {
+        // The window after Sign: FAKE_WAITING_DECISION cancel presses Cancel
+        // and touch touches the key, each after FAKE_WAITING_DELAY; otherwise
+        // it stays up until the signer closes it. argv: decision, ready.
+        const pid = String($.NSProcessInfo.processInfo.processIdentifier);
+        if (log) append(log, 'waiting ' + pid + '\n');
+        if (argv.length > 2 && argv[2]) $.NSData.data.writeToFileAtomically(argv[2], true);
+        const waiting = ObjC.unwrap(env.objectForKey('FAKE_WAITING_DECISION') || '');
+        $.NSThread.sleepForTimeInterval(Number(ObjC.unwrap(env.objectForKey('FAKE_WAITING_DELAY') || '0')));
+        if (waiting === 'cancel') {
+            markDeciding(argv[1]);
+            write(argv[1], 'cancel');
+            return;
+        }
+        if (waiting === 'touch' && touch) $.NSData.data.writeToFileAtomically(touch + '.any', true);
+        $.NSThread.sleepForTimeInterval(30);
+        return;
+    }
     if (argv[0] === '--pin-error') {
         // Record what the user would be told, then answer Try Again or Cancel.
         if (log) append(log, 'pin-error ' + argv.slice(2).join(' ') + '\n');
@@ -63,10 +81,10 @@ function run(argv) {
     }
     // FAKE_DIALOG_DECISIONS answers one preview each, in order (comma-separated,
     // counted in FAKE_DIALOG_DECISION_STATE; past its end, no answer). Besides
-    // the answers below: hang never answers, '' closes without an answer,
-    // raw:TEXT writes TEXT (\n and \0 escapes) with no marker, marker-sign
-    // writes the rejection marker and then sign, and sign-no-touch writes sign
-    // without the key ever confirming.
+    // the answers below: hang never answers, early-sign writes sign and stays
+    // open, '' closes without an answer, raw:TEXT writes TEXT (\n and \0
+    // escapes) with no marker, marker-sign writes the rejection marker and then
+    // sign, and sign-no-touch writes sign without the key ever confirming.
     const sequence = env.objectForKey('FAKE_DIALOG_DECISIONS');
     if (sequence) {
         const state = ObjC.unwrap(env.objectForKey('FAKE_DIALOG_DECISION_STATE') || '');
@@ -93,6 +111,13 @@ function run(argv) {
         $.NSData.data.writeToFileAtomically(touch + '.' + (match ? match[1] : 'default'), true);
     };
     if (decision === 'hang') {
+        $.NSThread.sleepForTimeInterval(30);
+        return;
+    }
+    if (decision === 'early-sign') {
+        // Answers Sign but stays open, past any deadline.
+        touchIt();
+        write(argv[2], 'sign');
         $.NSThread.sleepForTimeInterval(30);
         return;
     }
