@@ -1069,6 +1069,30 @@ class TouchPolicyTests(unittest.TestCase):
                 self.assertEqual((result.returncode, result.stdout), (remote.EX_SOFTWARE, b''), result.stderr)
                 self.assertNotIn('decision=sign\n', h.audit.read_text())
 
+    def test_a_queued_request_for_a_touch_key_needs_no_time_for_sign(self):
+        """With sign_timeout_seconds=8 GPG keeps 4s for the PIN and a touch, and
+        a preview that asks for Sign needs 2s more. After 3s in the queue about
+        5s are left: enough for a key whose touch is the gate, which still
+        signs, too little for one that needs Sign, which is refused as busy."""
+        for uif, signs in (('%01+', True), ('%02+', True), ('%00+', False), ('%03+', False)):
+            with self.subTest(uif=uif):
+                name = f'queued{uif[2]}'
+                h = self.harness(name, serve_extra='sign_timeout_seconds=8\n')
+                holder = int(subprocess.run(['sh', '-c', 'sleep 3 >/dev/null 2>&1 & echo $!'],
+                                            capture_output=True, text=True, check=True).stdout)
+                (self.tmp / name / 'lock').mkdir(parents=True, exist_ok=True)
+                (self.tmp / name / 'lock' / 'dialog.lock').write_text(str(holder))
+                self.card.write_text(f'{self.CARD_SUB} {uif}')
+                started = time.monotonic()
+                result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+                self.assertGreater(time.monotonic() - started, 2.5, 'the request did not queue')
+                if signs:
+                    self.assertEqual((result.returncode, result.stdout), (0, b'signature:remote'), result.stderr)
+                else:
+                    self.assertEqual((result.returncode, result.stdout), (remote.EX_SOFTWARE, b''))
+                    self.assertIn(b'the signing Mac was busy for most of 8s', result.stderr)
+                    self.assertEqual((list(h.captures.glob('*.summary')), h.gpg_calls()), ([], []))
+
     def test_too_little_time_left_after_the_queue_is_refused_as_busy(self):
         """A lock wait that leaves less than a short read of the preview plus
         GPG's reserve shows no preview and starts no GPG, even for a key that

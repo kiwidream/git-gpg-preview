@@ -474,12 +474,12 @@ TOUCHED_POLICIES = ('on', 'fixed')
 
 
 def sign_budget(sign_timeout: float) -> tuple[float, float]:
-    """(reserve, least) for a request with SIGN_TIMEOUT seconds. After Sign,
-    GPG keeps the reserve for pinentry and a touch: a minute, the time to type
-    a PIN, find the key and touch it, or a third of a longer timeout, but never
-    more than half. A request needs at least the reserve plus a short read of
-    the preview (10 seconds, a quarter of a short timeout) when its preview
-    would open; less than that is refused as busy."""
+    """(reserve, least) for a request with SIGN_TIMEOUT seconds. GPG keeps the
+    reserve for pinentry and a touch: a minute, the time to type a PIN, find
+    the key and touch it, or a third of a longer timeout, but never more than
+    half. A request whose preview asks for Sign needs at least the reserve plus
+    a short read of the preview (10 seconds, a quarter of a short timeout); one
+    whose key's touch is the gate, only the reserve. Less is refused as busy."""
     reserve = min(max(60, sign_timeout // 3), sign_timeout / 2)
     return reserve, reserve + min(10, sign_timeout / 4)
 TOUCH_NOTICES = {
@@ -928,9 +928,14 @@ class Service:
                 # Read under the lock, as the wrapper does: the card is busy
                 # while another request waits for its touch.
                 policy = self._touch_policy(started)
-                # The preview needs a short read and GPG its reserve: a request
-                # that waited too long shows nothing and starts no GPG.
-                if started + config.sign_timeout - time.monotonic() < sign_budget(config.sign_timeout)[1]:
+                # Whether GPG waits for Sign follows the policy read, never the
+                # notice files or whether a notice text exists.
+                require_sign = policy not in TOUCHED_POLICIES
+                # GPG needs its reserve for the PIN and a touch, and a preview
+                # that asks for Sign a short read as well: a request with less
+                # left shows nothing and starts no GPG.
+                reserve, least = sign_budget(config.sign_timeout)
+                if started + config.sign_timeout - time.monotonic() < (least if require_sign else reserve):
                     return self._busy(info, digest, repo, peer)
                 notice = TOUCH_NOTICES.get(policy, '')
                 notes = []
@@ -939,9 +944,6 @@ class Service:
                     if not self._add_touch_notice(paths, notice, summary, details):
                         error('could not add the touch policy notice to the preview or its details')
                         notes.append('could not add the touch policy notice to the preview or its details')
-                # Whether GPG waits for Sign follows the policy read, never the
-                # notice files or whether a notice text exists.
-                require_sign = policy not in TOUCHED_POLICIES
                 sign_notice = notice or (CACHED_FIXED_TOUCH_NOTICE if policy == 'cached-fixed' else UNKNOWN_TOUCH_NOTICE)
                 result = self._run_dialog_and_gpg(args, paths, info, digest, repo, peer, started,
                                                   require_sign, sign_notice, policy or 'unknown')
