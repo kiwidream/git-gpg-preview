@@ -1045,6 +1045,25 @@ export FAKE_DIALOG_DECISION=sign
 GATE_PAYLOAD="$TMP/initial.payload" gate_case --status-fd=2 -bsau TEST
 [[ "$pin_status" -eq 0 && "$pin_output" == "signed:$(shasum -a 256 "$TMP/initial.payload" | awk '{print $1}')" ]] ||
     fail "the next touch went to the stopped signature: $pin_status, $pin_output"
+# So does a Cancel, Mark as Spam or preview closed without an answer while GPG
+# waits at the card (touch on, so GPG starts with the preview). Spam comes
+# last, since it blocks the subject that the others sign.
+export FAKE_CARD_UIF=%01+
+for answer in cancel:1 garbage:70 spam:1; do
+    : > "$FAKE_CARD_QUEUE"
+    : > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+    export FAKE_DIALOG_DECISION=${answer%:*} FAKE_DIALOG_DELAY=0.5
+    gate_case --status-fd=2 -bsau TEST
+    [[ "$pin_status" -eq "${answer#*:}" && -z "$pin_output" ]] || fail "touch on, ${answer%:*} while the card waits: $pin_status"
+    grep -qxF 'SCD KILLSCD /bye' "$FAKE_GPG_CALL_DIR/connect-agent-calls" ||
+        fail "touch on, ${answer%:*}: the stopped signature was left pending at the card"
+    export FAKE_DIALOG_DECISION=sign FAKE_DIALOG_DELAY=0
+    GATE_PAYLOAD="$TMP/initial.payload" gate_case --status-fd=2 -bsau TEST
+    [[ "$pin_status" -eq 0 && "$pin_output" == "signed:$(shasum -a 256 "$TMP/initial.payload" | awk '{print $1}')" ]] ||
+        fail "touch on, ${answer%:*}: the next touch went to the stopped signature: $pin_status, $pin_output"
+done
+rm -f "$XDG_CONFIG_HOME/git-gpg-preview/spam-subjects"
+export FAKE_CARD_UIF=%00+
 unset FAKE_CARD_QUEUE
 # A slow PIN and touch within SIGN_GPG_SECONDS sign, and the real allowance
 # leaves a person time to type a PIN, find the key and touch it.

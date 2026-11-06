@@ -19,7 +19,7 @@ printf '%s\n%s' "${6-}" "${7-}" > "$capture/$$.gate"
 choice=$(cat "${FAKE_DIALOG_DECISION_FILE:?}" 2>/dev/null || echo sign)
 [[ "$choice" == never-ready ]] && exec sleep 30            # never shows, never answers
 [[ -n "$ready" ]] && : > "$ready"
-if [[ "$choice" == delayed-spam || "$choice" == delayed-sign ]]; then
+if [[ "$choice" == delayed-* ]]; then                   # answers after GPG has started
     sleep 0.5
     choice=${choice#delayed-}
 elif [[ "$choice" == late-sign:* ]]; then                 # Sign after that many seconds

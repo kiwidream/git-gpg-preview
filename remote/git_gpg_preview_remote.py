@@ -1034,7 +1034,8 @@ class Service:
             time.sleep(0.05)
 
     def _cancel_card_operation(self) -> None:
-        """The wrapper's cancel_card_operation: a GPG stopped mid-signature
+        """The wrapper's cancel_card_operation: a GPG stopped mid-signature (a
+        timeout, Cancel, Mark as Spam or a preview closed without an answer)
         leaves its request, and any PIN request, with gpg-agent and scdaemon,
         and the next touch would complete it or find the card busy. Stopping
         scdaemon ends both, before the dialog lock goes to the next request."""
@@ -1095,21 +1096,29 @@ class Service:
                 break
             time.sleep(0.1)
 
+        def stop_gpg():
+            # GPG stopped before it finished may have left its operation waiting
+            # at the card: end that too, before the lock goes to the next request.
+            running = gpg.poll() is None
+            stop(gpg)
+            if running:
+                self._cancel_card_operation()
+
         if outcome == 'dialog':
             decision = read_decision(paths['decision'])
             if decision == 'sign':
                 outcome = 'signed'
             elif decision == 'spam':
-                stop(gpg)
+                stop_gpg()
                 gpg.communicate()
                 return self._mark_spam(paths, info, digest, repo, peer)
             elif decision == 'cancel':
-                stop(gpg)
+                stop_gpg()
                 self.audit('cancel', repo, info['type'], digest, peer)
                 return {'status': EX_CANCELLED, 'decision': 'cancel', 'stdout': '',
                         'stderr': 'git-gpg-preview: signing cancelled by operator\n'}
             else:
-                stop(gpg)
+                stop_gpg()
                 self.audit('invalid-ui-decision', repo, info['type'], digest, peer)
                 return {'status': EX_SOFTWARE, 'decision': 'invalid-ui-decision', 'stdout': '',
                         'stderr': 'git-gpg-preview: preview returned no valid decision; refusing to sign\n'}
@@ -1122,9 +1131,8 @@ class Service:
             if gpg.poll() is None:
                 outcome = 'timeout'
         if outcome == 'timeout':
-            stop(gpg)
+            stop_gpg()
             stop(dialog)
-            self._cancel_card_operation()
             # After Sign the preview is closed, so the operator saw nothing wait.
             # The audit names match the wrapper's.
             decision, message = (('gpg-timeout', 'not signed: no touch or PIN before the deadline') if require_sign else

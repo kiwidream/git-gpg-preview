@@ -379,11 +379,7 @@ remember_spam_subject() {
 handle_operator_rejection() {
     case "$DECISION_VALUE" in
         cancel|spam)
-            if [[ -n "$CHILD_PID" ]]; then
-                /bin/kill -s TERM "$CHILD_PID" 2>/dev/null || true
-                wait "$CHILD_PID" 2>/dev/null || true
-                CHILD_PID=""
-            fi
+            [[ -z "$CHILD_PID" ]] || stop_gpg "$CHILD_PID"
             flush_gpg_stderr
             if [[ "$DECISION_VALUE" == spam ]]; then
                 if ! remember_spam_subject; then
@@ -639,8 +635,9 @@ prepend_touch_notice() {
     error "note: could not add the touch policy notice to the preview or its details"
 }
 
-# Ends what a GPG stopped mid-signature left at the card. gpg-agent and
-# scdaemon keep its request, and any PIN request scdaemon made, alive: the next
+# Ends what a GPG stopped mid-signature (a timeout, Cancel, Mark as Spam, or a
+# preview or PIN window closed without an answer) left at the card. gpg-agent
+# and scdaemon keep its request, and any PIN request scdaemon made, alive: the next
 # touch would complete that stale operation, or find the card busy. Stopping
 # scdaemon, as gpgconf --kill scdaemon does, ends both; gpg-agent starts it
 # again for the next request, which may ask for the PIN again. Bounded, and
@@ -649,6 +646,20 @@ cancel_card_operation() {
     local agent
     agent=$(gpg_connect_agent) || return 0
     run_query /dev/null "$agent" 'SCD KILLSCD' /bye || true
+}
+
+# Stops GPG at PID and, when it was still running, the operation it may have
+# left waiting at the card, before the dialog lock goes to the next request.
+stop_gpg() {
+    local pid="$1"
+    if /bin/kill -0 "$pid" 2>/dev/null; then
+        /bin/kill -s TERM "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        cancel_card_operation
+    else
+        wait "$pid" 2>/dev/null || true
+    fi
+    CHILD_PID=""
 }
 
 # Whether the request names its own home directory, keyring or options file.
@@ -1318,11 +1329,8 @@ while :; do
                         break
                     fi
                     if [[ "$gpg_waited" -ge $((SIGN_GPG_SECONDS * 10)) ]]; then
-                        /bin/kill -s TERM "$GPG_PID" 2>/dev/null || true
-                        wait "$GPG_PID" 2>/dev/null || true
-                        CHILD_PID=""
+                        stop_gpg "$GPG_PID"
                         dismiss_pin_entry
-                        cancel_card_operation
                         release_dialog_lock
                         audit_decision "gpg-timeout" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
                         error "not signed: no touch or PIN before the deadline"
@@ -1339,9 +1347,7 @@ while :; do
                 fi
                 ;;
             *)
-                /bin/kill -s TERM "$GPG_PID" 2>/dev/null || true
-                wait "$GPG_PID" 2>/dev/null || true
-                CHILD_PID=""
+                stop_gpg "$GPG_PID"
                 release_dialog_lock
                 audit_decision "invalid-ui-decision" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
                 error "preview returned no valid decision; refusing to sign"
@@ -1351,9 +1357,7 @@ while :; do
     fi
 
     if [[ "$OUTCOME" == "pin-window" && -n "$UNANSWERABLE_PROMPT" ]]; then
-        /bin/kill -s TERM "$GPG_PID" 2>/dev/null || true
-        wait "$GPG_PID" 2>/dev/null || true
-        CHILD_PID=""
+        stop_gpg "$GPG_PID"
         release_dialog_lock
         audit_decision "unanswerable-gpg-prompt" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
         error "GPG asked a question the PIN window cannot answer ($UNANSWERABLE_PROMPT); refusing to sign"
@@ -1366,9 +1370,7 @@ while :; do
             DECISION_VALUE=cancel
             handle_operator_rejection
         fi
-        /bin/kill -s TERM "$GPG_PID" 2>/dev/null || true
-        wait "$GPG_PID" 2>/dev/null || true
-        CHILD_PID=""
+        stop_gpg "$GPG_PID"
         release_dialog_lock
         audit_decision "invalid-ui-decision" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
         error "PIN window closed without an answer; refusing to sign"

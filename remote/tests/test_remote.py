@@ -1018,18 +1018,23 @@ class TouchPolicyTests(unittest.TestCase):
         self.assertIn(b'no hardware confirmation within 8s', result.stderr)
 
     def test_a_stopped_signature_does_not_wait_at_the_card_for_the_next_touch(self):
-        """After GPG is stopped for want of a touch, with Sign or without, the
-        operation it left at the card is cancelled: the next request's touch
-        signs that request, not the stale one."""
-        for uif in ('%00+', '%01+'):
-            with self.subTest(uif=uif):
-                queue = self.tmp / f'card-queue{uif[2]}'
+        """After GPG is stopped while the card waits, for want of a touch (with
+        Sign or without), on Cancel, Mark as Spam or a preview closed without
+        an answer, the operation it left there is cancelled: the next request's
+        touch signs that request, not the stale one."""
+        for index, (uif, answer, status) in enumerate((('%00+', 'approve-no-touch', remote.EX_SOFTWARE),
+                                                       ('%01+', 'approve-no-touch', remote.EX_SOFTWARE),
+                                                       ('%01+', 'delayed-cancel', remote.EX_CANCELLED),
+                                                       ('%01+', 'delayed-spam', remote.EX_CANCELLED),
+                                                       ('%01+', 'delayed-garbage', remote.EX_SOFTWARE))):
+            with self.subTest(uif=uif, answer=answer):
+                queue = self.tmp / f'card-queue{index}'
                 queue.write_text('')
-                h = self.harness(f'stopped{uif[2]}', extra_env={'FAKE_CARD_QUEUE': str(queue)})
-                h.decision.write_text('approve-no-touch')
+                h = self.harness(f'stopped{index}', extra_env={'FAKE_CARD_QUEUE': str(queue)})
+                h.decision.write_text(answer)
                 self.card.write_text(f'{self.CARD_SUB} {uif}')
                 result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
-                self.assertEqual((result.returncode, result.stdout), (remote.EX_SOFTWARE, b''))
+                self.assertEqual((result.returncode, result.stdout), (status, b''))
                 self.assertIn('SCD KILLSCD /bye', (h.calls / 'connect-agent-calls').read_text().splitlines())
                 h.decision.write_text('sign')
                 result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.initial, self.repo)
