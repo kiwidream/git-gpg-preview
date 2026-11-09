@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import unittest.mock
@@ -33,6 +34,9 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+SERVICE_KEY = '041CE6A7BED57FE579D43B6C3DB3F5612E33B6BC'   # the fake GPG's one secret key
+
+
 class Harness:
     """A serve process plus the environment its fakes read."""
 
@@ -45,7 +49,6 @@ class Harness:
         self.calls = tmp / 'gpg-calls'
         self.captures = tmp / 'captures'
         self.decision = tmp / 'decision.ctl'
-        self.touch_offer = tmp / 'touch-offer.ctl'
         self.audit = tmp / 'audit.log'
         tmp.mkdir(parents=True, exist_ok=True)
         self.decision.write_text('sign')
@@ -53,7 +56,20 @@ class Harness:
             d.mkdir(parents=True, exist_ok=True)
         if not (tmp / 'bin' / 'tailscale').exists():
             (tmp / 'bin' / 'tailscale').symlink_to(HELPERS / 'fake-tailscale.py')
-        gpg = real_gpg or str(HELPERS / 'fake-gpg.py')
+        defaults = {}
+        if real_gpg is None:
+            # By default the service key is on a card whose touch policy reads
+            # on, through the gpg-connect-agent beside GPG, so the preview runs
+            # beside GPG and the touch is the gate.
+            gnupg = tmp / 'default-gnupg'
+            gnupg.mkdir(parents=True, exist_ok=True)
+            for name, helper in (('gpg', 'fake-gpg.py'), ('gpg-connect-agent', 'fake-gpg-connect-agent.py')):
+                if not (gnupg / name).exists():
+                    (gnupg / name).symlink_to(HELPERS / helper)
+            (tmp / 'default-card').write_text(f'{SERVICE_KEY} %01+')
+            defaults = {'FAKE_GPG_CARD_KEYS': SERVICE_KEY, 'FAKE_CARD_FILE': str(tmp / 'default-card')}
+            real_gpg = str(gnupg / 'gpg')
+        gpg = real_gpg
         (self.serve_dir / 'config').write_text(f'real_gpg={gpg}\nui_helper=/nonexistent\nlock_root={tmp}/lock\naudit_log={self.audit}\n')
         (self.serve_dir / 'serve').write_text(
             f'bind=127.0.0.1\nport={self.port}\ndialog_runner={HELPERS}/fake-dialog.sh\n'
@@ -69,7 +85,6 @@ class Harness:
                     'FAKE_GPG_CALL_DIR': str(self.calls),
                     'FAKE_DIALOG_CAPTURE_DIR': str(self.captures),
                     'FAKE_DIALOG_DECISION_FILE': str(self.decision),
-                    'FAKE_TOUCH_OFFER_FILE': str(self.touch_offer),
                     'FAKE_TOUCH_FILE': str(tmp / 'touch'),
                     'FAKE_GPG_STDOUT': 'signature:remote',
                     'TMPDIR': str(tmp / 'temp'),
@@ -77,6 +92,7 @@ class Harness:
                     # the developer's own configuration must not reach it.
                     'GIT_CONFIG_GLOBAL': str(tmp / 'gitconfig'),
                     'GIT_CONFIG_NOSYSTEM': '1',
+                    **defaults,
                     **(extra_env or {})}
         (tmp / 'gitconfig').write_text(f'[user]\n\tsigningkey = {git_signingkey}\n' if git_signingkey else '')
         (tmp / 'temp').mkdir(exist_ok=True)
@@ -223,24 +239,27 @@ class RemoteSigningTests(unittest.TestCase):
 
     def test_shares_the_local_wrappers_dialog_lock(self):
         """A local `git commit` holding dialog.lock (shlock protocol: a live pid
-        in the file) makes the remote request wait; a dead owner is stale."""
-        lock = self.tmp / 'lock' / 'dialog.lock'
+        in the file) makes the remote request wait; a dead owner is stale. With
+        sign_timeout_seconds=8, 1.5s of waiting leaves the 6s a preview needs."""
+        h = Harness(self.tmp / 'shared-lock', serve_extra='sign_timeout_seconds=8\n')
+        self.addCleanup(h.stop)
+        lock = self.tmp / 'shared-lock' / 'lock' / 'dialog.lock'
         lock.parent.mkdir(parents=True, exist_ok=True)
-        holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(2.5)'])
+        holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(1.5)'])
         # Reap it the moment it exits: a zombie still answers kill -0, exactly
         # as it would for shlock, and would look like a live owner forever.
         import threading
         threading.Thread(target=holder.wait, daemon=True).start()
         lock.write_text(str(holder.pid))
         started = time.monotonic()
-        result = self.h.client(self.sign_args(), self.second, self.repo)
+        result = h.client(self.sign_args(), self.second, self.repo)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertGreaterEqual(time.monotonic() - started, 2.0, 'waited for the local wrapper to finish')
+        self.assertGreaterEqual(time.monotonic() - started, 1.2, 'waited for the local wrapper to finish')
         holder.wait()
         self.assertFalse(lock.exists(), 'released after signing')
         lock.write_text('999999')   # a pid nobody has: stale, proceed at once
         started = time.monotonic()
-        result = self.h.client(self.sign_args(), self.second, self.repo)
+        result = h.client(self.sign_args(), self.second, self.repo)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertLess(time.monotonic() - started, 2.0)
 
@@ -571,6 +590,39 @@ class RemoteSigningTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(b'--local-user', b'\0'.join(self.h.gpg_calls()[-1][0]))
 
+    def test_a_request_names_one_key_and_u_ends_its_bundle(self):
+        """GPG reads -ub as -u b and signs with every key named, so any other
+        shape could add a signer of the request's own choosing beside the pinned
+        key, and the touch would authorize a key nobody was shown."""
+        key = '3DB3F5612E33B6BC'
+        for args in (['--status-fd=2', '-ub', '-bsau', key],
+                     ['--status-fd=2', '-bsaub', key],
+                     ['--status-fd=2', '-bsua', key],
+                     ['--status-fd=2', '-uu', key],
+                     ['--status-fd=2', '-bsau', key, '-u', key],
+                     ['--status-fd=2', '-u', key, '-u', key],
+                     ['--status-fd=2', '-bsau', key, '--local-user', key],
+                     ['--status-fd=2', '-bsau', key, '--local-user=x'],
+                     ['--status-fd=2', '--local-user=x', '-bsau', key],
+                     ['--status-fd=2', '-bsau', key, f'--local-user={key}'],
+                     ['--status-fd=2', '-bsau', key, '--default-key', key],
+                     ['--status-fd=2', '-bsau', key, f'--default-key={key}']):
+            with self.subTest(args=args):
+                code, body = self.h.post({'version': 1, 'args': args, 'payload': base64.b64encode(self.second).decode(), 'context': {}})
+                self.assertEqual((code, body['status'], body['decision']), (200, 65, 'refused'), body)
+                self.assertEqual(self.h.gpg_calls(), [], 'GPG started')
+                self.assertEqual(list(self.h.captures.iterdir()), [], 'a preview opened')
+                with self.assertRaises(remote.RemoteError):
+                    remote.validate_signing_args(args)
+        # The shapes Git sends and the README documents still pass.
+        for args in (['--status-fd=2', '-bsau', key], ['--status-fd', '2', '-bsau', key], ['--status-fd=2', '-bsa', '-u', key],
+                     ['--detach-sign', '--armor', '--local-user', key], ['--detach-sign', '--armor', f'--local-user={key}'],
+                     ['--status-fd=2', '-bsa']):
+            with self.subTest(args=args):
+                remote.validate_signing_args(args)
+                self.assertEqual(remote.pin_key_selector(args, '041CE6A7BED57FE579D43B6C3DB3F5612E33B6BC')[-2:],
+                                 ['--local-user', '041CE6A7BED57FE579D43B6C3DB3F5612E33B6BC'])
+
     def test_service_refuses_arguments_git_never_sends(self):
         for args in (['--status-fd=2', '-bsau', 'K', '--homedir', '/tmp/x'],
                      ['--status-fd=2', '-bsau', '--output'],
@@ -627,15 +679,17 @@ SUBKEY_B = 'CCCC' * 9 + '0000000C'
 TWO_KEYS = f'{PRIMARY_A},{PRIMARY_B}/{SUBKEY_B}'
 
 
+# A suggestion of the cached touch policy, which nothing may show.
+CACHED_HINT = re.compile(r'set-touch\s+sig\s+cached|use cached', re.I)
+
+
 class TouchPolicyTests(unittest.TestCase):
-    """A touch policy other than cached on the card key the service signs with
-    gets a window of its own before the preview, as in the wrapper; signing goes
-    ahead either way. The policy is read and changed with the gpg-connect-agent
-    beside real GPG."""
+    """A touch policy of off or cached on the card key the service signs with
+    puts the ykman command above the facts, as in the wrapper; signing goes ahead
+    either way. The policy is read with the gpg-connect-agent beside real GPG."""
     PRIMARY = '041CE6A7BED57FE579D43B6C3DB3F5612E33B6BC'   # the fake service key
     CARD_SUB = 'AAAA000000000000000000000000000000000002'
     OTHER = 'BBBB000000000000000000000000000000000002'
-    SET_CACHED = 'SCD SERIALNO openpgp SCD SETATTR UIF-1 %03+ SCD GETATTR UIF-1 SCD KILLSCD /bye'
 
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory(prefix='ggp-touch.')
@@ -646,252 +700,762 @@ class TouchPolicyTests(unittest.TestCase):
         (self.gnupg / 'gpg').symlink_to(HELPERS / 'fake-gpg.py')
         (self.gnupg / 'gpg-connect-agent').symlink_to(HELPERS / 'fake-gpg-connect-agent.py')
         self.card = self.tmp / 'card'
-        self.repo, _, self.payload = fixture_repo(self.tmp)
+        self.repo, self.initial, self.payload = fixture_repo(self.tmp)
 
-    def harness(self, name: str, real_gpg: Path | None = None, card_keys: str = CARD_SUB, setattr_answer: str = '') -> Harness:
+    def harness(self, name: str, real_gpg: Path | None = None, card_keys: str = CARD_SUB, extra_env: dict | None = None,
+                serve_extra: str = '') -> Harness:
         h = Harness(self.tmp / name, real_gpg=str(real_gpg or self.gnupg / 'gpg'),
                     extra_env={'FAKE_GPG_SECRET_KEYS': f'{self.PRIMARY}/{self.CARD_SUB}',
-                               'FAKE_GPG_CARD_KEYS': card_keys, 'FAKE_CARD_FILE': str(self.card),
-                               'FAKE_CARD_SETATTR': setattr_answer})
+                               'FAKE_GPG_CARD_KEYS': card_keys, 'FAKE_CARD_FILE': str(self.card), **(extra_env or {})},
+                    serve_extra=serve_extra)
         self.addCleanup(h.stop)
         return h
 
-    def sign(self, h: Harness, card: str | None) -> tuple[str, str]:
+    def sign(self, h: Harness, card: str, selector: str = '3DB3F5612E33B6BC') -> tuple[str, str]:
         """Signs through the client with CARD in the reader: its signature key
-        and raw UIF-1 value, '' for no card, or None to leave the card as it is.
-        Returns the preview summary and the client's stderr."""
+        and raw UIF-1 value, or '' for no card. Returns the preview summary
+        and the client's stderr, after checking that neither they nor the
+        details suggest the cached policy."""
         if card:
             self.card.write_text(card)
-        elif card is not None:
+        else:
             self.card.unlink(missing_ok=True)
-        result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+        result = h.client(['--status-fd=2', '-bsau', selector], self.payload, self.repo)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, b'signature:remote')
-        return h.latest_capture()[0], result.stderr.decode()
+        summary, details = h.latest_capture()
+        stderr = result.stderr.decode()
+        self.assertNotRegex(summary + details + stderr, CACHED_HINT)
+        return summary, stderr
 
     @staticmethod
-    def agent_calls(h: Harness) -> list[str]:
+    def facts_max_lines() -> int:
+        """How many fact lines dialog.jxa's facts pane shows before it scrolls."""
+        return int(re.search(r'^const FACTS_MAX_LINES = (\d+);$', (ROOT.parent / 'dialog.jxa').read_text(), re.M).group(1))
+
+    @staticmethod
+    def note(policy: str) -> str:
+        """The one stderr line that carries POLICY's notice."""
+        return 'git-gpg-preview: note from the signing Mac: ' + remote.TOUCH_NOTICES[policy].replace('\n', ' ') + '\n'
+
+    @staticmethod
+    def agent_calls(h: Harness) -> int:
         calls = h.calls / 'connect-agent-calls'
-        return calls.read_text().splitlines() if calls.exists() else []
+        return len(calls.read_text().splitlines()) if calls.exists() else 0
 
-    @staticmethod
-    def touch_dialogs(h: Harness) -> list[str]:
-        """The touch policy windows so far, emptied for the next check."""
-        log = h.captures / 'touch-dialogs'
-        if not log.exists():
-            return []
-        lines = log.read_text().splitlines()
-        log.unlink()
-        return lines
-
-    @staticmethod
-    def offers(h: Harness) -> Path:
-        return h.serve_dir / 'touch-offers'
-
-    def dismissals(self, h: Harness) -> int:
-        return remote.touch_offer_state(self.offers(h), self.CARD_SUB)[0]
-
-    def shown_long_ago(self, h: Harness) -> None:
-        self.offers(h).write_text(f'{self.CARD_SUB} {self.dismissals(h)} 1\n')
-
-    def test_off_and_on_get_a_window_of_their_own_and_signing_goes_ahead(self):
-        for uif, policy in (('%01+', 'on'), ('%00+', 'off')):
-            with self.subTest(policy=policy):
-                h = self.harness(policy)
-                summary, stderr = self.sign(h, f'{self.CARD_SUB} {uif}')
-                self.assertTrue(summary.startswith('Request type: commit\n'), summary)
-                self.assertNotIn('ykman', summary)
-                self.assertEqual(self.touch_dialogs(h), [f'touch-offer {policy} 3'])
-                self.assertIn(f'git-gpg-preview: note from the signing Mac: {remote.TOUCH_NOTICES[policy]}\n', stderr)
-                self.assertEqual(len(self.agent_calls(h)), 1, 'the policy is read once per request')
-                self.assertEqual(self.dismissals(h), 1)
-                self.assertEqual(self.offers(h).stat().st_mode & 0o777, 0o600)
-
-    def test_cached_fixed_and_unreadable_policies_get_no_offer(self):
+    def test_off_and_cached_go_above_the_facts_and_signing_goes_ahead(self):
         h = self.harness('h')
-        for card in (f'{self.CARD_SUB} %03+', f'{self.CARD_SUB} %04+', f'{self.CARD_SUB} %02+',
-                     f'{self.CARD_SUB} %05+', self.CARD_SUB, f'{self.OTHER} %01+', ''):
+        for uif, policy in (('%00+', 'off'), ('%03+', 'cached')):
+            with self.subTest(policy=policy):
+                summary, stderr = self.sign(h, f'{self.CARD_SUB} {uif}')
+                self.assertTrue(summary.startswith(remote.TOUCH_NOTICES[policy] + '\n\nRequest type: commit\n'), summary)
+                facts, marker, message = summary.partition('\n\nMessage:\n')
+                self.assertIn('ykman openpgp keys set-touch sig on', facts)
+                self.assertTrue(marker and message.startswith('Second commit'), summary)
+                self.assertLessEqual(len(facts.split('\n')), self.facts_max_lines(), 'the facts pane would scroll')
+                details = h.latest_capture()[1]
+                self.assertTrue(details.startswith(remote.TOUCH_NOTICES[policy] + '\n\nGIT OPENPGP SIGNING REVIEW'), details[:300])
+                self.assertIn(self.note(policy), stderr)
+                self.assertEqual(stderr.count('note from the signing Mac'), 1, stderr)
+        self.assertEqual(self.agent_calls(h), 2, 'the policy is read once per request')
+
+    def test_on_fixed_cached_fixed_and_unreadable_policies_get_no_notice(self):
+        h = self.harness('h')
+        for card in (f'{self.CARD_SUB} %01+', f'{self.CARD_SUB} %04+', f'{self.CARD_SUB} %02+',
+                     f'{self.CARD_SUB} %05+', self.CARD_SUB, f'{self.OTHER} %00+', ''):
             with self.subTest(card=card):
                 summary, stderr = self.sign(h, card)
                 self.assertTrue(summary.startswith('Request type: commit\n'), summary)
+                self.assertTrue(h.latest_capture()[1].startswith('GIT OPENPGP SIGNING REVIEW'))
                 self.assertNotIn('ykman', stderr)
-                self.assertEqual(self.touch_dialogs(h), [])
-                self.assertFalse(self.offers(h).exists())
+                self.assertNotIn('note from the signing Mac', stderr)
 
-    def test_a_software_key_or_no_gpg_connect_agent_gets_no_offer(self):
+    def test_a_software_key_or_no_gpg_connect_agent_gets_no_notice(self):
         for name, h in (('software key', self.harness('software', card_keys='')),
                         ('no gpg-connect-agent', self.harness('plain', real_gpg=HELPERS / 'fake-gpg.py'))):
             with self.subTest(name):
-                summary, stderr = self.sign(h, f'{self.CARD_SUB} %01+')
+                summary, stderr = self.sign(h, f'{self.CARD_SUB} %00+')
                 self.assertTrue(summary.startswith('Request type: commit\n'), summary)
                 self.assertNotIn('ykman', stderr)
-                self.assertEqual(self.touch_dialogs(h), [])
-                self.assertEqual(self.agent_calls(h), [])
+                self.assertNotIn('note from the signing Mac', stderr)
+                self.assertEqual(self.agent_calls(h), 0)
 
     def test_the_note_reaches_git_beside_a_failure(self):
         h = self.harness('h')
         h.decision.write_text('cancel')
-        self.card.write_text(f'{self.CARD_SUB} %01+')
+        self.card.write_text(f'{self.CARD_SUB} %00+')
         result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
         self.assertEqual((result.returncode, result.stdout), (1, b''))
         stderr = result.stderr.decode()
-        self.assertIn(f'git-gpg-preview: note from the signing Mac: {remote.TOUCH_NOTICES["on"]}\n', stderr)
+        self.assertIn(self.note('off'), stderr)
+        self.assertNotRegex(stderr, CACHED_HINT)
         self.assertIn('signing cancelled by operator', stderr)
 
-    def test_not_now_asks_again_a_day_later_three_times_at_most_then_never(self):
-        h = self.harness('h')
-        _, stderr = self.sign(h, f'{self.CARD_SUB} %01+')
-        self.assertEqual(self.touch_dialogs(h), ['touch-offer on 3'])
-        self.assertIn('ykman', stderr)
-        _, stderr = self.sign(h, None)
-        self.assertEqual(self.touch_dialogs(h), [], 'offered again within a day')
-        self.assertNotIn('ykman', stderr)
-        for left in (2, 1):
-            self.shown_long_ago(h)
-            self.sign(h, None)
-            self.assertEqual(self.touch_dialogs(h), [f'touch-offer on {left}'])
-        self.assertEqual(self.dismissals(h), 3)
-        self.shown_long_ago(h)
-        _, stderr = self.sign(h, None)
-        self.assertEqual(self.touch_dialogs(h), [], 'offered after the last dismissal')
-        self.assertNotIn('ykman', stderr)
+    @staticmethod
+    def touch_at_start(h: Harness) -> list[str]:
+        """For each signing GPG call, whether the fake dialog's answer (and so
+        the touch) already existed when it started: 'before' only when GPG
+        waited for the preview."""
+        record = h.calls / 'touch-at-start'
+        return record.read_text().split() if record.exists() else []
 
-    def test_bad_or_unusable_records_cannot_silence_or_repeat_the_offer(self):
-        h = self.harness('h')
-        self.card.write_text(f'{self.CARD_SUB} %01+')
-        offers = self.offers(h)
-        offers.write_text(f'{self.CARD_SUB} 2 {int(time.time()) + 100000}\n')
-        self.sign(h, None)
-        self.assertEqual(self.touch_dialogs(h), ['touch-offer on 1'], 'a time in the future silenced the offer')
-        for line in (self.CARD_SUB, f'{self.CARD_SUB} x 1', f'{self.CARD_SUB} 3', f'{self.CARD_SUB} 3 x', f'{self.CARD_SUB} -3 1',
-                     f'{self.CARD_SUB} 03 1', f'{self.CARD_SUB} 3 1 extra', f'{self.CARD_SUB} 9999999999999999999 1',
-                     f'{self.CARD_SUB} 3 9999999999999999999', f'{self.OTHER} 3 1', 'garbage'):
-            with self.subTest(line=line):
-                offers.write_text(line + '\n')
-                self.sign(h, None)
-                self.assertEqual(self.touch_dialogs(h), ['touch-offer on 3'])
-        offers.write_text(f'{self.OTHER} 3 7\n')
-        self.sign(h, None)
-        self.assertEqual(self.touch_dialogs(h), ['touch-offer on 3'], "another key's record silenced this one")
-        self.assertIn(f'{self.OTHER} 3 7\n', offers.read_text(), 'another key lost its record')
-        offers.unlink()
-        offers.mkdir()
-        _, stderr = self.sign(h, None)
-        self.assertEqual(self.touch_dialogs(h), [], 'offered although the record cannot be kept')
-        self.assertIn(f'could not save {offers}', stderr)
-        self.assertIn(remote.TOUCH_NOTICES['on'], stderr)
-        offers.rmdir()
-        target = self.tmp / 'offers-target'
-        target.write_text(f'{self.CARD_SUB} 0 1\n')
-        offers.symlink_to(target)
-        self.sign(h, None)
-        self.assertEqual(self.touch_dialogs(h), [], 'offered through a symbolic link')
-        self.assertTrue(offers.is_symlink())
-        self.assertEqual(target.read_text(), f'{self.CARD_SUB} 0 1\n')
+    @staticmethod
+    def gate(h: Harness) -> str:
+        """What the latest preview was told beyond its files: require-sign and
+        the notice, or nothing."""
+        return sorted(h.captures.glob('*.gate'), key=lambda p: p.stat().st_mtime)[-1].read_text()
 
-    def test_use_cached_sets_the_policy_before_the_preview_and_audits_it(self):
-        h = self.harness('h')
-        h.touch_offer.write_text('apply')
-        summary, stderr = self.sign(h, f'{self.CARD_SUB} %01+')
-        self.assertEqual(self.touch_dialogs(h), ['touch-offer on 3'])
-        self.assertEqual(self.agent_calls(h)[1:], [self.SET_CACHED])
-        self.assertTrue(summary.startswith('Touch policy is now cached.\n\nRequest type: commit\n'), summary)
-        self.assertIn('git-gpg-preview: note from the signing Mac: touch policy is now cached\n', stderr)
-        self.assertIn('decision=touch-policy-cached', h.audit.read_text())
-        self.assertEqual(self.dismissals(h), 0)
-        self.assertEqual(self.card.read_text(), f'{self.CARD_SUB} %03+')
-        summary, stderr = self.sign(h, None)
-        self.assertEqual(self.touch_dialogs(h), [], 'a cached key is not offered')
-        self.assertTrue(summary.startswith('Request type: commit\n'), summary)
+    @staticmethod
+    def untouch(h: Harness) -> None:
+        """Forgets earlier touches and their records, so the same payload can be
+        signed again with a fresh answer."""
+        for path in [*h.tmp.glob('touch.*'), h.calls / 'touch-at-start']:
+            path.unlink(missing_ok=True)
 
-    def test_use_cached_that_fails_says_why_counts_and_signing_goes_ahead(self):
-        cases = (('ERR 100663404 Bad PIN <SCD>', ['touch-offer on 3', 'touch-unchanged Bad PIN <SCD>'], True, 'Bad PIN <SCD>'),
-                 ('ERR 100663435 Conditions of use not satisfied <SCD>',
-                  ['touch-offer on 3', 'touch-unchanged Conditions of use not satisfied <SCD>'], True, 'Conditions of use not satisfied <SCD>'),
-                 ('ERR 83886179 Operation cancelled <Pinentry>', ['touch-offer on 3'], False, ''),
-                 ('ignored', ['touch-offer on 3', 'touch-unchanged '], True, 'the key did not confirm the change'))
-        for index, (answer, dialogs, audited, noted) in enumerate(cases):
+    REFUSED = 'git-gpg-preview: not signed: touch policy is off and Sign was not clicked\n'
+
+    def test_touch_off_starts_gpg_only_after_sign(self):
+        h = self.harness('h')
+        h.decision.write_text('delayed-sign')
+        _, stderr = self.sign(h, f'{self.CARD_SUB} %00+')
+        self.assertEqual(self.touch_at_start(h), ['before'], 'GPG started before Sign')
+        self.assertEqual(self.gate(h), 'require-sign\n' + remote.TOUCH_NOTICES['off'])
+        self.assertNotIn('not signed', stderr)
+        # The client cannot know the policy, so its hint names both answers.
+        self.assertIn('on that machine, touch the key when its preview appears (touch policy on or fixed), '
+                      'or click Sign in the preview (off, cached, cached-fixed or unknown)\n', stderr)
+
+    def test_an_unknown_policy_needs_sign_too(self):
+        """A policy that cannot be read (an unknown value, a reply whose status
+        word is not 90 00, no setting, no card, another key on the card, a
+        software key or no gpg-connect-agent) may hide touch off: the preview
+        asks for Sign with its own notice, GPG waits for Sign, and anything
+        else signs nothing."""
+        cases = ((self.harness('unknown'), f'{self.CARD_SUB} %05+'), (self.harness('unset'), self.CARD_SUB),
+                 (self.harness('apdu-sw', extra_env={'FAKE_CARD_APDU_SW': '6A 82'}), f'{self.CARD_SUB} %01+'),
+                 (self.harness('none'), ''), (self.harness('other'), f'{self.OTHER} %01+'),
+                 (self.harness('software', card_keys=''), f'{self.CARD_SUB} %01+'),
+                 (self.harness('plain', real_gpg=HELPERS / 'fake-gpg.py'), f'{self.CARD_SUB} %01+'))
+        for h, card in cases:
+            with self.subTest(home=h.tmp.name):
+                h.decision.write_text('delayed-sign')
+                self.sign(h, card)
+                self.assertEqual(self.touch_at_start(h), ['before'], 'GPG started before Sign')
+                self.assertEqual(self.gate(h), 'require-sign\n' + remote.UNKNOWN_TOUCH_NOTICE)
+        for choice, status in (('cancel', remote.EX_CANCELLED), ('hang', remote.EX_SOFTWARE)):
+            with self.subTest(choice=choice):
+                h = self.harness(f'refused-{choice}')
+                h.decision.write_text(choice)
+                self.card.write_text(f'{self.CARD_SUB} %05+')
+                result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+                self.assertEqual((result.returncode, result.stdout), (status, b''))
+                self.assertIn(b'not signed: touch policy is unknown and Sign was not clicked', result.stderr)
+                self.assertEqual((h.gpg_calls(), self.touch_at_start(h)), ([], []))
+
+    def test_on_and_fixed_start_gpg_with_the_preview(self):
+        h = self.harness('h')
+        h.decision.write_text('delayed-sign')
+        for card in (f'{self.CARD_SUB} %01+', f'{self.CARD_SUB} %02+'):
+            with self.subTest(card=card):
+                self.untouch(h)
+                self.sign(h, card)
+                self.assertEqual(self.touch_at_start(h), ['after'], 'GPG waited for a click')
+                self.assertEqual(self.gate(h), '\n')
+
+    def test_cached_and_cached_fixed_always_need_sign(self):
+        """One touch on a cached key signs whatever follows for 15 seconds,
+        touches made outside this service included, so every signature with it
+        waits for Sign, with the notice that says so; Cancel signs nothing."""
+        for uif, policy, notice in (('%03+', 'cached', remote.TOUCH_NOTICES['cached']),
+                                    ('%04+', 'cached-fixed', remote.CACHED_FIXED_TOUCH_NOTICE)):
+            with self.subTest(policy=policy):
+                h = self.harness(policy)
+                h.decision.write_text('delayed-sign')
+                for _ in range(2):
+                    self.untouch(h)
+                    self.sign(h, f'{self.CARD_SUB} {uif}')
+                    self.assertEqual(self.touch_at_start(h), ['before'], 'GPG started before Sign')
+                    self.assertEqual(self.gate(h), 'require-sign\n' + notice)
+                h = self.harness(f'{policy}-cancel')
+                h.decision.write_text('cancel')
+                self.card.write_text(f'{self.CARD_SUB} {uif}')
+                result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+                self.assertEqual((result.returncode, result.stdout), (remote.EX_CANCELLED, b''))
+                self.assertIn(f'not signed: touch policy is {policy} and Sign was not clicked'.encode(), result.stderr)
+                self.assertEqual((h.gpg_calls(), self.touch_at_start(h)), ([], []))
+
+    def test_any_other_signing_key_in_the_certificate_needs_sign(self):
+        """GnuPG 2.3 and later may sign with the certificate's software signing
+        key, whose passphrase may be cached, with no touch, and a key on another
+        card signs under that card's policy: on and fixed keep the touch as the
+        gate only when the card's slot-1 key, whose policy was read, is the only
+        usable signing key. A key GPG cannot pick does not count, and that takes in
+        a primary key while a subkey can sign, whatever its kind. Kind mixed says
+        so whatever the policy, with no advice to change it, and its refusal
+        says so too."""
+        soft, other_card = '5' * 40, 'B' * 40
+        mixed = f'{self.PRIMARY}/{self.CARD_SUB}/{soft}'
+        needs_sign = 'require-sign\n' + remote.OTHER_KEY_NOTICE
+        for name, keys, extra, uif, gate in (
+                ('on', mixed, {}, '%01+', needs_sign),
+                ('fixed', mixed, {}, '%02+', needs_sign),
+                ('stub primary', f'{self.PRIMARY}/{self.CARD_SUB}', {'FAKE_GPG_STUB_KEYS': self.PRIMARY}, '%01+', '\n'),
+                ('card primary', f'{self.PRIMARY}/{self.CARD_SUB}',
+                 {'FAKE_GPG_CARD_KEYS': f'{self.PRIMARY},{self.CARD_SUB}'}, '%01+', '\n'),
+                ('two card subkeys', f'{self.PRIMARY}/{self.CARD_SUB}/{other_card}',
+                 {'FAKE_GPG_CARD_KEYS': f'{self.CARD_SUB},{other_card}'}, '%01+', needs_sign),
+                ('off', mixed, {}, '%00+', needs_sign),
+                ('cached', mixed, {}, '%03+', needs_sign),
+                ('cached-fixed', mixed, {}, '%04+', needs_sign),
+                ('software pick', f'{self.PRIMARY}/{soft}/{self.CARD_SUB}', {}, '%01+', needs_sign),
+                ('software primary', f'{self.PRIMARY}/{self.CARD_SUB}', {}, '%01+', '\n')):
+            with self.subTest(name):
+                h = self.harness(name.replace(' ', '-'), extra_env={'FAKE_GPG_SECRET_KEYS': keys, **extra})
+                h.decision.write_text('delayed-sign')
+                summary, stderr = self.sign(h, f'{self.CARD_SUB} {uif}')
+                self.assertEqual(self.gate(h), gate)
+                self.assertEqual(self.touch_at_start(h), ['after' if gate == '\n' else 'before'])
+                self.assertNotIn('ykman', summary + stderr)
+        for uif, in (('%01+',), ('%00+',)):
+            with self.subTest(refused=uif):
+                h = self.harness(f'cancel-{uif[1:3]}', extra_env={'FAKE_GPG_SECRET_KEYS': mixed})
+                h.decision.write_text('cancel')
+                self.card.write_text(f'{self.CARD_SUB} {uif}')
+                result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+                self.assertEqual((result.returncode, result.stdout), (remote.EX_CANCELLED, b''))
+                self.assertIn(b'git-gpg-preview: not signed: GPG could sign with more than one key '
+                              b'and Sign was not clicked\n', result.stderr)
+                self.assertNotIn(b'touch policy is', result.stderr)
+                self.assertEqual((h.gpg_calls(), self.touch_at_start(h)), ([], []))
+
+    def test_every_certificate_the_selector_matches_counts(self):
+        """GPG need not choose the first certificate a selector matches, so
+        another with a different signing key, in software or on another card, needs
+        Sign. One listing only the same key leaves the touch as the gate. The
+        service names a fingerprint and refuses a user ID, so this takes a second
+        certificate listed for that fingerprint once the service has started."""
+        soft, other_card = '5' * 40, 'B' * 40
+        for name, also, card_keys, gate in (
+                ('software', f'{self.OTHER}/{soft}', self.CARD_SUB, 'require-sign\n' + remote.OTHER_KEY_NOTICE),
+                ('another-card', f'{self.OTHER}/{other_card}', f'{self.CARD_SUB},{other_card}',
+                 'require-sign\n' + remote.OTHER_KEY_NOTICE),
+                ('same-key', f'{self.OTHER}/{self.CARD_SUB}', self.CARD_SUB, '\n')):
+            with self.subTest(name):
+                listed = self.tmp / f'also-{name}'
+                h = self.harness(f'also-{name}-home', card_keys=card_keys, extra_env={'FAKE_GPG_ALSO_MATCHES': str(listed)})
+                listed.write_text(also)
+                h.decision.write_text('delayed-sign')
+                self.sign(h, f'{self.CARD_SUB} %01+')
+                self.assertEqual(self.gate(h), gate)
+                self.assertEqual(self.touch_at_start(h), ['after' if gate == '\n' else 'before'])
+
+    def test_a_trailing_bang_does_not_narrow_the_certificate(self):
+        """The service drops a selector's !, so GPG may sign with any usable
+        signing key in the certificate, and the whole certificate decides even
+        when a card key was named exactly."""
+        soft = '5' * 40
+        for name, keys, card_keys, named, gate in (
+                ('card only', f'{self.PRIMARY}/{self.CARD_SUB}', self.CARD_SUB, self.CARD_SUB, '\n'),
+                ('mixed', f'{self.PRIMARY}/{self.CARD_SUB}/{soft}', self.CARD_SUB, self.CARD_SUB,
+                 'require-sign\n' + remote.OTHER_KEY_NOTICE),
+                ('software', f'{self.PRIMARY}/{soft}', '', soft, 'require-sign\n' + remote.UNKNOWN_TOUCH_NOTICE)):
+            with self.subTest(name):
+                h = self.harness(name.replace(' ', '-'), card_keys=card_keys, extra_env={'FAKE_GPG_SECRET_KEYS': keys},
+                                 serve_extra=f'signing_key={named}!\n')
+                h.decision.write_text('delayed-sign')
+                self.sign(h, f'{self.CARD_SUB} %01+', selector=f'{named}!')
+                self.assertEqual(self.gate(h), gate)
+                self.assertEqual(self.touch_at_start(h), ['after' if gate == '\n' else 'before'])
+                self.assertEqual(h.gpg_calls()[-1][0][-2:], [b'--local-user', named.encode()], 'GPG was handed no !')
+
+    def test_more_than_one_card_makes_the_policy_unknown(self):
+        """The same key may be on two inserted cards, and GPG may sign on the one
+        whose policy was not read: where scdaemon lists more than one card, Sign
+        is needed. One card, or a scdaemon that refuses the command, changes
+        nothing."""
+        for name, cards, gate in (('two', 'D2760001240100000006000000010000 D2760001240100000006000000020000',
+                                   'require-sign\n' + remote.UNKNOWN_TOUCH_NOTICE),
+                                  ('one', 'D2760001240100000006000000010000', '\n'),
+                                  ('none-listed', '', '\n'),
+                                  ('refused', None, '\n')):
+            with self.subTest(name):
+                h = self.harness(name, extra_env={} if cards is None else {'FAKE_CARD_LIST': cards})
+                h.decision.write_text('delayed-sign')
+                self.sign(h, f'{self.CARD_SUB} %01+')
+                self.assertEqual(self.gate(h), gate)
+                self.assertEqual(self.touch_at_start(h), ['after' if gate == '\n' else 'before'])
+
+    def test_the_other_key_notice_matches_the_wrapper(self):
+        wrapper = (ROOT.parent / 'git-gpg-preview').read_text()
+        self.assertEqual(re.search(r'^OTHER_KEY_NOTICE="(.*)"$', wrapper, re.M).group(1), remote.OTHER_KEY_NOTICE)
+        self.assertLessEqual(len(remote.OTHER_KEY_NOTICE), 80)
+
+    def test_the_gate_follows_require_sign_not_the_notice(self):
+        """In process: an empty notice still asks for Sign and still holds GPG
+        back until it comes."""
+        h = self.harness('h')
+        service = remote.Service(remote.ServeConfig(h.serve_dir), {'login': '', 'node': 'mac', 'ips': []})
+        info = remote.parse_payload(self.payload)
+        for choice, status in (('cancel', remote.EX_CANCELLED), ('delayed-sign', 0)):
+            with self.subTest(choice=choice), unittest.mock.patch.dict(os.environ, h.env):
+                h.decision.write_text(choice)
+                self.untouch(h)
+                paths = {name: self.tmp / f'{choice}-{name}' for name in ('payload', 'summary.txt', 'details.txt', 'decision', 'ready')}
+                paths['payload'].write_bytes(self.payload)
+                digest = remote.hashlib.sha256(self.payload).hexdigest()
+                paths['summary.txt'].write_text(f'Request type: commit\nSHA-256: {digest}\n\nMessage:\nSubject')
+                paths['details.txt'].write_text('details')
+                paths['decision'].write_text('')
+                result = service._run_dialog_and_gpg(['--status-fd=2', '-bsau', self.PRIMARY], paths, info, digest,
+                                                     'repo', 'peer', time.monotonic(),
+                                                     require_sign=True, sign_notice='', policy='off')
+                self.assertEqual(result['status'], status, result)
+                self.assertEqual(self.gate(h), 'require-sign\n')
+                self.assertEqual(self.touch_at_start(h), ['before'] if status == 0 else [])
+
+    def test_touch_off_without_sign_signs_nothing(self):
+        for choice, status in (('cancel', remote.EX_CANCELLED), ('garbage', remote.EX_SOFTWARE), ('hang', remote.EX_SOFTWARE)):
+            with self.subTest(choice=choice):
+                h = self.harness(choice)
+                h.decision.write_text(choice)
+                self.card.write_text(f'{self.CARD_SUB} %00+')
+                started = time.monotonic()
+                result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+                self.assertLess(time.monotonic() - started, 10, 'sign_timeout_seconds=3 bounds the wait for Sign')
+                self.assertEqual((result.returncode, result.stdout), (status, b''))
+                self.assertIn(self.REFUSED, result.stderr.decode())
+                self.assertEqual((h.gpg_calls(), self.touch_at_start(h)), ([], []), 'GPG started without Sign')
+                self.assertIn('decision=' + ('cancel' if choice == 'cancel' else 'sign-not-clicked'), h.audit.read_text())
+
+    def refused(self, h: Harness, choice: str, status: int = remote.EX_SOFTWARE, limit: float = 10):
+        """Signs with touch off and the preview answering CHOICE, which must be
+        refused within LIMIT seconds with STATUS and no GPG call. Returns the
+        stderr and the preview's process id."""
+        h.decision.write_text(choice)
+        self.card.write_text(f'{self.CARD_SUB} %00+')
+        started = time.monotonic()
+        result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+        self.assertLess(time.monotonic() - started, limit)
+        self.assertEqual((result.returncode, result.stdout), (status, b''), result.stderr)
+        self.assertIn(self.REFUSED, result.stderr.decode())
+        self.assertEqual((h.gpg_calls(), self.touch_at_start(h)), ([], []), 'GPG started without Sign')
+        pid = int(sorted(h.captures.glob('*.gate'), key=lambda p: p.stat().st_mtime)[-1].stem)
+        return result.stderr.decode(), pid
+
+    def test_only_the_exact_answer_sign_is_a_sign(self):
+        for index, answer in enumerate(('raw: sign', 'raw:sign ', 'raw:Sign', 'raw:signsign', 'raw:sign\\n', 'raw:sign\\0', 'marker-sign')):
             with self.subTest(answer=answer):
-                h = self.harness(f'h{index}', setattr_answer=answer)
-                h.touch_offer.write_text('apply')
-                summary, stderr = self.sign(h, f'{self.CARD_SUB} %01+')
-                self.assertEqual(self.touch_dialogs(h), dialogs)
-                self.assertEqual(self.dismissals(h), 1)
-                self.assertEqual('decision=touch-policy-unchanged' in h.audit.read_text(), audited)
-                self.assertNotIn('Touch policy is now cached', summary)
-                if noted:
-                    self.assertIn(f'note from the signing Mac: could not set the cached touch policy: {noted}\n', stderr)
+                self.refused(self.harness(f'h{index}'), answer)
+        h = self.harness('exact')
+        h.decision.write_text('raw:sign')
+        self.sign(h, f'{self.CARD_SUB} %00+')
+        self.assertEqual(self.touch_at_start(h), ['before'])
+
+    def test_only_exact_answers_cancel_or_mark_as_spam(self):
+        """' cancel', 'cancel\\0' and 'spam\\n' are no answer the preview gives:
+        refused as Sign not clicked, with the wrapper's status and audit name,
+        neither as Cancel nor as Mark as Spam."""
+        for index, answer in enumerate(('raw: cancel', 'raw:cancel\\0', 'raw:spam\\n')):
+            with self.subTest(answer=answer):
+                h = self.harness(f'x{index}')
+                self.refused(h, answer)
+                self.assertEqual(re.findall(r'decision=(\S+)', h.audit.read_text()), ['sign-not-clicked'])
+                self.assertFalse((h.serve_dir / 'spam-subjects').exists())
+
+    def test_after_sign_a_window_waits_for_the_touch_and_offers_cancel(self):
+        """After Sign the preview has closed, and a key that still wants a touch
+        gets a window that says so while GPG runs: a touch signs and closes it;
+        Cancel in it stops GPG, cancels the card operation and signs nothing.
+        When the touch is the gate the preview stays up instead, so no such
+        window opens."""
+        waiting = self.tmp / 'waiting'
+        h = self.harness('touch', extra_env={'FAKE_WAITING_FILE': str(waiting)})
+        waiting.write_text('touch')
+        h.decision.write_text('approve-no-touch')
+        self.sign(h, f'{self.CARD_SUB} %00+')
+        self.assertEqual(self.touch_at_start(h), ['after'], 'GPG did not wait for the touch')
+        windows = (h.captures / 'waiting-windows').read_text().split('\n')
+        self.assertEqual((len(windows), windows[0].split()[0]), (2, 'waiting'))
+        with self.assertRaises(ProcessLookupError, msg='the waiting window outlived the signature'):
+            os.kill(int(windows[0].split()[1]), 0)
+        queue = self.tmp / 'card-queue'
+        queue.write_text('')
+        h = self.harness('cancel', extra_env={'FAKE_WAITING_FILE': str(waiting), 'FAKE_CARD_QUEUE': str(queue)})
+        waiting.write_text('cancel')
+        h.decision.write_text('approve-no-touch')
+        self.card.write_text(f'{self.CARD_SUB} %00+')
+        result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+        self.assertEqual((result.returncode, result.stdout), (remote.EX_CANCELLED, b''), result.stderr)
+        self.assertIn(b'signing cancelled by operator', result.stderr)
+        self.assertEqual(self.touch_at_start(h), ['after'], 'GPG did not run after Sign')
+        self.assertIn('SCD KILLSCD /bye', (h.calls / 'connect-agent-calls').read_text().splitlines())
+        self.assertEqual(queue.read_text(), '', 'the stopped signature still waits at the card')
+        self.assertEqual(re.findall(r'decision=(\S+)', h.audit.read_text()), ['cancel'])
+        h = self.harness('on', extra_env={'FAKE_WAITING_FILE': str(waiting)})
+        self.sign(h, f'{self.CARD_SUB} %01+')
+        self.assertFalse((h.captures / 'waiting-windows').exists())
+
+    def test_the_policy_is_read_from_the_card_not_scdaemons_copy(self):
+        """scdaemon answers GETATTR UIF-1 from the card data it read first, so a
+        policy changed since (ykman openpgp keys set-touch) would read as the
+        old one. The service asks the card itself: a key turned from on to off
+        asks for Sign on the next request."""
+        h = self.harness('h', extra_env={'FAKE_SCD_CACHE': str(self.tmp / 'scd-cache')})
+        h.decision.write_text('delayed-sign')
+        self.sign(h, f'{self.CARD_SUB} %01+')
+        self.assertEqual(self.gate(h), '\n')
+        self.untouch(h)
+        self.sign(h, f'{self.CARD_SUB} %00+')
+        self.assertEqual(self.gate(h), 'require-sign\n' + remote.TOUCH_NOTICES['off'])
+        self.assertEqual(self.touch_at_start(h), ['before'], 'GPG started before Sign')
+
+    def test_sign_timeout_must_be_positive_and_finite(self):
+        h = self.harness('h')
+        serve = (h.serve_dir / 'serve').read_text()
+        self.assertLess(remote.MAX_SIGN_TIMEOUT, threading.TIMEOUT_MAX, 'Lock.acquire would raise OverflowError')
+        for value in ('nan', 'inf', '-inf', '0', '-5', 'soon', '3600.5', '1e12', '1e400'):
+            with self.subTest(value=value):
+                (h.serve_dir / 'serve').write_text(f'{serve}sign_timeout_seconds={value}\n')
+                with self.assertRaisesRegex(remote.RemoteError, 'sign_timeout_seconds must be a positive, finite.*at most 3600'):
+                    remote.ServeConfig(h.serve_dir)
+        for value, expected in (('7.5', 7.5), ('3600', 3600), ('', 120)):
+            with self.subTest(value=value):
+                (h.serve_dir / 'serve').write_text(f'{serve}sign_timeout_seconds={value}\n')
+                self.assertEqual(remote.ServeConfig(h.serve_dir).sign_timeout, expected)
+
+    def test_touch_off_mark_as_spam_saves_the_subject_without_gpg(self):
+        h = self.harness('h')
+        stderr, _ = self.refused(h, 'spam', remote.EX_CANCELLED)
+        self.assertIn('subject marked as spam', stderr)
+        self.assertEqual((h.serve_dir / 'spam-subjects').read_bytes(), 'second commit Ω\n'.encode())
+        self.assertIn('decision=spam-mark', h.audit.read_text())
+
+    def test_the_wait_for_sign_shares_the_request_time_and_ends_the_preview(self):
+        """The request's time from its arrival covers the policy lookup, a
+        preview that never shows and the wait for Sign, which ends where only
+        GPG's reserve is left; a refused preview does not keep running."""
+        # sign_timeout_seconds=8 keeps 4s for GPG, so Sign counts until 4s,
+        # even after a 1.5s lookup.
+        _, pid = self.refused(self.harness('slow', extra_env={'FAKE_CONNECT_AGENT_SLEEP': '1.5'},
+                                           serve_extra='sign_timeout_seconds=8\n'), 'hang', limit=4.8)
+        with self.assertRaises(ProcessLookupError, msg='the preview still runs after the refusal'):
+            os.kill(pid, 0)
+        _, pid = self.refused(self.harness('never'), 'never-ready', limit=3.5)
+        with self.assertRaises(ProcessLookupError, msg='the preview still runs after the refusal'):
+            os.kill(pid, 0)
+        # An answer from a preview still open at the deadline does not count.
+        self.refused(self.harness('early'), 'early-sign', limit=3.5)
+        h = self.harness('slower', extra_env={'FAKE_CONNECT_AGENT_SLEEP': '4'})
+        h.decision.write_text('hang')
+        self.card.write_text(f'{self.CARD_SUB} %00+')
+        started = time.monotonic()
+        result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+        self.assertTrue(2.5 < time.monotonic() - started < 3.5, f'{time.monotonic() - started:.1f}s, not about 3s')
+        self.assertEqual(result.stdout, b'')
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_a_long_wait_in_the_queue_leaves_the_policy_its_own_time(self):
+        """The policy lookup's 10 seconds start once the locks are held: a
+        request that queued for longer still reads on, and needs no Sign."""
+        # sign_timeout_seconds=45 leaves the 32.5s a preview needs after 10.5s.
+        h = self.harness('h', serve_extra='sign_timeout_seconds=45\n')
+        holder = int(subprocess.run(['sh', '-c', 'sleep 10.5 >/dev/null 2>&1 & echo $!'],
+                                    capture_output=True, text=True, check=True).stdout)
+        (self.tmp / 'h' / 'lock').mkdir(parents=True, exist_ok=True)
+        (self.tmp / 'h' / 'lock' / 'dialog.lock').write_text(str(holder))
+        started = time.monotonic()
+        self.sign(h, f'{self.CARD_SUB} %01+')
+        self.assertGreater(time.monotonic() - started, 10, 'the request did not queue')
+        self.assertEqual(self.gate(h), '\n', 'a long queue made the policy unknown')
+
+    def test_sign_leaves_gpg_its_reserve_and_counts_until_then(self):
+        """With sign_timeout_seconds=8 GPG keeps half (a minute, or a third of a
+        long timeout, at most half) for the PIN and a touch, so Sign counts
+        until 4s: at 2.5s it signs, at 3.5s with a 3s PIN and touch it still
+        signs, and at 5s it is refused."""
+        h = self.harness('in-time', serve_extra='sign_timeout_seconds=8\n')
+        h.decision.write_text('late-sign:2.5')
+        self.sign(h, f'{self.CARD_SUB} %00+')
+        self.assertEqual(self.touch_at_start(h), ['before'])
+        h = self.harness('slow-pin', extra_env={'FAKE_GPG_SLOW': '3'}, serve_extra='sign_timeout_seconds=8\n')
+        h.decision.write_text('late-sign:3.5')
+        self.sign(h, f'{self.CARD_SUB} %00+')
+        self.refused(self.harness('late', serve_extra='sign_timeout_seconds=8\n'), 'late-sign:5', limit=5)
+        self.assertEqual(remote.sign_budget(120), (60, 70))
+        self.assertEqual(remote.sign_budget(300), (100, 110))
+
+    def test_after_sign_a_key_that_never_confirms_is_stopped(self):
+        h = self.harness('h')
+        h.decision.write_text('approve-no-touch')
+        self.card.write_text(f'{self.CARD_SUB} %00+')
+        started = time.monotonic()
+        result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+        self.assertLess(time.monotonic() - started, 4.5)
+        self.assertEqual((result.returncode, result.stdout), (remote.EX_SOFTWARE, b''))
+        self.assertIn(b'not signed: no touch or PIN before the deadline', result.stderr)
+        self.assertEqual(self.touch_at_start(h), ['after'], 'GPG did not run after Sign')
+        self.assertIn('decision=gpg-timeout', h.audit.read_text())
+
+    def test_queued_requests_never_outlive_their_time(self):
+        """Two requests queued behind a dialog lock that another signer holds
+        are refused within sign_timeout_seconds of arriving, and neither ever
+        shows a preview."""
+        h = self.harness('h')
+        holder = subprocess.Popen(['sleep', '30'])
+        self.addCleanup(holder.kill)
+        (self.tmp / 'h' / 'lock').mkdir(parents=True, exist_ok=True)
+        (self.tmp / 'h' / 'lock' / 'dialog.lock').write_text(str(holder.pid))
+        self.card.write_text(f'{self.CARD_SUB} %01+')
+
+        def request(_):
+            started = time.monotonic()
+            result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+            return time.monotonic() - started, result
+
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            results = list(pool.map(request, range(2)))
+        for elapsed, result in results:
+            self.assertLess(elapsed, 4.5)
+            self.assertEqual((result.returncode, result.stdout), (remote.EX_SOFTWARE, b''))
+            self.assertIn(b'the signing Mac was busy for most of 3s', result.stderr)
+        self.assertEqual(list(h.captures.glob('*.summary')), [], 'a queued request showed a preview')
+        self.assertEqual(h.audit.read_text().count('decision=busy'), 2)
+        # A request that gets the lock after waiting has only what is left of
+        # its time: with sign_timeout_seconds=8, 6.5s after a 1.5s wait. The
+        # holder is not this process's child, so it leaves no zombie that would
+        # still look alive.
+        h = self.harness('later', serve_extra='sign_timeout_seconds=8\n')
+        holder = int(subprocess.run(['sh', '-c', 'sleep 1.5 >/dev/null 2>&1 & echo $!'],
+                                    capture_output=True, text=True, check=True).stdout)
+        (self.tmp / 'later' / 'lock').mkdir(parents=True, exist_ok=True)
+        (self.tmp / 'later' / 'lock' / 'dialog.lock').write_text(str(holder))
+        h.decision.write_text('hang')
+        elapsed, result = request(0)
+        self.assertLess(elapsed, 8.6, 'the wait for the lock was not counted')
+        self.assertEqual((result.returncode, result.stdout), (remote.EX_SOFTWARE, b''))
+        self.assertIn(b'no hardware confirmation within 8s', result.stderr)
+
+    def test_a_stopped_signature_does_not_wait_at_the_card_for_the_next_touch(self):
+        """After GPG is stopped while the card waits, for want of a touch (with
+        Sign or without), on Cancel, Mark as Spam or a preview closed without
+        an answer, the operation it left there is cancelled: the next request's
+        touch signs that request, not the stale one."""
+        for index, (uif, answer, status) in enumerate((('%00+', 'approve-no-touch', remote.EX_SOFTWARE),
+                                                       ('%01+', 'approve-no-touch', remote.EX_SOFTWARE),
+                                                       ('%01+', 'delayed-cancel', remote.EX_CANCELLED),
+                                                       ('%01+', 'delayed-spam', remote.EX_CANCELLED),
+                                                       ('%01+', 'delayed-garbage', remote.EX_SOFTWARE))):
+            with self.subTest(uif=uif, answer=answer):
+                queue = self.tmp / f'card-queue{index}'
+                queue.write_text('')
+                h = self.harness(f'stopped{index}', extra_env={'FAKE_CARD_QUEUE': str(queue)})
+                h.decision.write_text(answer)
+                self.card.write_text(f'{self.CARD_SUB} {uif}')
+                result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+                self.assertEqual((result.returncode, result.stdout), (status, b''))
+                self.assertIn('SCD KILLSCD /bye', (h.calls / 'connect-agent-calls').read_text().splitlines())
+                h.decision.write_text('sign')
+                result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.initial, self.repo)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, f'signed:{remote.hashlib.sha256(self.initial).hexdigest()}'.encode(),
+                                 'the next touch went to the stopped signature')
+
+    def test_the_card_cancel_is_only_for_a_card_operation_left_pending(self):
+        """Stopping scdaemon drops the PIN it holds and disturbs its other users,
+        so the cancel goes only where a card operation may be pending: a GPG
+        stopped while it ran, signing from a certificate with a signing key on
+        a card (even when its software key is the pick, as GnuPG 2.3 and later
+        may sign on the card), or one whose lookup failed. Not a certificate
+        with no card signing key, and not a GPG that had already finished when
+        the operator's Cancel landed."""
+        soft = '5' * 40
+        for name, extra, cancels in (('software', {'card_keys': ''}, False),
+                                     ('card and software', {'extra_env': {'FAKE_GPG_SECRET_KEYS': f'{self.PRIMARY}/{soft}/{self.CARD_SUB}'}}, True),
+                                     ('lookup failed', {'extra_env': {'FAKE_GPG_LIST_FAIL': str(self.tmp / 'list-fails')}}, True),
+                                     ('finished', {}, False)):
+            with self.subTest(name):
+                h = self.harness(name.replace(' ', '-'), **extra)
+                if name == 'lookup failed':
+                    (self.tmp / 'list-fails').write_text('')  # the service has started; its lookup now fails
+                h.decision.write_text('touch-then-late-cancel' if name == 'finished' else 'approve-no-touch')
+                self.card.write_text(f'{self.CARD_SUB} {"%01+" if name == "finished" else "%00+"}')
+                result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+                status = remote.EX_CANCELLED if name == 'finished' else remote.EX_SOFTWARE
+                self.assertEqual((result.returncode, result.stdout), (status, b''), result.stderr)
+                if name == 'finished':
+                    self.assertEqual(len(h.gpg_calls()), 1, 'GPG did not finish before the Cancel')
                 else:
-                    self.assertNotIn('could not set', stderr)
+                    self.assertIn(b'not signed: no touch or PIN before the deadline', result.stderr)
+                    self.assertEqual(self.gate(h).split('\n')[0], 'require-sign', 'the policy was read')
+                calls = h.calls / 'connect-agent-calls'
+                self.assertEqual('SCD KILLSCD /bye' in (calls.read_text() if calls.exists() else '').splitlines(), cancels)
 
-    def test_an_unanswered_window_or_pin_prompt_shares_the_signing_time_limit(self):
-        h = self.harness('offer')
-        h.touch_offer.write_text('hang')
+    def test_a_gpg_that_finished_before_it_was_stopped_gets_no_card_cancel(self):
+        """In process: GPG takes 0.4s, and the Cancel the preview wrote with the
+        touch is read a second later, after GPG has signed. Stopping it then
+        sends no KILLSCD: nothing waits at the card."""
+        h = self.harness('h', extra_env={'FAKE_GPG_SLOW': '0.4'})
+        service = remote.Service(remote.ServeConfig(h.serve_dir), {'login': '', 'node': 'mac', 'ips': []})
+        info = remote.parse_payload(self.payload)
+        read = remote.read_decision
+
+        def slow_read(path):
+            time.sleep(1)
+            return read(path)
+
+        h.decision.write_text('touch-then-cancel')
+        paths = {name: self.tmp / f'finished-{name}' for name in ('payload', 'summary.txt', 'details.txt', 'decision', 'ready')}
+        paths['payload'].write_bytes(self.payload)
+        digest = remote.hashlib.sha256(self.payload).hexdigest()
+        paths['summary.txt'].write_text(f'Request type: commit\nSHA-256: {digest}\n\nMessage:\nSubject')
+        paths['details.txt'].write_text('details')
+        paths['decision'].write_text('')
+        with unittest.mock.patch.dict(os.environ, h.env), unittest.mock.patch.object(remote, 'read_decision', slow_read):
+            result = service._run_dialog_and_gpg(['--status-fd=2', '-bsau', self.PRIMARY], paths, info, digest,
+                                                 'repo', 'peer', time.monotonic(), require_sign=False, policy='on')
+        self.assertEqual(result['status'], remote.EX_CANCELLED, result)
+        self.assertEqual(len(h.gpg_calls()), 1, 'GPG did not finish')
+        calls = h.calls / 'connect-agent-calls'
+        self.assertNotIn('KILLSCD', calls.read_text() if calls.exists() else '')
+
+    def test_a_pending_answer_is_read_with_the_one_rule(self):
+        """An answer the preview began (its marker exists) is awaited as
+        read_decision reads it: only exactly sign, cancel and spam count, so
+        'sign ', 'sign\\n', ' cancel', 'cancel\\0' and bytes that are not UTF-8
+        are answers but invalid, and an empty file is none yet. Such an answer
+        after a touch releases nothing."""
+        service = remote.Service.__new__(remote.Service)
+        decision = self.tmp / 'decision'
+        (self.tmp / 'decision.deciding').write_text('')
+        for data, waits, read in ((b'sign ', False, 'invalid'), (b'sign\n', False, 'invalid'),
+                                  (b' cancel', False, 'invalid'), (b'cancel\0', False, 'invalid'),
+                                  (b'\xff\xfe', False, 'invalid'), (b'', True, ''),
+                                  (b'sign', False, 'sign'), (b'cancel', False, 'cancel'),
+                                  (b'spam', False, 'spam')):
+            with self.subTest(data=data):
+                decision.write_bytes(data)
+                started = time.monotonic()
+                service._await_pending_decision({'decision': decision})
+                self.assertEqual(time.monotonic() - started >= remote.DECISION_GRACE_SECONDS * 0.9, waits)
+                self.assertEqual(remote.read_decision(decision), read)
+        for index, answer in enumerate(('marker-raw:sign ', 'marker-raw:sign\\n')):
+            with self.subTest(answer=answer):
+                h = self.harness(f'pending{index}')
+                h.decision.write_text(answer)
+                self.card.write_text(f'{self.CARD_SUB} %01+')
+                result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+                # Refused as unfinished or as no valid answer, whichever of the
+                # preview and GPG ends first; never signed.
+                self.assertEqual((result.returncode, result.stdout), (remote.EX_SOFTWARE, b''), result.stderr)
+                self.assertNotIn('decision=sign\n', h.audit.read_text())
+
+    def test_a_queued_request_for_a_touch_key_needs_no_time_for_sign(self):
+        """With sign_timeout_seconds=8 GPG keeps 4s for the PIN and a touch, and
+        a preview that asks for Sign needs 2s more. After 3s in the queue about
+        5s are left: enough for a key whose touch is the gate, which still
+        signs, too little for one that needs Sign, which is refused as busy."""
+        for uif, signs in (('%01+', True), ('%02+', True), ('%00+', False), ('%03+', False)):
+            with self.subTest(uif=uif):
+                name = f'queued{uif[2]}'
+                h = self.harness(name, serve_extra='sign_timeout_seconds=8\n')
+                holder = int(subprocess.run(['sh', '-c', 'sleep 3 >/dev/null 2>&1 & echo $!'],
+                                            capture_output=True, text=True, check=True).stdout)
+                (self.tmp / name / 'lock').mkdir(parents=True, exist_ok=True)
+                (self.tmp / name / 'lock' / 'dialog.lock').write_text(str(holder))
+                self.card.write_text(f'{self.CARD_SUB} {uif}')
+                started = time.monotonic()
+                result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+                self.assertGreater(time.monotonic() - started, 2.5, 'the request did not queue')
+                if signs:
+                    self.assertEqual((result.returncode, result.stdout), (0, b'signature:remote'), result.stderr)
+                else:
+                    self.assertEqual((result.returncode, result.stdout), (remote.EX_SOFTWARE, b''))
+                    self.assertIn(b'the signing Mac was busy for most of 8s', result.stderr)
+                    self.assertEqual((list(h.captures.glob('*.summary')), h.gpg_calls()), ([], []))
+
+    def test_too_little_time_left_after_the_queue_is_refused_as_busy(self):
+        """A lock wait that leaves less than a short read of the preview plus
+        GPG's reserve shows no preview and starts no GPG, even for a key that
+        needs a touch."""
+        h = self.harness('h')
+        holder = int(subprocess.run(['sh', '-c', 'sleep 2.6 >/dev/null 2>&1 & echo $!'],
+                                    capture_output=True, text=True, check=True).stdout)
+        (self.tmp / 'h' / 'lock').mkdir(parents=True, exist_ok=True)
+        (self.tmp / 'h' / 'lock' / 'dialog.lock').write_text(str(holder))
+        self.card.write_text(f'{self.CARD_SUB} %01+')
         started = time.monotonic()
-        self.sign(h, f'{self.CARD_SUB} %01+')
-        self.assertLess(time.monotonic() - started, 3, 'sign_timeout_seconds=3 covers the offer too')
-        self.assertEqual(self.touch_dialogs(h), ['touch-offer on 3'])
-        self.assertEqual(self.dismissals(h), 0, 'an unanswered offer is not a dismissal')
-        self.sign(h, None)
-        self.assertEqual(self.touch_dialogs(h), [], 'an unanswered offer waits a day like any other')
-        h = self.harness('pin', setattr_answer='hang')
-        h.touch_offer.write_text('apply')
+        result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+        self.assertLess(time.monotonic() - started, 3.5)
+        self.assertEqual((result.returncode, result.stdout), (remote.EX_SOFTWARE, b''))
+        self.assertIn(b'the signing Mac was busy for most of 3s', result.stderr)
+        self.assertEqual((list(h.captures.glob('*.summary')), h.gpg_calls()), ([], []), 'a preview or GPG started')
+        self.assertIn('decision=busy', h.audit.read_text())
+
+    def test_a_notice_that_cannot_be_written_still_needs_sign(self):
+        """In process, so writing the notice can be made to fail. Neither file
+        gets it, the operator is told, and the preview still asks for Sign
+        with the notice text: GPG waits for Sign, and Cancel signs nothing."""
+        h = self.harness('h')
+        self.card.write_text(f'{self.CARD_SUB} %00+')
+        write_text = Path.write_text
+
+        def details_fail(path, text, *args, **kwargs):
+            if path.name == 'details.txt' and text.startswith('Touch policy'):
+                raise OSError(28, 'No space left on device')
+            return write_text(path, text, *args, **kwargs)
+
+        request = {'args': ['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], 'payload': base64.b64encode(self.payload).decode(),
+                   'context': {'repository': str(self.repo), 'branch': 'main'}}
+        for choice, status in (('cancel', remote.EX_CANCELLED), ('delayed-sign', 0)):
+            with self.subTest(choice=choice), unittest.mock.patch.dict(os.environ, h.env), \
+                    unittest.mock.patch.object(Path, 'write_text', details_fail):
+                h.decision.write_text(choice)
+                self.untouch(h)
+                service = remote.Service(remote.ServeConfig(h.serve_dir), {'login': '', 'node': 'mac', 'ips': []})
+                result = service.sign(request, {'node': 'minidev-test', 'login': 'tester'})
+                summary, details = h.latest_capture()
+                self.assertEqual(result['status'], status, result)
+                self.assertFalse(summary.startswith('Touch policy') or details.startswith('Touch policy'), 'only one file got the notice')
+                self.assertEqual(self.gate(h), 'require-sign\n' + remote.TOUCH_NOTICES['off'])
+                self.assertIn('could not add the touch policy notice to the preview or its details', result['stderr'])
+                self.assertEqual(self.touch_at_start(h), ['before'] if status == 0 else [])
+                if status:
+                    self.assertIn(self.REFUSED, result['stderr'])
+
+    def test_the_policy_lookup_counts_against_the_signing_time(self):
+        h = self.harness('h', extra_env={'FAKE_CONNECT_AGENT_SLEEP': '2'})
+        h.decision.write_text('approve-no-touch')
+        self.card.write_text(f'{self.CARD_SUB} %01+')
         started = time.monotonic()
-        self.sign(h, f'{self.CARD_SUB} %01+')
-        self.assertLess(time.monotonic() - started, 3, 'sign_timeout_seconds=3 covers the Admin PIN prompt too')
-        self.assertEqual(self.touch_dialogs(h), ['touch-offer on 3', 'touch-unchanged '])
-        self.assertEqual(self.dismissals(h), 1)
+        result = h.client(['--status-fd=2', '-bsau', '3DB3F5612E33B6BC'], self.payload, self.repo)
+        # Two of the three seconds went to the lookup: too little is left.
+        self.assertEqual(result.returncode, remote.EX_SOFTWARE, result.stderr)
+        self.assertIn(b'the signing Mac was busy for most of 3s', result.stderr)
+        self.assertLess(time.monotonic() - started, 3.5, 'a 2s lookup and the 3s signing time were added up')
 
-    def test_offer_limits_match_the_wrapper(self):
-        wrapper = (ROOT.parent / 'git-gpg-preview').read_text()
-        self.assertIn(f'\nTOUCH_OFFER_DISMISSALS={remote.TOUCH_OFFER_DISMISSALS}\n', wrapper)
-        self.assertIn(f'\nTOUCH_OFFER_INTERVAL={remote.TOUCH_OFFER_INTERVAL}\n', wrapper)
+    def test_the_preview_is_the_only_window_and_nothing_is_recorded(self):
+        h = self.harness('h')
+        files = sorted(p.name for p in h.serve_dir.iterdir())
+        for count, uif in enumerate(('%00+', '%01+', '%02+', '%03+', '%04+'), start=1):
+            with self.subTest(uif=uif):
+                self.sign(h, f'{self.CARD_SUB} {uif}')
+                self.assertFalse((h.captures / 'other-windows').exists())
+                self.assertEqual(len(list(h.captures.glob('*.summary'))), count)
+                self.assertEqual(sorted(p.name for p in h.serve_dir.iterdir()), files)
 
-    def wrapper_offer_function(self, offers: Path, *call: str) -> str:
-        """Runs one of the wrapper's touch offer functions against OFFERS."""
-        wrapper = (ROOT.parent / 'git-gpg-preview').read_text()
-        functions = '\n'.join(re.search(rf'^{name}\(\) \{{\n.*?^\}}', wrapper, re.M | re.S).group()
-                              for name in ('touch_offer_state', 'touch_offer_due', 'remember_touch_offer'))
-        script = (f'TOUCH_OFFERS_FILE="$1"; TOUCH_OFFER_DISMISSALS={remote.TOUCH_OFFER_DISMISSALS}; '
-                  f'TOUCH_OFFER_INTERVAL={remote.TOUCH_OFFER_INTERVAL}\n{functions}\n"${{@:2}}"')
-        result = subprocess.run(['bash', '-c', script, 'bash', str(offers), *call], capture_output=True, text=True)
-        return f'{result.returncode} {result.stdout.strip()}'.strip()
-
-    def test_offer_records_match_the_wrapper(self):
-        offers = self.tmp / 'touch-offers'
-        key = self.CARD_SUB
-        for line in (f'{key} 2 1700000000', f'{key} 0 0', f'{key}\t1\t5', f'  {key}  1  5  ', f'{key} 2 1700000000 extra', f'{key} 2',
-                     f'{key} x 5', f'{key} 02 5', f'{key} -1 5', f'{key} 1 5\r', f'{key} 99999999999999999 5', f'{key} 999999999999999999 5',
-                     f'{key} 9999999999999999999 5', f'{self.OTHER} 2 5', 'garbage', ''):
-            with self.subTest(line=line):
-                offers.write_bytes(line.encode() + b'\n')
-                state = remote.touch_offer_state(offers, key)
-                self.assertEqual(self.wrapper_offer_function(offers, 'touch_offer_state', key), f'0 {state[0]} {state[1]}')
-        for first, second in ((f'{key} 1 5\n{key} 2 6\n', (1, 5)), (f'{key} x 5\n{key} 2 6\n', (2, 6))):
-            offers.write_text(first)
-            self.assertEqual(remote.touch_offer_state(offers, key), second)
-            self.assertEqual(self.wrapper_offer_function(offers, 'touch_offer_state', key), f'0 {second[0]} {second[1]}')
-        offers.unlink()
-        self.assertEqual(remote.touch_offer_state(offers, key), (0, 0))
-        self.assertEqual(self.wrapper_offer_function(offers, 'touch_offer_state', key), '0 0 0')
-        # Each writes what the other reads, keeping the other keys' lines.
-        offers.write_text(f'{self.OTHER} 3 7\n')
-        remote.remember_touch_offer(offers, key, 1, 100)
-        self.assertEqual(self.wrapper_offer_function(offers, 'touch_offer_state', key), '0 1 100')
-        self.assertEqual(self.wrapper_offer_function(offers, 'remember_touch_offer', key, '2', '200'), '0')
-        self.assertEqual(remote.touch_offer_state(offers, key), (2, 200))
-        self.assertEqual(remote.touch_offer_state(offers, self.OTHER), (3, 7))
-        self.assertEqual(sorted(offers.read_text().splitlines()), sorted([f'{self.OTHER} 3 7', f'{key} 2 200']))
-        self.assertEqual(offers.stat().st_mode & 0o777, 0o600)
-        self.assertEqual([p.name for p in self.tmp.iterdir() if '.touch-offers' in p.name or 'touch-offers.' in p.name], [])
-        limit, interval = remote.TOUCH_OFFER_DISMISSALS, remote.TOUCH_OFFER_INTERVAL
-        for dismissals, shown, now in ((0, 0, 1000000), (limit - 1, 0, 1000000), (limit, 0, 1000000), (limit + 1, 0, 1000000),
-                                       (0, 1000000 - interval, 1000000), (0, 1000000 - interval + 1, 1000000), (0, 1000000, 1000000),
-                                       (0, 1000001, 1000000)):
-            with self.subTest(dismissals=dismissals, shown=shown):
-                due = remote.touch_offer_due(dismissals, shown, now)
-                self.assertEqual(self.wrapper_offer_function(offers, 'touch_offer_due', str(dismissals), str(shown), str(now)),
-                                 '0' if due else '1')
+    def test_an_old_offer_record_is_neither_read_nor_written(self):
+        h = self.harness('h')
+        record = h.serve_dir / 'touch-offers'
+        old = f'{self.CARD_SUB} 3 {int(time.time())}\n'
+        record.write_text(old)
+        os.utime(record, (1, 1))
+        for uif, policy in (('%00+', 'off'), ('%03+', 'cached')):
+            with self.subTest(policy=policy):
+                summary, stderr = self.sign(h, f'{self.CARD_SUB} {uif}')
+                self.assertTrue(summary.startswith(remote.TOUCH_NOTICES[policy]), summary)
+                self.assertIn(self.note(policy), stderr)
+                self.assertEqual(record.read_text(), old)
+                self.assertEqual(record.stat().st_mtime, 1)
 
     def test_the_summary_splits_at_the_first_message_line_and_keeps_long_messages(self):
         forged = 'x\n\nMessage:\nFORGED'
@@ -907,6 +1471,31 @@ class TouchPolicyTests(unittest.TestCase):
         self.assertTrue(summary.endswith(long_message), summary)
         summary = remote.Service._summary(None, {**info, 'message': long_message * 2}, [], b'payload', 'a' * 64, {}, 'peer')
         self.assertIn('[truncated in summary; View Details shows the complete report]', summary)
+
+    def test_a_branch_name_cannot_break_or_reorder_its_fact_line(self):
+        """NSTextView starts a new line at U+0085, U+2028 and U+2029, and the
+        bidirectional controls reorder text, though none is a control
+        character: in a fact each becomes '?', as in the wrapper. Other text
+        stays."""
+        unsafe = '\u0085\u2028\u2029\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069'
+        branch = 'facts' + ''.join(c + chr(ord('a') + i) for i, c in enumerate(unsafe)) + '\u00e9'
+        info = {'type': 'commit', 'message': 'Subject'}
+        summary = remote.Service._summary(None, info, ['-u', 'KEY'], b'payload', 'a' * 64, {'branch': branch}, 'peer')
+        facts = summary.partition('\n\nMessage:\n')[0].split('\n')
+        self.assertIn('Branch: facts?a?b?c?d?e?f?g?h?i?j?k?l?m?n?o\u00e9', facts)
+        self.assertFalse(set(summary) & set(unsafe), summary)
+
+    def test_a_branch_name_holds_no_c1_control(self):
+        """U+009B is the 8-bit CSI, and the rest of U+0080-U+009F is no safer in
+        a fact or the audit log: each becomes '?', as in the wrapper. U+00A0,
+        just past them, stays."""
+        c1 = ''.join(map(chr, range(0x80, 0xa0)))
+        info = {'type': 'commit', 'message': 'Subject'}
+        summary = remote.Service._summary(None, info, ['-u', 'KEY'], b'payload', 'a' * 64,
+                                          {'branch': f'c1\u009b{c1}\u00a0\u00e9'}, 'peer')
+        facts = summary.partition('\n\nMessage:\n')[0].split('\n')
+        self.assertIn('Branch: c1' + '?' * 33 + '\u00a0\u00e9', facts)
+        self.assertFalse(set(summary) & set(c1), summary)
 
     def test_a_failed_slow_or_late_card_query_gives_no_policy(self):
         agent = str(HELPERS / 'fake-gpg-connect-agent.py')
@@ -945,6 +1534,17 @@ class TouchPolicyTests(unittest.TestCase):
                     self.card.write_text(card)
                     self.assertEqual(remote.card_touch_policy(agent, self.CARD_SUB), policy)
 
+    def test_only_off_and_cached_get_a_notice_of_two_short_lines_suggesting_on(self):
+        self.assertEqual(sorted(remote.TOUCH_NOTICES), ['cached', 'off'])
+        for policy, notice in remote.TOUCH_NOTICES.items():
+            with self.subTest(policy=policy):
+                lines = notice.split('\n')
+                self.assertEqual(len(lines), 2, notice)
+                self.assertTrue(lines[0].startswith(f'Touch policy is {policy}: '), notice)
+                self.assertTrue(lines[1].endswith('run: ykman openpgp keys set-touch sig on'), notice)
+                self.assertTrue(all(len(line) <= 80 for line in lines), 'the facts pane does not wrap')
+                self.assertNotRegex(notice, CACHED_HINT)
+
     def test_touch_notices_match_the_wrapper(self):
         wrapper = (ROOT.parent / 'git-gpg-preview').read_text()
         function = re.search(r'^touch_policy_notice\(\) \{\n.*?^\}', wrapper, re.M | re.S).group()
@@ -976,6 +1576,27 @@ class TouchPolicyTests(unittest.TestCase):
             'tie goes to the first listed': cert(primary, 'cSC', '+', (sub1, 'u', '300', card), (sub2, 'u', '300', '+')),
             'subkey from the future': cert(primary, 'cSC', '+', (sub1, 'u', '200', card), (sub2, 'u', future, '+')),
             'primary when no subkey signs': cert(primary, 'scSC', card, (sub1, 'r', '300', '+')),
+            'software primary that can sign': cert(primary, 'scSC', '+', (sub1, 'u', '300', card)),
+            'stub primary that can sign': cert(primary, 'scSC', '#', (sub1, 'u', '300', card)),
+            'card primary with a software subkey': cert(primary, 'scSC', card, (sub1, 'u', '300', '+')),
+            'software primary when no subkey signs': cert(primary, 'scSC', '+', (sub1, 'e', '300', card)),
+            'one card subkey': cert(primary, 'cSC', '+', (sub1, 'u', '300', card)),
+            'two card subkeys': cert(primary, 'cSC', '+', (sub1, 'u', '300', card), (sub2, 'u', '200', card)),
+            'one card key in two certificates': cert(primary, 'cSC', '+', (sub1, 'u', '300', card))
+                                                + cert('D' * 40, 'cSC', '+', (sub1, 'u', '300', card)),
+            'no signing key on a card': cert(primary, 'cSC', card, (sub1, 'u', '300', '+')),
+            'a card certificate, then a software one': cert(primary, 'cSC', '+', (sub1, 'u', '300', card))
+                                                       + cert('D' * 40, 'cSC', '+', (sub2, 'u', '200', '+')),
+            'a software certificate, then a card one': cert(primary, 'cSC', '+', (sub1, 'u', '300', '+'))
+                                                       + cert('D' * 40, 'cSC', '+', (sub2, 'u', '200', card)),
+            'two card certificates': cert(primary, 'cSC', '+', (sub1, 'u', '300', card))
+                                     + cert('D' * 40, 'cSC', '+', (sub2, 'u', '200', card)),
+            'two software certificates': cert(primary, 'cSC', '+', (sub1, 'u', '300', '+'))
+                                         + cert('D' * 40, 'cSC', '+', (sub2, 'u', '200', '')),
+            'a later certificate that cannot sign': cert(primary, 'cSC', '+', (sub1, 'u', '300', card))
+                                                    + cert('D' * 40, 'cSC', '+', (sub2, 'e', '200', '+')),
+            'a later certificate from the future': cert(primary, 'cSC', '+', (sub1, 'u', '300', card))
+                                                   + cert('D' * 40, 'cSC', '+', (sub2, 'u', future, '+')),
             'nothing can sign': cert(primary, 'cSC', '+', (sub1, 'e', '300', card)),
             'first certificate that can sign': cert(primary, 'cSC', '+', (sub1, 'e', '300', '+'))
                                               + cert('D' * 40, 'cSC', '+', (sub2, 'u', '200', card)),
@@ -992,6 +1613,20 @@ class TouchPolicyTests(unittest.TestCase):
                                          str(listing), primary], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(remote.selected_signing_key(text, time.time()), result.stdout.strip())
+        kinds = {'newest subkey on the card': 'mixed', 'newest subkey in software': 'mixed',
+                 'tie goes to the first listed': 'mixed', 'software primary that can sign': 'card',
+                 'stub primary that can sign': 'card', 'card primary with a software subkey': 'software',
+                 'software primary when no subkey signs': 'software',
+                 'expired newest subkey': 'card', 'stub without its secret': 'card',
+                 'primary when no subkey signs': 'card', 'one card subkey': 'card', 'two card subkeys': 'mixed',
+                 'one card key in two certificates': 'card',
+                 'empty token is software': 'software', 'no signing key on a card': 'software',
+                 'a card certificate, then a software one': 'mixed', 'a software certificate, then a card one': 'mixed',
+                 'two card certificates': 'mixed', 'two software certificates': 'software',
+                 'a later certificate that cannot sign': 'card', 'a later certificate from the future': 'mixed'}
+        for name, kind in kinds.items():
+            with self.subTest(name):
+                self.assertEqual(remote.selected_signing_key(listings[name], time.time()).split()[-1], kind)
 
 
 class SigningKeyTests(unittest.TestCase):

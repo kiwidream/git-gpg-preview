@@ -32,12 +32,13 @@ function run(argv) {
     const env = $.NSProcessInfo.processInfo.environment;
     const log = ObjC.unwrap(env.objectForKey('FAKE_DIALOG_LOG') || '');
     const captureDir = ObjC.unwrap(env.objectForKey('FAKE_DIALOG_CAPTURE_DIR') || '');
-    const decision = ObjC.unwrap(env.objectForKey('FAKE_DIALOG_DECISION') || 'sign');
+    let decision = ObjC.unwrap(env.objectForKey('FAKE_DIALOG_DECISION') || 'sign');
     const delay = Number(ObjC.unwrap(env.objectForKey('FAKE_DIALOG_DELAY') || '0'));
     const touch = ObjC.unwrap(env.objectForKey('FAKE_TOUCH_FILE') || '');
     if (argv[0] === '--pin-entry') {
         // Type the next PIN from FAKE_PIN_ENTRIES (comma-separated); CANCEL
-        // presses Cancel. argv: channel, result, remaining, attempt.
+        // presses Cancel, and CLOSE closes the window without an answer.
+        // argv: channel, result, remaining, attempt.
         if (log) append(log, 'pin-entry ' + argv[3] + ' ' + argv[4] + '\n');
         const entries = ObjC.unwrap(env.objectForKey('FAKE_PIN_ENTRIES') || '').split(',');
         const used = ObjC.unwrap(env.objectForKey('FAKE_PIN_ENTRY_STATE') || '');
@@ -48,11 +49,30 @@ function run(argv) {
             write(argv[2], 'cancel');
             return;
         }
+        if (pin === 'CLOSE') return;
         // "a+b" sends two lines, like a PIN that lands as its attempt ends.
         const handle = $.NSFileHandle.fileHandleForWritingAtPath(argv[1]);
         handle.writeData($.NSString.stringWithString(pin.split('+').join('\n') + '\n').dataUsingEncoding($.NSUTF8StringEncoding));
         handle.closeFile;
         write(argv[2], 'entered');
+        return;
+    }
+    if (argv[0] === '--waiting') {
+        // The window after Sign: FAKE_WAITING_DECISION cancel presses Cancel
+        // and touch touches the key, each after FAKE_WAITING_DELAY; otherwise
+        // it stays up until the signer closes it. argv: decision, ready.
+        const pid = String($.NSProcessInfo.processInfo.processIdentifier);
+        if (log) append(log, 'waiting ' + pid + '\n');
+        if (argv.length > 2 && argv[2]) $.NSData.data.writeToFileAtomically(argv[2], true);
+        const waiting = ObjC.unwrap(env.objectForKey('FAKE_WAITING_DECISION') || '');
+        $.NSThread.sleepForTimeInterval(Number(ObjC.unwrap(env.objectForKey('FAKE_WAITING_DELAY') || '0')));
+        if (waiting === 'cancel') {
+            markDeciding(argv[1]);
+            write(argv[1], 'cancel');
+            return;
+        }
+        if (waiting === 'touch' && touch) $.NSData.data.writeToFileAtomically(touch + '.any', true);
+        $.NSThread.sleepForTimeInterval(30);
         return;
     }
     if (argv[0] === '--pin-error') {
@@ -61,32 +81,62 @@ function run(argv) {
         write(argv[1], ObjC.unwrap(env.objectForKey('FAKE_PIN_ERROR_DECISION') || 'retry'));
         return;
     }
-    if (argv[0] === '--touch-offer') {
-        // Record what the user would be asked, then answer from
-        // FAKE_TOUCH_OFFER_DECISION: apply, dismiss, or hang until stopped.
-        if (log) append(log, 'touch-offer ' + argv[2] + ' ' + argv[3] + '\n');
-        const answer = ObjC.unwrap(env.objectForKey('FAKE_TOUCH_OFFER_DECISION') || 'dismiss');
-        if (answer === 'hang') {
-            $.NSThread.sleepForTimeInterval(30);
-            return;
-        }
-        write(argv[1], answer);
-        return;
+    // FAKE_DIALOG_DECISIONS answers one preview each, in order (comma-separated,
+    // counted in FAKE_DIALOG_DECISION_STATE; past its end, no answer). Besides
+    // the answers below: hang never answers, early-sign writes sign and stays
+    // open, '' closes without an answer, raw:TEXT writes TEXT (\n and \0
+    // escapes) with no marker, marker-sign writes the rejection marker and then
+    // sign, and sign-no-touch writes sign without the key ever confirming.
+    const sequence = env.objectForKey('FAKE_DIALOG_DECISIONS');
+    if (sequence) {
+        const state = ObjC.unwrap(env.objectForKey('FAKE_DIALOG_DECISION_STATE') || '');
+        const index = state ? readText(state).split('\n').filter(Boolean).length : 0;
+        if (state) append(state, 'x\n');
+        decision = ObjC.unwrap(sequence).split(',')[index] || '';
     }
-    if (argv[0] === '--touch-unchanged') {
-        if (log) append(log, 'touch-unchanged ' + argv[1] + '\n');
-        return;
-    }
-    if (log) append(log, 'start ' + $.NSProcessInfo.processInfo.processIdentifier + '\n');
+    const pid = String($.NSProcessInfo.processInfo.processIdentifier);
+    if (log) append(log, 'start ' + pid + '\n');
     if (argv.length > 3 && argv[3]) {
         $.NSData.data.writeToFileAtomically(argv[3], true);
     }
     if (captureDir) {
-        const pid = String($.NSProcessInfo.processInfo.processIdentifier);
         $.NSData.dataWithContentsOfFile(argv[0]).writeToFileAtomically(captureDir + '/' + pid + '.summary', true);
         $.NSData.dataWithContentsOfFile(argv[1]).writeToFileAtomically(captureDir + '/' + pid + '.details', true);
+        // What the signer passed beyond the files: require-sign and the notice.
+        $.NSString.stringWithString((argv[5] || '') + '\n' + (argv[6] || ''))
+            .writeToFileAtomicallyEncodingError(captureDir + '/' + pid + '.gate', true, $.NSUTF8StringEncoding, null);
     }
     if (delay > 0) $.NSThread.sleepForTimeInterval(delay);
+    const touchIt = function() {
+        if (!touch) return;
+        const match = readText(argv[0]).match(/SHA-256:\s*([0-9a-f]+)/);
+        $.NSData.data.writeToFileAtomically(touch + '.' + (match ? match[1] : 'default'), true);
+    };
+    if (decision === 'hang') {
+        $.NSThread.sleepForTimeInterval(30);
+        return;
+    }
+    if (decision === 'early-sign') {
+        // Answers Sign but stays open, past any deadline.
+        touchIt();
+        write(argv[2], 'sign');
+        $.NSThread.sleepForTimeInterval(30);
+        return;
+    }
+    if (decision === '' || decision.indexOf('raw:') === 0 || decision === 'marker-sign' || decision === 'sign-no-touch') {
+        if (decision === 'sign-no-touch') {
+            write(argv[2], 'sign');
+        } else if (decision.indexOf('raw:') === 0) {
+            touchIt();
+            write(argv[2], decision.slice(4).replace(/\\n/g, '\n').replace(/\\0/g, '\0'));
+        } else if (decision === 'marker-sign') {
+            touchIt();
+            markDeciding(argv[2]);
+            write(argv[2], 'sign');
+        }
+        if (log) append(log, 'end ' + pid + '\n');
+        return;
+    }
     // A real preview has no Sign button: the hardware touch completes signing.
     // For "sign" the fake reports that touch so the fake GPG can proceed; for
     // "cancel" it reports no touch, and the wrapper kills GPG before signing.

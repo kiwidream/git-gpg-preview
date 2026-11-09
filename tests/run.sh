@@ -20,9 +20,20 @@ export FAKE_DIALOG_LOG="$TMP/dialog.log"
 # Shared "hardware touch" signal: the fake dialog creates it for a sign
 # decision; the fake GPG blocks on it so signing is concurrent with review.
 export FAKE_TOUCH_FILE="$TMP/touch"
+# By default GPG signs with a card key whose touch policy reads on, through the
+# gpg-connect-agent beside it, so the preview runs beside GPG and the touch is
+# the gate. The touch policy tests below vary this; default_card restores it.
+DEFAULT_CARD_KEY=CCCC000000000000000000000000000000000002
+default_card() {
+    export FAKE_CARD_SIG_KEY=$DEFAULT_CARD_KEY FAKE_CARD_UIF=%01+
+}
+default_card
+mkdir -p "$TMP/default-gnupg"
+ln -s "$ROOT/tests/helpers/fake-gpg" "$TMP/default-gnupg/gpg"
+ln -s "$ROOT/tests/helpers/fake-gpg-connect-agent" "$TMP/default-gnupg/gpg-connect-agent"
 
 cat > "$XDG_CONFIG_HOME/git-gpg-preview/config" <<EOF
-real_gpg=$ROOT/tests/helpers/fake-gpg
+real_gpg=$TMP/default-gnupg/gpg
 ui_helper=$ROOT/tests/helpers/fake-dialog.jxa
 lock_root=$TMP/lock
 audit_log=$TMP/audit.log
@@ -656,12 +667,22 @@ fi
 
 # Before the first preview, the touch policy of the key GPG will sign with is
 # read through gpg-agent with the gpg-connect-agent beside real GPG, and only
-# when that key is the card's signature key. Off and on get a window of their
-# own, and the ykman command on stderr; the preview stays about the message, and
+# when that key is the card's signature key. Off and cached put two lines above
+# the facts, the policy and the ykman command, and one note on stderr. Nothing
+# anywhere suggests the cached policy, the preview is the only window, and
 # signing goes ahead either way.
-TOUCH_ON="Touch policy is on: a touch for every signature. To let a touch cover 15 seconds, run: ykman openpgp keys set-touch sig cached"
-TOUCH_OFF="Touch policy is off: this key signs with no touch. To require one, run: ykman openpgp keys set-touch sig cached"
-TOUCH_OFFERS="$XDG_CONFIG_HOME/git-gpg-preview/touch-offers"
+TOUCH_OFF=$'Touch policy is off: this key signs with no touch.\nTo require one, run: ykman openpgp keys set-touch sig on'
+TOUCH_CACHED=$'Touch policy is cached: one touch signs for 15 seconds, so Sign is required.\nTo require a touch for every signature, run: ykman openpgp keys set-touch sig on'
+CACHED_HINT='set-touch[[:space:]]+sig[[:space:]]+cached|use cached'
+TOUCH_UNKNOWN='Touch policy unknown: Sign to continue'
+TOUCH_CACHED_FIXED='Touch policy cached-fixed: one touch signs for 15 seconds; Sign is required.'
+TOUCH_MIXED="GPG could sign with more than one key: Sign to continue"
+DETAILS_TITLE='GIT OPENPGP SIGNING REVIEW — FULL DETAILS'
+# note_line NOTICE: the one stderr line that carries NOTICE.
+note_line() {
+    local newline=$'\n'
+    printf 'git-gpg-preview: note: %s\n' "${1//$newline/ }"
+}
 mkdir -p "$TMP/gnupg-bin" "$TMP/linked-bin"
 ln -s "$ROOT/tests/helpers/fake-gpg" "$TMP/gnupg-bin/gpg"
 ln -s "$ROOT/tests/helpers/fake-gpg-connect-agent" "$TMP/gnupg-bin/gpg-connect-agent"
@@ -673,244 +694,829 @@ use_real_gpg() {
 connect_agent_calls() {
     [[ -f "$FAKE_GPG_CALL_DIR/connect-agent-calls" ]] && wc -l < "$FAKE_GPG_CALL_DIR/connect-agent-calls" | tr -d ' ' || echo 0
 }
-touch_dialogs() {
-    grep -E '^touch-' "$FAKE_DIALOG_LOG" || true
-}
-# assert_touch_offer LABEL UIF EXPECTED-NOTICE GPG-ARGS...; an empty notice means no offer.
-assert_touch_offer() {
-    local label="$1" expected="$3" policy=on summary
+# assert_touch_notice LABEL UIF EXPECTED-NOTICE GPG-ARGS...; an empty notice means none.
+assert_touch_notice() {
+    local label="$1" uif="$2" expected="$3" summary details
     export FAKE_CARD_UIF="$2"
     shift 3
     reset_pin_state
-    rm -f "$TOUCH_OFFERS" "$FAKE_GPG_CALL_DIR/connect-agent-calls" "$FAKE_GPG_CALL_DIR/secret-key-listings"
+    rm -f "$FAKE_GPG_CALL_DIR/connect-agent-calls" "$FAKE_GPG_CALL_DIR/secret-key-listings"
+    ls -A "$XDG_CONFIG_HOME/git-gpg-preview" > "$TMP/config-files.before"
     run_pin_case "$@"
     [[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "$label: signing ($pin_status)"
+    ls -A "$XDG_CONFIG_HOME/git-gpg-preview" | cmp -s - "$TMP/config-files.before" || fail "$label: a file was written beside the configuration"
+    [[ $(grep -c '^start ' "$FAKE_DIALOG_LOG") -eq 1 ]] && ! grep -q '^touch-' "$FAKE_DIALOG_LOG" || fail "$label: a window other than the preview opened"
     summary=$(latest_capture)
-    [[ $(head -n 1 "$summary") == 'Request type: commit' ]] || fail "$label: the preview does not lead with the request"
-    ! grep -qF 'ykman' "$summary" || fail "$label: touch notice in the preview"
-    if [[ -n "$expected" ]]; then
-        [[ "$expected" == "$TOUCH_OFF" ]] && policy=off
-        [[ $(touch_dialogs) == "touch-offer $policy 3" ]] || fail "$label: no offer: $(touch_dialogs)"
-        grep -qxF "git-gpg-preview: note: $expected" "$TMP/pin.stderr" || fail "$label: notice missing from stderr"
+    details=$(details_of "$summary")
+    ! grep -qiE "$CACHED_HINT" "$summary" "$details" "$TMP/pin.stderr" ||
+        fail "$label: suggests the cached touch policy"
+    # A policy read as on or fixed keeps the touch as the gate. Off and cached
+    # ask for Sign with their notice, cached-fixed with its own; a policy that
+    # was not read (every case here that does not read one) with the unknown one.
+    # EXPECTED_SIGN_NOTICE: a Sign window of another kind.
+    if [[ -n "${EXPECTED_SIGN_NOTICE-}" ]]; then
+        [[ $(cat "${summary%.summary}.gate") == require-sign$'\n'"$EXPECTED_SIGN_NOTICE" ]] || fail "$label: the preview was not asked for Sign"
+    elif [[ "$expected" == "$TOUCH_OFF" || "$expected" == "$TOUCH_CACHED" ]]; then
+        [[ $(cat "${summary%.summary}.gate") == require-sign$'\n'"$expected" ]] || fail "$label: the preview was not asked for Sign"
+    elif [[ "$uif" == %04+ ]]; then
+        [[ $(cat "${summary%.summary}.gate") == require-sign$'\n'"$TOUCH_CACHED_FIXED" ]] || fail "$label: the preview was not asked for Sign"
+    elif [[ "$uif" == %0[12]+ ]]; then
+        [[ -z $(cat "${summary%.summary}.gate") ]] || fail "$label: the preview was asked for Sign"
     else
-        [[ -z $(touch_dialogs) ]] || fail "$label: unexpected offer: $(touch_dialogs)"
-        ! grep -qF 'ykman' "$TMP/pin.stderr" || fail "$label: unexpected touch notice"
-        [[ ! -e "$TOUCH_OFFERS" ]] || fail "$label: offer recorded"
+        [[ $(cat "${summary%.summary}.gate") == require-sign$'\n'"$TOUCH_UNKNOWN" ]] || fail "$label: the preview was not asked for Sign"
+    fi
+    if [[ -n "$expected" ]]; then
+        [[ $(head -n 2 "$details") == "$expected" && -z $(sed -n 3p "$details") && $(sed -n 4p "$details") == "$DETAILS_TITLE" ]] ||
+            fail "$label: the notice is not above the details"
+        [[ $(head -n 2 "$summary") == "$expected" ]] || fail "$label: the notice is not above the facts"
+        [[ -z $(head -n 2 "$summary" | awk 'length > 80') ]] || fail "$label: a notice line is wider than the facts pane"
+        [[ -z $(sed -n 3p "$summary") && $(sed -n 4p "$summary") == 'Request type: commit' ]] || fail "$label: the notice displaced the facts"
+        [[ $(sed -n 10p "$summary") == 'Message:' ]] || fail "$label: the notice moved the Message: line"
+        [[ $(grep '^git-gpg-preview: note: ' "$TMP/pin.stderr") == "$(note_line "$expected")" ]] ||
+            fail "$label: stderr does not carry exactly the notice"
+    else
+        [[ $(head -n 1 "$summary") == 'Request type: commit' ]] || fail "$label: a line above the facts"
+        [[ $(head -n 1 "$details") == "$DETAILS_TITLE" ]] || fail "$label: a line above the details"
+        ! grep -q '^git-gpg-preview: note: ' "$TMP/pin.stderr" || fail "$label: a note on stderr"
+        ! grep -qF 'ykman' "$summary" "$TMP/pin.stderr" || fail "$label: unexpected touch notice"
     fi
 }
 use_real_gpg "$TMP/gnupg-bin/gpg"
 export FAKE_SECRET_KEYS="$TMP/secret-keys" FAKE_GPG_STDOUT='signature-touch-policy' FAKE_CARD_SIG_KEY=$CARD_SUB
 secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" > "$FAKE_SECRET_KEYS"
-assert_touch_offer 'touch policy on' '%01+' "$TOUCH_ON" --status-fd=2 -bsau TEST
+assert_touch_notice 'touch policy off' '%00+' "$TOUCH_OFF" --status-fd=2 -bsau TEST
 [[ $(connect_agent_calls) -eq 1 ]] || fail 'touch policy was not read once'
 [[ $(wc -l < "$FAKE_GPG_CALL_DIR/secret-key-listings") -eq 1 ]] || fail 'the signing key was looked up more than once'
-assert_touch_offer 'touch policy off' '%00+' "$TOUCH_OFF" --status-fd=2 -bsau TEST
-assert_touch_offer 'touch policy on, pinentry path' '%01+' "$TOUCH_ON" -bsau TEST
-assert_touch_offer 'touch policy cached' '%03+' '' --status-fd=2 -bsau TEST
-assert_touch_offer 'touch policy cached-fixed' '%04+' '' --status-fd=2 -bsau TEST
-assert_touch_offer 'touch policy fixed' '%02+' '' --status-fd=2 -bsau TEST
-assert_touch_offer 'unknown touch policy byte' '%05+' '' --status-fd=2 -bsau TEST
-assert_touch_offer 'card without a touch setting' '' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'touch policy cached' '%03+' "$TOUCH_CACHED" --status-fd=2 -bsau TEST
+assert_touch_notice 'touch policy off, pinentry path' '%00+' "$TOUCH_OFF" -bsau TEST
+assert_touch_notice 'touch policy on' '%01+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'touch policy cached-fixed' '%04+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'touch policy fixed' '%02+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'unknown touch policy byte' '%05+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'card without a touch setting' '' '' --status-fd=2 -bsau TEST
 export FAKE_CARD_SIG_KEY=$OTHER_CARD
-assert_touch_offer 'another key in the card signature slot' '%01+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'another key in the card signature slot' '%00+' '' --status-fd=2 -bsau TEST
 unset FAKE_CARD_SIG_KEY
-assert_touch_offer 'no card in the reader' '%01+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'no card in the reader' '%00+' '' --status-fd=2 -bsau TEST
 export FAKE_CARD_SIG_KEY=$CARD_SUB
-assert_touch_offer 'the caller'"'"'s own home directory' '%01+' '' --status-fd=2 -bsau TEST --homedir "$TMP/elsewhere"
+assert_touch_notice 'the caller'"'"'s own home directory' '%00+' '' --status-fd=2 -bsau TEST --homedir "$TMP/elsewhere"
 [[ $(connect_agent_calls) -eq 0 ]] || fail 'touch policy read for the caller'"'"'s own home directory'
-assert_touch_offer 'the caller'"'"'s own keyring' '%01+' '' --status-fd=2 -bsau TEST --keyring "$TMP/elsewhere.kbx"
-assert_touch_offer 'a second key named with --default-key' '%01+' '' --status-fd=2 -bsau TEST --default-key OTHER
+assert_touch_notice 'the caller'"'"'s own keyring' '%00+' '' --status-fd=2 -bsau TEST --keyring "$TMP/elsewhere.kbx"
+assert_touch_notice 'a second key named with --default-key' '%00+' '' --status-fd=2 -bsau TEST --default-key OTHER
 export FAKE_SECRET_KEYS_STATUS=2
-assert_touch_offer 'listing that failed' '%01+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'listing that failed' '%00+' '' --status-fd=2 -bsau TEST
 unset FAKE_SECRET_KEYS_STATUS
 export FAKE_CONNECT_AGENT_EXIT=2
-assert_touch_offer 'gpg-connect-agent that failed' '%01+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'gpg-connect-agent that failed' '%00+' '' --status-fd=2 -bsau TEST
 unset FAKE_CONNECT_AGENT_EXIT
 secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 200 "$CARD" "$SOFT_SUB" u 300 + > "$FAKE_SECRET_KEYS"
-assert_touch_offer 'software key signs' '%01+' '' --status-fd=2 -bsau TEST
+EXPECTED_SIGN_NOTICE=$TOUCH_MIXED assert_touch_notice 'software key signs' '%00+' '' --status-fd=2 -bsau TEST
 [[ $(connect_agent_calls) -eq 0 ]] || fail 'touch policy read for a software key'
+# A mixed certificate needs Sign whatever the card's policy, so it gets no advice
+# to change that policy, above the facts or on stderr.
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" "$SOFT_SUB" u 200 + > "$FAKE_SECRET_KEYS"
+EXPECTED_SIGN_NOTICE=$TOUCH_MIXED assert_touch_notice 'mixed certificate, touch off' '%00+' '' --status-fd=2 -bsau TEST
+EXPECTED_SIGN_NOTICE=$TOUCH_MIXED assert_touch_notice 'mixed certificate, touch cached' '%03+' '' --status-fd=2 -bsau TEST
 secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" > "$FAKE_SECRET_KEYS"
 use_real_gpg "$TMP/linked-bin/gpg"
-assert_touch_offer 'gpg-connect-agent beside the linked real GPG' '%01+' "$TOUCH_ON" --status-fd=2 -bsau TEST
+assert_touch_notice 'gpg-connect-agent beside the linked real GPG' '%00+' "$TOUCH_OFF" --status-fd=2 -bsau TEST
 use_real_gpg "$ROOT/tests/helpers/fake-gpg"
-assert_touch_offer 'no gpg-connect-agent beside real GPG' '%01+' '' --status-fd=2 -bsau TEST
+assert_touch_notice 'no gpg-connect-agent beside real GPG' '%00+' '' --status-fd=2 -bsau TEST
 [[ $(connect_agent_calls) -eq 0 ]] || fail 'a gpg-connect-agent not beside real GPG was used'
-pass 'a touch policy other than cached gets a window of its own, and signing goes ahead'
+pass 'touch policy off or cached puts the ykman command above the facts, no other window opens, and signing goes ahead'
 
-# touch_case [GPG-ARGS...]: sign once with the key's policy on, keeping the record.
-touch_case() {
-    reset_pin_state
-    rm -f "$FAKE_GPG_CALL_DIR/connect-agent-calls"
-    run_pin_case --status-fd=2 -bsau TEST "$@"
-    [[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "signing with a touch policy offer ($pin_status)"
-}
-# The record says when the offer was last shown; make that long ago.
-offer_shown_long_ago() {
-    awk -v key="$CARD_SUB" '$1 == key { $3 = 1 } { print }' "$TOUCH_OFFERS" > "$TOUCH_OFFERS.new"
-    mv -f "$TOUCH_OFFERS.new" "$TOUCH_OFFERS"
-}
-offer_dismissals() {
-    awk -v key="$CARD_SUB" '$1 == key { print $2 }' "$TOUCH_OFFERS"
-}
+# The remote service keeps its own copy of the notices. What this wrapper shows
+# and prints must be exactly that copy, policy by policy, so the two cannot drift.
+if command -v python3 >/dev/null; then
+    remote_notice() {
+        python3 -c 'import importlib.util, sys
+spec = importlib.util.spec_from_file_location("git_gpg_preview_remote", sys.argv[1])
+remote = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(remote)
+sys.stdout.write(remote.TOUCH_NOTICES.get(sys.argv[2], ""))' "$ROOT/remote/git_gpg_preview_remote.py" "$1"
+    }
+    [[ -n $(remote_notice off) && -n $(remote_notice cached) ]] || fail 'could not read the remote service notices'
+    use_real_gpg "$TMP/gnupg-bin/gpg"
+    for policy in 00:off 01:on 02:fixed 03:cached 04:cached-fixed; do
+        assert_touch_notice "the remote service's notice for ${policy#*:}" "%${policy%%:*}+" "$(remote_notice "${policy#*:}")" \
+            --status-fd=2 -bsau TEST
+    done
+    pass "the wrapper's notices are the remote service's, policy by policy"
+else
+    pass "no python3 installed to compare the remote service's notices with"
+fi
+
+# An install from before the offer was removed keeps its record, which is neither
+# read nor written: a key with every dismissal used still gets the notice.
 use_real_gpg "$TMP/gnupg-bin/gpg"
-export FAKE_CARD_UIF=%01+
-TOUCH_OFFER_DISMISSALS=$(sed -n 's/^TOUCH_OFFER_DISMISSALS=//p' "$ROOT/git-gpg-preview")
-TOUCH_OFFER_INTERVAL=$(sed -n 's/^TOUCH_OFFER_INTERVAL=//p' "$ROOT/git-gpg-preview")
-[[ "$TOUCH_OFFER_DISMISSALS" -eq 3 && "$TOUCH_OFFER_INTERVAL" -eq 86400 ]] || fail 'could not read the offer limits'
-
-# Not Now: once a day, three times in all, then never again, notice included.
-rm -f "$TOUCH_OFFERS"
-touch_case
-[[ $(touch_dialogs) == 'touch-offer on 3' ]] || fail "first offer: $(touch_dialogs)"
-[[ $(offer_dismissals) == 1 ]] || fail 'first dismissal not recorded'
-[[ $(stat -f '%Lp' "$TOUCH_OFFERS") == 600 ]] || fail 'touch offer record is not private'
-touch_case
-[[ -z $(touch_dialogs) ]] || fail 'offered again within a day'
-! grep -qF 'ykman' "$TMP/pin.stderr" || fail 'notice repeated within a day'
-offer_shown_long_ago
-touch_case
-[[ $(touch_dialogs) == 'touch-offer on 2' ]] || fail "second offer: $(touch_dialogs)"
-offer_shown_long_ago
-touch_case
-[[ $(touch_dialogs) == 'touch-offer on 1' ]] || fail "third offer: $(touch_dialogs)"
-[[ $(offer_dismissals) == 3 ]] || fail 'third dismissal not recorded'
-offer_shown_long_ago
-touch_case
-[[ -z $(touch_dialogs) ]] || fail 'offered after the last dismissal'
-! grep -qF 'ykman' "$TMP/pin.stderr" || fail 'notice repeated after the last dismissal'
-pass 'Not Now asks again a day later, three times at most, then never again'
-
-# The record is per key and only advice: bad lines count as no line, and a file
-# that cannot be kept means no window, since it would open on every signature.
-printf '%s 2 %d\n' "$CARD_SUB" "$(($(date +%s) + 100000))" > "$TOUCH_OFFERS"
-touch_case
-[[ $(touch_dialogs) == 'touch-offer on 1' ]] || fail "a time in the future silenced the offer: $(touch_dialogs)"
-for line in "$CARD_SUB" "$CARD_SUB x 1" "$CARD_SUB 3" "$CARD_SUB 3 x" "$CARD_SUB -3 1" "$CARD_SUB 03 1" "$CARD_SUB 3 1 extra" \
-    "$CARD_SUB 9999999999999999999 1" "$CARD_SUB 3 9999999999999999999" "$OTHER_CARD 3 1" 'garbage'; do
-    printf '%s\n' "$line" > "$TOUCH_OFFERS"
-    touch_case
-    [[ $(touch_dialogs) == 'touch-offer on 3' ]] || fail "malformed record '$line': $(touch_dialogs)"
-    grep -qxF "$line" "$TOUCH_OFFERS" && [[ "$line" == "$CARD_SUB"* ]] && fail "record '$line' for this key was kept beside the new one"
-done
-printf '%s 3 7\n' "$OTHER_CARD" > "$TOUCH_OFFERS"
-touch_case
-grep -qxF "$OTHER_CARD 3 7" "$TOUCH_OFFERS" || fail 'another key lost its record'
-rm -f "$TOUCH_OFFERS"
-mkdir "$TOUCH_OFFERS"
-touch_case
-[[ -z $(touch_dialogs) ]] || fail 'offered although the record cannot be kept'
-grep -qF "could not save $TOUCH_OFFERS" "$TMP/pin.stderr" || fail 'an unusable record was not reported'
-grep -qxF "git-gpg-preview: note: $TOUCH_ON" "$TMP/pin.stderr" || fail 'an unusable record lost the notice'
-rmdir "$TOUCH_OFFERS"
-printf '%s 0 1\n' "$CARD_SUB" > "$TMP/offers-target"
-ln -s "$TMP/offers-target" "$TOUCH_OFFERS"
-touch_case
-[[ -z $(touch_dialogs) ]] || fail 'offered through a symbolic link'
-[[ -L "$TOUCH_OFFERS" && $(cat "$TMP/offers-target") == "$CARD_SUB 0 1" ]] || fail 'the record followed a symbolic link'
-rm -f "$TOUCH_OFFERS"
-pass 'the offer record is per key, private, and bad or unusable records cannot silence or repeat it'
-
-# Use Cached writes UIF-1 through gpg-agent, under the same lock and before GPG;
-# only the value the card reads back counts. scdaemon is stopped after it.
-export FAKE_TOUCH_OFFER_DECISION=apply
-touch_case
-summary=$(latest_capture)
-[[ $(touch_dialogs) == 'touch-offer on 3' ]] || fail "Use Cached windows: $(touch_dialogs)"
-[[ $(sed -n 2p "$FAKE_GPG_CALL_DIR/connect-agent-calls") == 'SCD SERIALNO openpgp SCD SETATTR UIF-1 %03+ SCD GETATTR UIF-1 SCD KILLSCD /bye' ]] \
-    || fail "Use Cached agent commands: $(sed -n 2p "$FAKE_GPG_CALL_DIR/connect-agent-calls")"
-[[ $(sed -n 1p "$summary") == 'Touch policy is now cached.' && $(sed -n 3p "$summary") == 'Request type: commit' ]] \
-    || fail 'the preview does not say the policy changed'
-grep -qxF 'git-gpg-preview: note: touch policy is now cached' "$TMP/pin.stderr" || fail 'stderr does not say the policy changed'
-grep -qF 'decision=touch-policy-cached' "$TMP/audit.log" || fail 'the policy change was not audited'
-[[ $(offer_dismissals) == 0 ]] || fail 'Use Cached counted as a dismissal'
-[[ $(grep -c '^start ' "$FAKE_DIALOG_LOG") -eq 1 ]] || fail 'no preview after Use Cached'
-pass 'Use Cached sets the cached policy through gpg-agent before the preview, and audits it'
-
-# Use Cached that fails counts as a dismissal, says why, and signing goes ahead;
-# a Cancel in pinentry needs no second window.
-assert_touch_failure() {
-    local label="$1" answer="$2" dialogs="$3" audited="$4" noted="$5"
-    export FAKE_CARD_SETATTR="$answer"
-    rm -f "$TOUCH_OFFERS"
-    touch_case
-    [[ $(touch_dialogs) == "$dialogs" ]] || fail "$label windows: $(touch_dialogs)"
-    [[ $(offer_dismissals) == 1 ]] || fail "$label was not counted as a dismissal"
-    if [[ "$audited" -eq 1 ]]; then
-        grep -qF 'decision=touch-policy-unchanged' "$TMP/audit.log" || fail "$label was not audited"
-    else
-        ! grep -qF 'decision=touch-policy-unchanged' "$TMP/audit.log" || fail "$label was audited"
-    fi
-    if [[ -n "$noted" ]]; then
-        grep -qxF "git-gpg-preview: note: could not set the cached touch policy: $noted" "$TMP/pin.stderr" || fail "$label note"
-    else
-        ! grep -qF 'could not set' "$TMP/pin.stderr" || fail "$label noted a failure"
-    fi
-    ! grep -q '^Touch policy is now cached' "$(latest_capture)" || fail "$label claimed a change"
-    unset FAKE_CARD_SETATTR
-}
-assert_touch_failure 'a wrong Admin PIN' 'ERR 100663404 Bad PIN <SCD>' $'touch-offer on 3\ntouch-unchanged Bad PIN <SCD>' 1 'Bad PIN <SCD>'
-assert_touch_failure 'a key that refuses cached' 'ERR 100663435 Conditions of use not satisfied <SCD>' \
-    $'touch-offer on 3\ntouch-unchanged Conditions of use not satisfied <SCD>' 1 'Conditions of use not satisfied <SCD>'
-assert_touch_failure 'a Cancel in pinentry' 'ERR 83886179 Operation cancelled <Pinentry>' 'touch-offer on 3' 0 ''
-assert_touch_failure 'a write the card did not keep' ignored $'touch-offer on 3\ntouch-unchanged ' 1 'the key did not confirm the change'
-unset FAKE_TOUCH_OFFER_DECISION
-pass 'Use Cached that fails says why, counts as a dismissal, and signing goes ahead'
-
-# The windows and the Admin PIN prompt cannot hold the lock for long. A window
-# nobody answers is not a dismissal, and waits a day like any other.
-sed -E 's/^TOUCH_OFFER_TICKS=.*/TOUCH_OFFER_TICKS=4/; s/^TOUCH_PIN_TICKS=.*/TOUCH_PIN_TICKS=4/' "$ROOT/git-gpg-preview" > "$TMP/fast-wrapper"
-chmod 700 "$TMP/fast-wrapper"
-reset_pin_state
-rm -f "$TOUCH_OFFERS"
-export FAKE_TOUCH_OFFER_DECISION=hang
-set +e
-pin_output=$("$TMP/fast-wrapper" --status-fd=2 -bsau TEST < "$TMP/commit.payload" 2>"$TMP/pin.stderr")
-pin_status=$?
-set -e
-[[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "unanswered offer stopped signing ($pin_status)"
-[[ $(offer_dismissals) == 0 ]] || fail 'an unanswered offer counted as a dismissal'
-touch_case
-[[ -z $(touch_dialogs) ]] || fail 'an unanswered offer repeated within a day'
-reset_pin_state
-rm -f "$TOUCH_OFFERS"
-export FAKE_TOUCH_OFFER_DECISION=apply FAKE_CARD_SETATTR=hang
-set +e
-pin_output=$("$TMP/fast-wrapper" --status-fd=2 -bsau TEST < "$TMP/commit.payload" 2>"$TMP/pin.stderr")
-pin_status=$?
-set -e
-[[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "unanswered Admin PIN prompt stopped signing ($pin_status)"
-[[ $(touch_dialogs) == $'touch-offer on 3\ntouch-unchanged ' ]] || fail "unanswered Admin PIN prompt windows: $(touch_dialogs)"
-[[ $(offer_dismissals) == 1 ]] || fail 'an unanswered Admin PIN prompt was not counted'
-unset FAKE_TOUCH_OFFER_DECISION FAKE_CARD_SETATTR
-pass 'an unanswered window or Admin PIN prompt cannot stop signing or hold the lock'
+OLD_OFFER_RECORD="$XDG_CONFIG_HOME/git-gpg-preview/touch-offers"
+printf '%s 3 %d\n' "$CARD_SUB" "$(date +%s)" > "$OLD_OFFER_RECORD"
+cp "$OLD_OFFER_RECORD" "$TMP/touch-offers.before"
+touch -t 202001010000 "$OLD_OFFER_RECORD" "$TMP/touch-offers.before"
+assert_touch_notice 'an old record, key set to off' '%00+' "$TOUCH_OFF" --status-fd=2 -bsau TEST
+assert_touch_notice 'an old record, key set to cached' '%03+' "$TOUCH_CACHED" --status-fd=2 -bsau TEST
+cmp -s "$OLD_OFFER_RECORD" "$TMP/touch-offers.before" || fail 'the old offer record was changed'
+[[ ! "$OLD_OFFER_RECORD" -nt "$TMP/touch-offers.before" ]] || fail 'the old offer record was rewritten'
+rm -f "$OLD_OFFER_RECORD"
+pass 'an old offer record is neither read nor written'
 
 # Git shows the stderr copy only when signing fails, so check it there.
 use_real_gpg "$TMP/gnupg-bin/gpg"
 reset_pin_state
-rm -f "$TOUCH_OFFERS"
-export FAKE_CARD_UIF=%01+ FAKE_GPG_EXIT=42 FAKE_GPG_STDERR=$'gpg: signing failed: Card error\n'
+export FAKE_CARD_UIF=%00+ FAKE_GPG_EXIT=42 FAKE_GPG_STDERR=$'gpg: signing failed: Card error\n'
 run_pin_case --status-fd=2 -bsau TEST
 unset FAKE_GPG_EXIT FAKE_GPG_STDERR
 [[ "$pin_status" -eq 42 ]] || fail "the touch notice changed GPG's failure status ($pin_status)"
-grep -qxF "git-gpg-preview: note: $TOUCH_ON" "$TMP/pin.stderr" || fail 'a failed signature lost the touch notice'
+grep -qxF "$(note_line "$TOUCH_OFF")" "$TMP/pin.stderr" || fail 'a failed signature lost the touch notice'
 grep -qxF 'gpg: signing failed: Card error' "$TMP/pin.stderr" || fail "a failed signature lost GPG's error"
 pass 'a failed signature reports the touch notice next to the GPG error'
 
-# A wrong PIN repeats the preview, not the offer, and the policy is read once.
+# The notice goes into the summary and the details together or into neither,
+# and both stay 0600 like the rest of the request, whatever the umask. A failure
+# is reported, leaves both files as they were and no temporary file behind, and
+# signing goes ahead. Permissions are restored before anything is checked.
+PREPEND_FUNCTION=$(awk '/^error\(\) \{/,/^}/; /^prepend_touch_notice\(\) \{/,/^}/' "$ROOT/git-gpg-preview")
+NOTICE_FAILED='git-gpg-preview: note: could not add the touch policy notice to the preview or its details'
+# prepend_notice FUNCTION: runs it on fresh 0600 files in $TMP/notice, umask 022.
+prepend_notice() {
+    rm -rf "$TMP/notice"
+    mkdir -p "$TMP/notice"
+    printf 'facts\n' > "$TMP/notice/summary"
+    printf 'report\n' > "$TMP/notice/details"
+    chmod 600 "$TMP/notice/summary" "$TMP/notice/details"
+    PROGRAM_NAME=git-gpg-preview bash -c 'umask 022'$'\n'"$1"$'\n''prepend_touch_notice "$@"' \
+        bash "$TOUCH_OFF" "$TMP/notice/summary" "$TMP/notice/details" 2> "$TMP/prepend.stderr"
+}
+notice_files() {
+    printf '%s|%s|%s|%s|%s' "$(cat "$TMP/notice/summary")" "$(cat "$TMP/notice/details")" \
+        "$(stat -f '%Lp' "$TMP/notice/summary")" "$(stat -f '%Lp' "$TMP/notice/details")" "$(ls -A "$TMP/notice" | tr '\n' ' ')"
+}
+UNCHANGED='facts|report|600|600|details summary '
+prepend_notice "$PREPEND_FUNCTION" || fail 'adding the notice failed'
+[[ $(notice_files) == "$TOUCH_OFF"$'\n\nfacts|'"$TOUCH_OFF"$'\n\nreport|600|600|details summary ' ]] ||
+    fail "the notice was not put above both files, 0600, alone: $(notice_files)"
+[[ ! -s "$TMP/prepend.stderr" ]] || fail "adding the notice reported a failure: $(cat "$TMP/prepend.stderr")"
+# An unreadable details file: the summary would have worked, but must not change.
+prepend_status=0
+PREPEND_UNREADABLE=$(printf '%s' "$PREPEND_FUNCTION" | sed 's/^prepend_touch_notice() {$/prepend_touch_notice() { chmod 000 "$3"/')
+prepend_notice "$PREPEND_UNREADABLE" || prepend_status=$?
+chmod 600 "$TMP/notice/details"
+[[ "$prepend_status" -eq 0 && $(cat "$TMP/prepend.stderr") == "$NOTICE_FAILED" && $(notice_files) == "$UNCHANGED" ]] ||
+    fail "an unreadable details file: $prepend_status, $(cat "$TMP/prepend.stderr"), $(notice_files)"
+# A directory that takes no new file.
+prepend_status=0
+PREPEND_LOCKED=$(printf '%s' "$PREPEND_FUNCTION" | sed 's/^prepend_touch_notice() {$/prepend_touch_notice() { chmod 500 "${2%\/*}"/')
+prepend_notice "$PREPEND_LOCKED" || prepend_status=$?
+chmod 700 "$TMP/notice"
+[[ "$prepend_status" -eq 0 && $(cat "$TMP/prepend.stderr") == "$NOTICE_FAILED" && $(notice_files) == "$UNCHANGED" ]] ||
+    fail "an unwritable directory: $prepend_status, $(cat "$TMP/prepend.stderr"), $(notice_files)"
+# The details cannot be replaced after the summary was: the summary goes back.
+prepend_status=0
+prepend_notice "$(printf '%s' "$PREPEND_FUNCTION" | sed 's|/bin/mv -f "\$new_details" "\$details"|false|')" || prepend_status=$?
+[[ "$prepend_status" -eq 0 && $(cat "$TMP/prepend.stderr") == "$NOTICE_FAILED" && $(notice_files) == "$UNCHANGED" ]] ||
+    fail "details that cannot be replaced: $prepend_status, $(cat "$TMP/prepend.stderr"), $(notice_files)"
+# ...and if even that fails, stderr says which file has the notice.
+prepend_status=0
+prepend_notice "$(printf '%s' "$PREPEND_FUNCTION" | sed 's|/bin/mv -f "\$new_details" "\$details"|false|; s|/bin/mv -f "\$old_summary" "\$summary"|false|')" ||
+    prepend_status=$?
+[[ "$prepend_status" -eq 0 && $(notice_files) == "$TOUCH_OFF"$'\n\nfacts|report|600|600|details summary ' ]] ||
+    fail "a summary that cannot go back: $prepend_status, $(notice_files)"
+[[ $(cat "$TMP/prepend.stderr") == 'git-gpg-preview: note: the touch policy notice is in the preview but not in its details' ]] ||
+    fail "a summary that cannot go back was not reported: $(cat "$TMP/prepend.stderr")"
+sed '/^prepend_touch_notice() {/,/^}/ s|/bin/cat "\$details"|/bin/cat "$details.missing"|' "$ROOT/git-gpg-preview" > "$TMP/notice-failing-wrapper"
+chmod 700 "$TMP/notice-failing-wrapper"
+! cmp -s "$ROOT/git-gpg-preview" "$TMP/notice-failing-wrapper" || fail 'could not make the notice fail'
+reset_pin_state
+export FAKE_CARD_UIF=%00+
+set +e
+pin_output=$("$TMP/notice-failing-wrapper" --status-fd=2 -bsau TEST < "$TMP/commit.payload" 2>"$TMP/pin.stderr")
+pin_status=$?
+set -e
+[[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "a failed notice stopped signing ($pin_status)"
+grep -qxF "$NOTICE_FAILED" "$TMP/pin.stderr" || fail 'a failed notice was not reported'
+grep -qxF "$(note_line "$TOUCH_OFF")" "$TMP/pin.stderr" || fail 'a failed notice lost the stderr note'
+[[ $(head -n 1 "$(latest_capture)") == 'Request type: commit' && $(head -n 1 "$(details_of "$(latest_capture)")") == "$DETAILS_TITLE" ]] ||
+    fail 'a failed notice changed the preview'
+pass 'the notice goes into both files or neither, 0600, and a failure is reported and cleaned up'
+
+# Touch policy off: the key signs without a touch, so GPG waits for Sign in the
+# preview, within SIGN_CLICK_SECONDS. The fake dialog answers after
+# FAKE_DIALOG_DELAY and, for sign, makes the "touch" only then; fake GPG records
+# whether that touch already existed when it started ("before" only when GPG
+# waited for the answer), and the dialog log shows the PIN window after it.
+gate_case() {
+    reset_pin_state
+    rm -f "$FAKE_GPG_CALL_DIR/touch-at-start"
+    set +e
+    rm -f "$TMP/decision-state"
+    pin_output=$("${GATE_WRAPPER:-$ROOT/git-gpg-preview}" "$@" < "${GATE_PAYLOAD:-$TMP/commit.payload}" 2>"$TMP/pin.stderr")
+    pin_status=$?
+    set -e
+}
+touch_at_start() {
+    cat "$FAKE_GPG_CALL_DIR/touch-at-start" 2>/dev/null || true
+}
+dialog_order() {
+    grep -E '^(start|end|pin-entry) ' "$FAKE_DIALOG_LOG" | cut -d' ' -f1 | tr '\n' ' '
+}
+GATE_REFUSED='git-gpg-preview: not signed: touch policy is off and Sign was not clicked'
+use_real_gpg "$TMP/gnupg-bin/gpg"
+export FAKE_DIALOG_DELAY=1 FAKE_PIN_RETRIES=3 FAKE_GPG_PIN=123456 FAKE_PIN_ENTRIES=123456
+for uif in %00+ %05+ %01+ %02+ %03+ %04+; do
+    export FAKE_CARD_UIF=$uif
+    gate_case --status-fd=2 -bsau TEST
+    [[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "touch $uif: not signed ($pin_status)"
+    if [[ "$uif" != %0[12]+ ]]; then
+        [[ $(touch_at_start) == before ]] || fail "touch $uif: GPG started before Sign ($(touch_at_start))"
+        [[ $(dialog_order) == 'start end pin-entry ' ]] || fail "touch $uif: the PIN window did not follow Sign: $(dialog_order)"
+    else
+        [[ $(touch_at_start) == after ]] || fail "touch $uif: GPG waited for a click ($(touch_at_start))"
+    fi
+done
+export FAKE_CARD_UIF=%00+
+gate_case -bsau TEST
+[[ "$pin_status" -eq 0 && $(touch_at_start) == before ]] || fail "touch off, pinentry path: GPG did not wait for Sign ($pin_status, $(touch_at_start))"
+# On and fixed keep the touch as the gate only when the card's slot-1 key, whose
+# policy was read, is the only usable signing key GPG could pick: GnuPG 2.3 and
+# later may sign with a software key whose passphrase is cached, with no touch,
+# and a key on another card signs under its own policy. So any other key needs
+# Sign, even when the slot-1 key is the pick. A key GPG cannot pick does not
+# count, and that takes in a primary key while a subkey can sign, whatever its
+# kind. A key named with ! is the only one GPG can pick, so its own kind decides.
+# assert_gate LABEL UIF SIGN-NOTICE SELECTOR; an empty notice means no Sign.
+assert_gate() {
+    local label="$1" notice="$3" gate
+    export FAKE_CARD_UIF="$2"
+    gate_case --status-fd=2 -bsau "$4"
+    [[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "$label: not signed ($pin_status)"
+    gate=$(cat "$(latest_capture | sed 's/\.summary$//').gate")
+    if [[ -n "$notice" ]]; then
+        [[ "$gate" == require-sign$'\n'"$notice" ]] || fail "$label: the preview was not asked for Sign: $gate"
+        [[ $(touch_at_start) == before ]] || fail "$label: GPG started before Sign ($(touch_at_start))"
+    else
+        [[ -z "$gate" ]] || fail "$label: the preview was asked for Sign: $gate"
+        [[ $(touch_at_start) == after ]] || fail "$label: GPG waited for a click ($(touch_at_start))"
+    fi
+}
+cp "$FAKE_SECRET_KEYS" "$TMP/secret-keys.card-only"
+assert_gate 'on, card-only certificate' %01+ '' TEST
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" "$SOFT_SUB" u 200 + > "$FAKE_SECRET_KEYS"
+assert_gate 'on, card and software certificate' %01+ "$TOUCH_MIXED" TEST
+assert_gate 'fixed, card and software certificate' %02+ "$TOUCH_MIXED" TEST
+assert_gate 'on, its card subkey named without !' %01+ "$TOUCH_MIXED" "$CARD_SUB"
+assert_gate 'on, its card key named with !' %01+ '' "$CARD_SUB!"
+assert_gate 'fixed, its card key named with !' %02+ '' "$CARD_SUB!"
+assert_gate 'on, its software key named with !' %01+ "$TOUCH_UNKNOWN" "$SOFT_SUB!"
+assert_gate 'off, card and software certificate' %00+ "$TOUCH_MIXED" TEST
+assert_gate 'cached, card and software certificate' %03+ "$TOUCH_MIXED" TEST
+assert_gate 'cached-fixed, card and software certificate' %04+ "$TOUCH_MIXED" TEST
+# That refusal names the other key, not the policy.
+export FAKE_DIALOG_DECISION=cancel
+for uif in %01+ %00+; do
+    export FAKE_CARD_UIF=$uif
+    gate_case --status-fd=2 -bsau TEST
+    [[ "$pin_status" -eq 1 && -z "$pin_output" && -z $(touch_at_start) ]] || fail "$uif, card and software certificate, Cancel: $pin_status, GPG $(touch_at_start)"
+    grep -qxF "git-gpg-preview: not signed: GPG could sign with more than one key and Sign was not clicked" "$TMP/pin.stderr" &&
+        ! grep -q 'touch policy is' "$TMP/pin.stderr" || fail "$uif, card and software certificate, Cancel: $(cat "$TMP/pin.stderr")"
+done
+export FAKE_DIALOG_DECISION=sign
+# A selector such as a user ID can match several certificates, and GPG need not
+# choose the first, so any that can sign counts: two certificates on two cards
+# need Sign, since only the first card's policy was read. A ! still names one key.
+{ secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD"; secret_keys "$OTHER" cSC + "$SOFT_SUB" u 200 +; } > "$FAKE_SECRET_KEYS"
+assert_gate 'on, a user ID matching a card and a software certificate' %01+ "$TOUCH_MIXED" TEST
+assert_gate 'on, its card key named with !, among both certificates' %01+ '' "$CARD_SUB!"
+{ secret_keys "$OTHER" cSC + "$SOFT_SUB" u 300 +; secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 200 "$CARD"; } > "$FAKE_SECRET_KEYS"
+assert_gate 'on, a user ID matching a software and a card certificate' %01+ "$TOUCH_MIXED" TEST
+{ secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD"; secret_keys "$OTHER" cSC + "$OTHER_CARD" u 200 "$CARD"; } > "$FAKE_SECRET_KEYS"
+assert_gate 'on, a user ID matching two card certificates' %01+ "$TOUCH_MIXED" TEST
+assert_gate 'on, the read key named with !, among two card certificates' %01+ '' "$CARD_SUB!"
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" "$OTHER_CARD" u 200 "$CARD" > "$FAKE_SECRET_KEYS"
+assert_gate 'on, two card subkeys in one certificate' %01+ "$TOUCH_MIXED" TEST
+# The one key is on a card, but not in the slot whose policy was read: unread.
+cp "$TMP/secret-keys.card-only" "$FAKE_SECRET_KEYS"
+export FAKE_CARD_SIG_KEY=$OTHER_CARD
+assert_gate 'on, another key in the card signature slot' %01+ "$TOUCH_UNKNOWN" TEST
+export FAKE_CARD_SIG_KEY=$CARD_SUB
+# The same key may be on two inserted cards, and GPG may sign on the one whose
+# policy was not read: where scdaemon lists more than one card, Sign is needed.
+# One card, or a scdaemon that refuses the command (all the cases above), changes
+# nothing.
+export FAKE_CARD_LIST="D2760001240100000006000000010000 D2760001240100000006000000020000"
+assert_gate 'on, scdaemon lists two cards' %01+ "$TOUCH_UNKNOWN" TEST
+assert_gate 'fixed, scdaemon lists two cards' %02+ "$TOUCH_UNKNOWN" TEST
+export FAKE_CARD_LIST=D2760001240100000006000000010000
+assert_gate 'on, scdaemon lists one card' %01+ '' TEST
+export FAKE_CARD_LIST=''
+assert_gate 'on, scdaemon lists no card' %01+ '' TEST
+unset FAKE_CARD_LIST
+{ secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD"; secret_keys "$OTHER" cSC + "$SOFT_SUB" e 200 +; } > "$FAKE_SECRET_KEYS"
+assert_gate 'on, a user ID also matching a certificate that cannot sign' %01+ '' TEST
+secret_keys "$PRIMARY" scSC + "$CARD_SUB" u 300 "$CARD" > "$FAKE_SECRET_KEYS"
+assert_gate 'on, a software primary that can sign and one card subkey' %01+ '' TEST
+assert_gate 'on, that software primary named with !' %01+ "$TOUCH_UNKNOWN" "$PRIMARY!"
+secret_keys "$PRIMARY" scSC '#' "$CARD_SUB" u 300 "$CARD" > "$FAKE_SECRET_KEYS"
+assert_gate 'on, a stub primary that can sign and one card subkey' %01+ '' TEST
+# With no subkey that can sign, the primary key is what GPG picks.
+secret_keys "$PRIMARY" scSC "$CARD" "$SOFT_SUB" e 200 + > "$FAKE_SECRET_KEYS"
+export FAKE_CARD_SIG_KEY=$PRIMARY
+assert_gate 'on, a card primary and an expired software subkey' %01+ '' TEST
+export FAKE_CARD_SIG_KEY=$CARD_SUB
+secret_keys "$PRIMARY" scSC + "$CARD_SUB" e 300 "$CARD" > "$FAKE_SECRET_KEYS"
+assert_gate 'on, a software primary and an expired card subkey' %01+ "$TOUCH_UNKNOWN" TEST
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" "$SOFT_SUB" e 200 + > "$FAKE_SECRET_KEYS"
+assert_gate 'on, an expired software subkey' %01+ '' TEST
+secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 300 "$CARD" "$SOFT_SUB" u 200 '#' > "$FAKE_SECRET_KEYS"
+assert_gate 'on, a software subkey without its secret' %01+ '' TEST
+cp "$TMP/secret-keys.card-only" "$FAKE_SECRET_KEYS"
+export FAKE_CARD_UIF=%00+
+# Cancel, a window closed without an answer, and no answer in time sign nothing:
+# GPG never starts.
+export FAKE_DIALOG_DECISION=cancel
+gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 1 && -z "$pin_output" && -z $(touch_at_start) ]] || fail "touch off, Cancel: $pin_status, GPG $(touch_at_start)"
+grep -qxF "$GATE_REFUSED" "$TMP/pin.stderr" && grep -qxF 'git-gpg-preview: signing cancelled by user' "$TMP/pin.stderr" ||
+    fail "touch off, Cancel: $(cat "$TMP/pin.stderr")"
+export FAKE_DIALOG_DECISION=garbage
+gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 70 && -z "$pin_output" && -z $(touch_at_start) ]] || fail "touch off, no answer: $pin_status, GPG $(touch_at_start)"
+grep -qxF "$GATE_REFUSED" "$TMP/pin.stderr" || fail "touch off, no answer: $(cat "$TMP/pin.stderr")"
+sed 's/^SIGN_CLICK_SECONDS=.*/SIGN_CLICK_SECONDS=1/' "$ROOT/git-gpg-preview" > "$TMP/fast-sign-wrapper"
+chmod 700 "$TMP/fast-sign-wrapper"
+! cmp -s "$ROOT/git-gpg-preview" "$TMP/fast-sign-wrapper" || fail 'could not shorten SIGN_CLICK_SECONDS'
+export FAKE_DIALOG_DECISION=sign FAKE_DIALOG_DELAY=30
+gate_started=$SECONDS
+GATE_WRAPPER="$TMP/fast-sign-wrapper" gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 70 && -z "$pin_output" && -z $(touch_at_start) && $((SECONDS - gate_started)) -lt 10 ]] ||
+    fail "touch off, no click in time: $pin_status after $((SECONDS - gate_started))s, GPG $(touch_at_start)"
+grep -qxF "$GATE_REFUSED" "$TMP/pin.stderr" || fail "touch off, no click in time: $(cat "$TMP/pin.stderr")"
+# A policy that cannot be read is refused the same way, and says so.
+export FAKE_CARD_UIF=%05+ FAKE_DIALOG_DECISION=cancel FAKE_DIALOG_DELAY=0
+gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 1 && -z $(touch_at_start) ]] &&
+    grep -qxF 'git-gpg-preview: not signed: touch policy is unknown and Sign was not clicked' "$TMP/pin.stderr" ||
+    fail "touch unknown, Cancel: $pin_status, GPG $(touch_at_start), $(cat "$TMP/pin.stderr")"
+export FAKE_DIALOG_DECISION=sign FAKE_DIALOG_DELAY=30
+GATE_WRAPPER="$TMP/fast-sign-wrapper" gate_case -bsau TEST --homedir "$TMP/elsewhere"
+[[ "$pin_status" -eq 70 && -z $(touch_at_start) ]] &&
+    grep -qxF 'git-gpg-preview: not signed: touch policy is unknown and Sign was not clicked' "$TMP/pin.stderr" ||
+    fail "touch not read, no click in time: $pin_status, GPG $(touch_at_start)"
+export FAKE_CARD_UIF=%00+
+# The gate does not depend on the notice: with its files unwritable, Sign is
+# still needed, and Cancel still signs nothing.
+export FAKE_DIALOG_DELAY=1
+GATE_WRAPPER="$TMP/notice-failing-wrapper" gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 0 && $(touch_at_start) == before ]] || fail "touch off, notice not written: GPG did not wait for Sign ($pin_status, $(touch_at_start))"
+grep -qxF "$NOTICE_FAILED" "$TMP/pin.stderr" || fail 'touch off, notice not written: not reported'
+export FAKE_DIALOG_DECISION=cancel
+GATE_WRAPPER="$TMP/notice-failing-wrapper" gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 1 && -z $(touch_at_start) ]] && grep -qxF "$GATE_REFUSED" "$TMP/pin.stderr" ||
+    fail "touch off, notice not written, Cancel: $pin_status, GPG $(touch_at_start)"
+export FAKE_DIALOG_DECISION=sign FAKE_DIALOG_DELAY=0
+pass 'touch off or unknown: GPG starts only after Sign, then the PIN window; Cancel, no answer or no click in time sign nothing'
+
+# Each PIN attempt needs a Sign of its own: after a wrong PIN, a second preview
+# that hangs, is cancelled or closes without an answer signs nothing, and GPG
+# ran once. Two Signs sign, with two GPG calls.
+export FAKE_DIALOG_DECISION_STATE="$TMP/decision-state" FAKE_PIN_ENTRIES=654321,123456 FAKE_PIN_ERROR_DECISION=retry
+for answers in sign,hang:70 sign,cancel:1 sign,:70 sign,sign:0; do
+    export FAKE_DIALOG_DECISIONS=${answers%:*}
+    GATE_WRAPPER="$TMP/fast-sign-wrapper" gate_case --status-fd=2 -bsau TEST
+    if [[ "${answers#*:}" -eq 0 ]]; then
+        [[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' && $(touch_at_start | grep -c .) -eq 2 ]] ||
+            fail "touch off, PIN retry with Sign twice: $pin_status, GPG $(touch_at_start | tr '\n' ' ')"
+    else
+        [[ "$pin_status" -eq "${answers#*:}" && -z "$pin_output" && $(touch_at_start | grep -c .) -eq 1 ]] ||
+            fail "touch off, PIN retry answered ${FAKE_DIALOG_DECISIONS#sign,}: $pin_status, GPG $(touch_at_start | tr '\n' ' ')"
+        grep -qxF "$GATE_REFUSED" "$TMP/pin.stderr" || fail "touch off, PIN retry answered ${FAKE_DIALOG_DECISIONS#sign,}: $(cat "$TMP/pin.stderr")"
+    fi
+done
+unset FAKE_DIALOG_DECISIONS FAKE_DIALOG_DECISION_STATE FAKE_PIN_ERROR_DECISION
+export FAKE_PIN_ENTRIES=123456
+# Only the exact bytes "sign" are a Sign: not with a space, another case, twice,
+# a trailing newline or NUL, or after the rejection marker. GPG never runs. The
+# same rule holds for cancel and spam: ' cancel' or 'cancel\0' is no answer the
+# preview gives, refused as Sign not clicked, as the service refuses it.
+for answer in 'raw: sign' 'raw:Sign' 'raw:signsign' 'raw:sign\n' 'raw:sign\0' marker-sign \
+              'raw: cancel' 'raw:cancel\0' 'raw:spam\n'; do
+    export FAKE_DIALOG_DECISION=$answer
+    gate_case --status-fd=2 -bsau TEST
+    [[ "$pin_status" -eq 70 && -z "$pin_output" && -z $(touch_at_start) ]] && grep -qxF "$GATE_REFUSED" "$TMP/pin.stderr" ||
+        fail "touch off, answer '$answer': $pin_status, GPG $(touch_at_start)"
+    [[ $(sed -n 's/.*decision=\([^ ]*\).*/\1/p' "$TMP/audit.log") == sign-not-clicked ]] ||
+        fail "touch off, answer '$answer': audited as $(sed -n 's/.*decision=\([^ ]*\).*/\1/p' "$TMP/audit.log")"
+done
+[[ ! -e "$XDG_CONFIG_HOME/git-gpg-preview/spam-subjects" ]] || fail "touch off, answer 'spam\\n': the subject was saved"
+export FAKE_DIALOG_DECISION=raw:sign
+gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 0 && $(touch_at_start) == before ]] || fail "touch off, an exact sign: $pin_status, GPG $(touch_at_start)"
+# Mark as Spam is no Sign either: the subject is saved, and GPG never runs.
+awk '{ print } $0 == "" { exit }' "$TMP/initial.payload" > "$TMP/gate-spam.payload"
+printf 'Touch off spam subject\n' >> "$TMP/gate-spam.payload"
+export FAKE_DIALOG_DECISION=spam
+GATE_PAYLOAD="$TMP/gate-spam.payload" gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 1 && -z "$pin_output" && -z $(touch_at_start) ]] && grep -qxF "$GATE_REFUSED" "$TMP/pin.stderr" ||
+    fail "touch off, Mark as Spam: $pin_status, GPG $(touch_at_start)"
+grep -qxF 'touch off spam subject' "$XDG_CONFIG_HOME/git-gpg-preview/spam-subjects" || fail 'touch off, Mark as Spam: the subject was not saved'
+grep -qF 'decision=spam-mark' "$TMP/audit.log" || fail 'touch off, Mark as Spam: not audited'
+rm -f "$XDG_CONFIG_HOME/git-gpg-preview/spam-subjects"
+export FAKE_DIALOG_DECISION=sign
+unset FAKE_PIN_RETRIES FAKE_GPG_PIN FAKE_PIN_ENTRIES
+pass 'touch off: each PIN attempt needs its own Sign, only an exact "sign" counts, and Mark as Spam saves the subject without GPG'
+
+# A Sign inside SIGN_CLICK_SECONDS counts, and one after it does not. After
+# Sign the preview is closed, so a key that never confirms is stopped after
+# SIGN_GPG_SECONDS: nothing is signed, and the request ends.
+sed 's/^SIGN_CLICK_SECONDS=.*/SIGN_CLICK_SECONDS=2/; s/^SIGN_GPG_SECONDS=.*/SIGN_GPG_SECONDS=1/' "$ROOT/git-gpg-preview" > "$TMP/short-wrapper"
+chmod 700 "$TMP/short-wrapper"
+[[ $(grep -c '^SIGN_\(CLICK\|GPG\)_SECONDS=[12]$' "$TMP/short-wrapper") -eq 2 ]] || fail 'could not shorten the Sign deadlines'
+export FAKE_CARD_UIF=%00+ FAKE_DIALOG_DECISION=sign
+for case in 1.4:0 2.8:70; do
+    export FAKE_DIALOG_DELAY=${case%:*}
+    GATE_WRAPPER="$TMP/short-wrapper" gate_case --status-fd=2 -bsau TEST
+    [[ "$pin_status" -eq "${case#*:}" ]] || fail "touch off, Sign after ${FAKE_DIALOG_DELAY}s of 2: $pin_status"
+done
+export FAKE_DIALOG_DECISION=sign-no-touch FAKE_DIALOG_DELAY=0
+gate_started=$SECONDS
+GATE_WRAPPER="$TMP/short-wrapper" gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 70 && -z "$pin_output" && -n $(touch_at_start) && $((SECONDS - gate_started)) -lt 6 ]] ||
+    fail "touch off, no touch after Sign: $pin_status after $((SECONDS - gate_started))s"
+grep -qxF 'git-gpg-preview: not signed: no touch or PIN before the deadline' "$TMP/pin.stderr" || fail "no touch after Sign: $(cat "$TMP/pin.stderr")"
+grep -qF 'decision=gpg-timeout' "$TMP/audit.log" || fail 'no touch after Sign: not audited'
+# The card operation the stopped GPG left behind ends with it, before the next
+# request: that request's touch signs that request, not the stale one.
+export FAKE_CARD_QUEUE="$TMP/card-queue"
+: > "$FAKE_CARD_QUEUE"
+GATE_WRAPPER="$TMP/short-wrapper" gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 70 ]] || fail "a stopped signature: $pin_status"
+grep -qxF 'SCD KILLSCD /bye' "$FAKE_GPG_CALL_DIR/connect-agent-calls" || fail 'the stopped signature was left pending at the card'
+export FAKE_DIALOG_DECISION=sign
+GATE_PAYLOAD="$TMP/initial.payload" gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 0 && "$pin_output" == "signed:$(shasum -a 256 "$TMP/initial.payload" | awk '{print $1}')" ]] ||
+    fail "the next touch went to the stopped signature: $pin_status, $pin_output"
+# So does a Cancel, Mark as Spam or preview closed without an answer while GPG
+# waits at the card (touch on, so GPG starts with the preview). Spam comes
+# last, since it blocks the subject that the others sign.
+export FAKE_CARD_UIF=%01+
+for answer in cancel:1 garbage:70 spam:1; do
+    : > "$FAKE_CARD_QUEUE"
+    : > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+    export FAKE_DIALOG_DECISION=${answer%:*} FAKE_DIALOG_DELAY=0.5
+    gate_case --status-fd=2 -bsau TEST
+    [[ "$pin_status" -eq "${answer#*:}" && -z "$pin_output" ]] || fail "touch on, ${answer%:*} while the card waits: $pin_status"
+    grep -qxF 'SCD KILLSCD /bye' "$FAKE_GPG_CALL_DIR/connect-agent-calls" ||
+        fail "touch on, ${answer%:*}: the stopped signature was left pending at the card"
+    export FAKE_DIALOG_DECISION=sign FAKE_DIALOG_DELAY=0
+    GATE_PAYLOAD="$TMP/initial.payload" gate_case --status-fd=2 -bsau TEST
+    [[ "$pin_status" -eq 0 && "$pin_output" == "signed:$(shasum -a 256 "$TMP/initial.payload" | awk '{print $1}')" ]] ||
+        fail "touch on, ${answer%:*}: the next touch went to the stopped signature: $pin_status, $pin_output"
+done
+rm -f "$XDG_CONFIG_HOME/git-gpg-preview/spam-subjects"
+# So does a Cancel in the PIN window, and a question it cannot answer.
+export FAKE_DIALOG_DECISION=sign-no-touch FAKE_PIN_RETRIES=3 FAKE_GPG_PIN=123456
+for pin_case in pin-cancel:1 pin-close:70 ask:70; do
+    : > "$FAKE_CARD_QUEUE"
+    : > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+    case "${pin_case%:*}" in
+        ask) export FAKE_GPG_ASK='GET_BOOL cardctrl.insert_card.okay' ;;
+        pin-close) export FAKE_PIN_ENTRIES=CLOSE ;;
+        *) export FAKE_PIN_ENTRIES=CANCEL ;;
+    esac
+    gate_case --status-fd=2 -bsau TEST
+    unset FAKE_GPG_ASK FAKE_PIN_ENTRIES
+    [[ "$pin_status" -eq "${pin_case#*:}" && -z "$pin_output" && -n $(touch_at_start) ]] ||
+        fail "${pin_case%:*} after Sign: $pin_status, GPG $(touch_at_start)"
+    grep -qxF 'SCD KILLSCD /bye' "$FAKE_GPG_CALL_DIR/connect-agent-calls" ||
+        fail "${pin_case%:*} after Sign: the stopped signature was left pending at the card"
+    [[ "${pin_case%:*}" != pin-close ]] || grep -qxF 'git-gpg-preview: PIN window closed without an answer; refusing to sign' "$TMP/pin.stderr" ||
+        fail "the PIN window closed without an answer: $(cat "$TMP/pin.stderr")"
+done
+unset FAKE_PIN_RETRIES FAKE_GPG_PIN
+export FAKE_CARD_UIF=%00+
+unset FAKE_CARD_QUEUE
+# A request with its own GnuPG home has its card operation cancelled there,
+# not in the default home's agent, by GPG's rule: the last --homedir wins, under
+# any name GPG takes for it. An --options file cannot change the home (GPG
+# ignores homedir there), so its line naming another one does not count.
+export FAKE_DIALOG_DECISION=sign-no-touch
+printf 'homedir %s\n' "$TMP/not-this-one" > "$TMP/homedir-options"
+for homedir_case in plain equals home hom last options options-only; do
+    case "$homedir_case" in
+        plain) homedir_args=(--homedir "$TMP/elsewhere") ;;
+        equals) homedir_args=(--homedir="$TMP/elsewhere") ;;
+        home) homedir_args=(--home="$TMP/elsewhere") ;;
+        hom) homedir_args=(--hom="$TMP/elsewhere") ;;
+        last) homedir_args=(--homedir "$TMP/not-this-one" --homedir="$TMP/elsewhere") ;;
+        options) homedir_args=(--homedir "$TMP/elsewhere" --options "$TMP/homedir-options") ;;
+        options-only) homedir_args=(--options "$TMP/homedir-options") ;;
+    esac
+    homedir_cancel="--homedir $TMP/elsewhere SCD KILLSCD /bye"
+    [[ "$homedir_case" != options-only ]] || homedir_cancel='SCD KILLSCD /bye'
+    : > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+    GATE_WRAPPER="$TMP/short-wrapper" gate_case --status-fd=2 -bsau TEST "${homedir_args[@]}"
+    [[ "$pin_status" -eq 70 && -n $(touch_at_start) ]] || fail "a stopped signature, $homedir_case home: $pin_status"
+    [[ $(cat "$FAKE_GPG_CALL_DIR/connect-agent-calls") == "$homedir_cancel" ]] ||
+        fail "a stopped signature, $homedir_case home, was cancelled elsewhere: $(cat "$FAKE_GPG_CALL_DIR/connect-agent-calls")"
+done
+# The wrapper looks up no key of its own for such a request: --home= names its
+# own home as --homedir does, so the policy goes unread and Sign is needed.
+grep -qxF 'git-gpg-preview: not signed: no touch or PIN before the deadline' "$TMP/pin.stderr" ||
+    fail "a stopped signature with its own home: $(cat "$TMP/pin.stderr")"
+# A certificate with no signing key on a card leaves nothing there: stopping
+# its GPG cancels nothing, which would drop the PIN scdaemon holds and disturb
+# its other users. One with a card signing key gets the cancel even when its
+# newer software key is the pick, since GnuPG 2.3 and later may sign on the card.
+cp "$FAKE_SECRET_KEYS" "$TMP/secret-keys.card"
+for certificate in software-only:0 card-and-software:1; do
+    if [[ "${certificate%:*}" == software-only ]]; then
+        secret_keys "$PRIMARY" cSC '' "$SOFT_SUB" u 300 '' > "$FAKE_SECRET_KEYS"
+    else
+        secret_keys "$PRIMARY" cSC + "$CARD_SUB" u 200 "$CARD" "$SOFT_SUB" u 300 + > "$FAKE_SECRET_KEYS"
+    fi
+    : > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+    GATE_WRAPPER="$TMP/short-wrapper" gate_case --status-fd=2 -bsau TEST
+    [[ "$pin_status" -eq 70 && -n $(touch_at_start) ]] || fail "a stopped signature, ${certificate%:*} certificate: $pin_status"
+    [[ $(grep -c '^SCD KILLSCD /bye$' "$FAKE_GPG_CALL_DIR/connect-agent-calls") -eq "${certificate#*:}" ]] ||
+        fail "a stopped signature, ${certificate%:*} certificate: $(cat "$FAKE_GPG_CALL_DIR/connect-agent-calls")"
+done
+cp "$TMP/secret-keys.card" "$FAKE_SECRET_KEYS"
+# Nor does a GPG that finished after Cancel was read but before it was stopped:
+# here GPG takes 0.4s, and this copy of the wrapper takes a second over the
+# Cancel. It signed, so nothing waits at the card.
+/usr/bin/awk '{ print } /^handle_operator_rejection\(\) \{$/ { print "    /bin/sleep 1" }' "$ROOT/git-gpg-preview" > "$TMP/slow-cancel-wrapper"
+chmod 700 "$TMP/slow-cancel-wrapper"
+[[ $(grep -c '^    /bin/sleep 1$' "$TMP/slow-cancel-wrapper") -eq 1 ]] || fail 'could not slow the Cancel down'
+export FAKE_CARD_UIF=%01+ FAKE_DIALOG_DECISION=raw:cancel FAKE_GPG_SLOW=0.4
+: > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+finished_before=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
+GATE_WRAPPER="$TMP/slow-cancel-wrapper" gate_case --status-fd=2 -bsau TEST
+unset FAKE_GPG_SLOW
+[[ "$pin_status" -eq 1 && -z "$pin_output" && $(wc -l < "$FAKE_GPG_CALL_DIR/calls") -gt "$finished_before" ]] ||
+    fail "Cancel read before GPG finished: $pin_status, GPG finished: $(($(wc -l < "$FAKE_GPG_CALL_DIR/calls") > finished_before))"
+! grep -q KILLSCD "$FAKE_GPG_CALL_DIR/connect-agent-calls" || fail 'a GPG that had finished before it was stopped stopped scdaemon'
+export FAKE_CARD_UIF=%00+
+# A GPG_PID or PIN_CHANNEL the caller exports is not the wrapper's: an early
+# exit (here Cancel, before GPG starts) stops no such process and sends no
+# KILLSCD, and the PIN path deletes no such file.
+sleep 30 &
+inherited_pid=$!
+: > "$TMP/inherited-pin-channel"
+: > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+export FAKE_DIALOG_DECISION=cancel
+GPG_PID=$inherited_pid PIN_CHANNEL="$TMP/inherited-pin-channel" gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 1 && -z $(touch_at_start) ]] || fail "Cancel with an inherited GPG_PID: $pin_status, GPG $(touch_at_start)"
+kill -0 "$inherited_pid" 2>/dev/null || fail 'an inherited GPG_PID was stopped'
+! grep -q KILLSCD "$FAKE_GPG_CALL_DIR/connect-agent-calls" || fail 'an inherited GPG_PID stopped scdaemon'
+[[ -e "$TMP/inherited-pin-channel" ]] || fail 'an inherited PIN_CHANNEL was deleted'
+kill "$inherited_pid"
+wait "$inherited_pid" 2>/dev/null || true
+# The policy is read only from a status word of 90 00 (done): a reply with a
+# valid policy byte but another one, such as 6A 82, reads as unknown and asks
+# for Sign. So does an abbreviation GPG takes for --homedir or --keyring: the
+# request names its own files, whose card the wrapper does not read.
+export FAKE_CARD_UIF=%01+
+for unread in apdu-sw homed keyr no-default-k opt; do
+    unread_arg=""
+    case "$unread" in
+        apdu-sw) export FAKE_CARD_APDU_SW='6A 82' ;;
+        homed) unread_arg=--homed="$TMP/elsewhere" ;;
+        keyr) unread_arg=--keyr="$TMP/elsewhere/pubring.kbx" ;;
+        no-default-k) unread_arg=--no-default-k ;;
+        opt) unread_arg=--opt="$TMP/homedir-options" ;;
+    esac
+    if [[ -z "$unread_arg" ]]; then
+        gate_case --status-fd=2 -bsau TEST
+    else
+        gate_case --status-fd=2 -bsau TEST "$unread_arg"
+    fi
+    unset FAKE_CARD_APDU_SW
+    unread_gate=$(latest_capture)
+    unread_gate=$(cat "${unread_gate%.summary}.gate")
+    [[ "$pin_status" -eq 1 && "$unread_gate" == "require-sign"$'\n'"$TOUCH_UNKNOWN" ]] ||
+        fail "touch on, $unread: the policy was read ($pin_status, preview asked: $unread_gate)"
+done
+export FAKE_CARD_UIF=%00+
+# A preview still open at the deadline is stopped, and a Sign it wrote before
+# then does not count: GPG never starts.
+export FAKE_DIALOG_DECISION=early-sign
+gate_started=$SECONDS
+GATE_WRAPPER="$TMP/short-wrapper" gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 70 && -z "$pin_output" && -z $(touch_at_start) && $((SECONDS - gate_started)) -lt 6 ]] ||
+    fail "touch off, a Sign from a preview still open at the deadline: $pin_status, GPG $(touch_at_start)"
+grep -qxF "$GATE_REFUSED" "$TMP/pin.stderr" && grep -qF 'decision=sign-not-clicked' "$TMP/audit.log" ||
+    fail "touch off, a preview still open at the deadline: $(cat "$TMP/pin.stderr")"
+# After Sign the preview has closed, so a window says the key still waits, with
+# Cancel, while GPG runs: a touch signs and closes it; Cancel stops GPG and
+# cancels what it left at the card. A preview the touch gates needs none.
+export FAKE_DIALOG_DECISION=sign-no-touch FAKE_WAITING_DELAY=0.3
+for answer in touch:0 cancel:1; do
+    : > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+    export FAKE_WAITING_DECISION=${answer%:*}
+    gate_case --status-fd=2 -bsau TEST
+    [[ "$pin_status" -eq "${answer#*:}" && $(touch_at_start) == after ]] ||
+        fail "touch off, ${answer%:*} in the window after Sign: $pin_status, GPG $(touch_at_start)"
+    waiting_pid=$(sed -n 's/^waiting //p' "$FAKE_DIALOG_LOG")
+    [[ $(grep -c '^waiting ' "$FAKE_DIALOG_LOG") -eq 1 ]] && ! kill -0 "$waiting_pid" 2>/dev/null ||
+        fail "touch off, ${answer%:*}: no window after Sign, or it outlived the request"
+    [[ "${answer%:*}" == cancel || -n "$pin_output" ]] || fail 'touch off, a touch in the window after Sign: no signature'
+done
+[[ -z "$pin_output" ]] && grep -qxF 'git-gpg-preview: signing cancelled by user' "$TMP/pin.stderr" ||
+    fail "touch off, Cancel after Sign: $(cat "$TMP/pin.stderr")"
+grep -qxF 'SCD KILLSCD /bye' "$FAKE_GPG_CALL_DIR/connect-agent-calls" || fail 'Cancel after Sign left the signature pending at the card'
+grep -qF 'decision=cancel' "$TMP/audit.log" || fail 'Cancel after Sign: not audited'
+export FAKE_CARD_UIF=%01+ FAKE_DIALOG_DECISION=sign
+gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 0 ]] && ! grep -q '^waiting ' "$FAKE_DIALOG_LOG" || fail "touch on: a window after Sign opened ($pin_status)"
+unset FAKE_WAITING_DECISION FAKE_WAITING_DELAY
+# A signal while GPG waits after Sign ends the request at once, though GPG
+# ignores it: GPG is killed a second after TERM, and what it left at the card
+# is cancelled, waiting at most about 3s for a wedged scdaemon. Background jobs
+# start with INT ignored, so perl restores it.
+export FAKE_CARD_UIF=%00+ FAKE_DIALOG_DECISION=sign-no-touch FAKE_GPG_IGNORE_SIGNALS=1
+for signal in INT:130:5 TERM:143:5 TERM:143:8:wedged; do
+    if [[ "$signal" == *:wedged ]]; then
+        export FAKE_KILLSCD_SLEEP=30
+        signal=${signal%:wedged}
+    fi
+    signal_limit=${signal##*:}
+    signal=${signal%:*}
+    reset_pin_state
+    rm -f "$FAKE_GPG_CALL_DIR/touch-at-start"
+    : > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+    /usr/bin/perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV or die' "$ROOT/git-gpg-preview" --status-fd=2 -bsau TEST \
+        < "$TMP/commit.payload" > "$TMP/signal.stdout" 2> "$TMP/signal.stderr" &
+    signal_pid=$!
+    waited=0
+    while [[ ! -s "$FAKE_GPG_CALL_DIR/touch-at-start" && "$waited" -lt 100 ]]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    [[ -s "$FAKE_GPG_CALL_DIR/touch-at-start" ]] || fail "SIG${signal%:*} after Sign: GPG never started"
+    # The signing GPG, named by its payload file, until it records its call.
+    signal_gpg=$(ls -t "$FAKE_GPG_CALL_DIR"/*.stdin | head -n 1)
+    signal_gpg=${signal_gpg##*/}
+    signal_sent=$SECONDS
+    kill -s "${signal%:*}" "$signal_pid"
+    signal_status=0
+    wait "$signal_pid" || signal_status=$?
+    [[ "$signal_status" -eq "${signal#*:}" && $((SECONDS - signal_sent)) -lt "$signal_limit" && ! -s "$TMP/signal.stdout" ]] ||
+        fail "SIG${signal%:*} after Sign: status $signal_status after $((SECONDS - signal_sent))s"
+    ! kill -0 "${signal_gpg%%.*}" 2>/dev/null || fail "SIG${signal%:*} after Sign: GPG still runs"
+    grep -qxF 'SCD KILLSCD /bye' "$FAKE_GPG_CALL_DIR/connect-agent-calls" ||
+        fail "SIG${signal%:*} after Sign: the stopped signature was left pending at the card"
+done
+unset FAKE_GPG_IGNORE_SIGNALS FAKE_KILLSCD_SLEEP
+# A signal after GPG has finished and been reaped, while the request still runs
+# (here waiting for an answer the preview began), signals neither GPG's old
+# number, which may belong to another process by now, nor scdaemon: GPG had
+# finished, so nothing waits at the card. /bin/kill is logged to see that.
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s"\nexec /bin/kill "$@"\n' "$TMP/kill.log" > "$TMP/logged-kill"
+chmod 700 "$TMP/logged-kill"
+sed "s#/bin/kill#$TMP/logged-kill#g" "$ROOT/git-gpg-preview" > "$TMP/kill-logged-wrapper"
+chmod 700 "$TMP/kill-logged-wrapper"
+export FAKE_CARD_UIF=%01+ FAKE_DIALOG_DECISION=touch-then-stall-spam FAKE_DIALOG_DELAY=0
+reset_pin_state
+rm -f "$TMP/kill.log"
+: > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+reaped_before=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
+"$TMP/kill-logged-wrapper" --status-fd=2 -bsau TEST < "$TMP/commit.payload" > "$TMP/signal.stdout" 2> "$TMP/signal.stderr" &
+signal_pid=$!
+waited=0
+while [[ $(wc -l < "$FAKE_GPG_CALL_DIR/calls") -eq "$reaped_before" && "$waited" -lt 100 ]]; do
+    sleep 0.1
+    waited=$((waited + 1))
+done
+reaped_gpg=$(latest_call)
+reaped_gpg=${reaped_gpg%%.*}
+sleep 0.5
+kill -s TERM "$signal_pid"
+signal_status=0
+wait "$signal_pid" || signal_status=$?
+[[ "$signal_status" -eq 143 && ! -s "$TMP/signal.stdout" && "$waited" -lt 100 ]] ||
+    fail "SIGTERM after GPG finished: status $signal_status, GPG finished: $((waited < 100))"
+! grep -qE "^-s [A-Z]+ $reaped_gpg\$" "$TMP/kill.log" || fail "SIGTERM after GPG finished signalled its old number $reaped_gpg"
+! grep -q KILLSCD "$FAKE_GPG_CALL_DIR/connect-agent-calls" || fail 'SIGTERM after GPG finished stopped scdaemon'
+# Where ps cannot answer (a sandbox may deny it), a child kill -0 reaches still
+# counts as the wrapper's: Cancel and SIGTERM while GPG waits for the touch stop
+# it promptly and cancel what it left at the card.
+printf '#!/bin/bash\necho "ps: Operation not permitted" >&2\nexit 1\n' > "$TMP/denied-ps"
+chmod 700 "$TMP/denied-ps"
+sed "s#/bin/ps#$TMP/denied-ps#g" "$ROOT/git-gpg-preview" > "$TMP/no-ps-wrapper"
+chmod 700 "$TMP/no-ps-wrapper"
+! grep -q '/bin/ps' "$TMP/no-ps-wrapper" || fail 'could not deny ps'
+export FAKE_CARD_UIF=%01+ FAKE_DIALOG_DECISION=cancel FAKE_DIALOG_DELAY=0.5
+# A ps that fails, and one that answers nothing.
+for ps_answer in 'echo "ps: Operation not permitted" >&2; exit 1' 'exit 0'; do
+    printf '#!/bin/bash\n%s\n' "$ps_answer" > "$TMP/denied-ps"
+    : > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+    no_ps_started=$SECONDS
+    GATE_WRAPPER="$TMP/no-ps-wrapper" gate_case --status-fd=2 -bsau TEST
+    [[ "$pin_status" -eq 1 && -n $(touch_at_start) && $((SECONDS - no_ps_started)) -lt 6 ]] ||
+        fail "Cancel with ps ($ps_answer): $pin_status after $((SECONDS - no_ps_started))s"
+    grep -qxF 'SCD KILLSCD /bye' "$FAKE_GPG_CALL_DIR/connect-agent-calls" ||
+        fail "Cancel with ps ($ps_answer) left the signature pending at the card"
+done
+printf '#!/bin/bash\necho "ps: Operation not permitted" >&2\nexit 1\n' > "$TMP/denied-ps"
+export FAKE_DIALOG_DECISION=hang FAKE_DIALOG_DELAY=0
+for no_ps_case in denied-ps inherited-pid; do
+    reset_pin_state
+    rm -f "$FAKE_GPG_CALL_DIR/touch-at-start"
+    : > "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+    if [[ "$no_ps_case" == denied-ps ]]; then
+        "$TMP/no-ps-wrapper" --status-fd=2 -bsau TEST < "$TMP/commit.payload" > "$TMP/signal.stdout" 2> "$TMP/signal.stderr" &
+    else
+        # A signal with a GPG_PID the caller exported, before GPG starts (touch
+        # off: the preview waits for Sign), stops no such process.
+        export FAKE_CARD_UIF=%00+
+        sleep 30 &
+        inherited_pid=$!
+        GPG_PID=$inherited_pid "$ROOT/git-gpg-preview" --status-fd=2 -bsau TEST < "$TMP/commit.payload" > "$TMP/signal.stdout" 2> "$TMP/signal.stderr" &
+    fi
+    signal_pid=$!
+    waited=0
+    if [[ "$no_ps_case" == denied-ps ]]; then
+        while [[ ! -s "$FAKE_GPG_CALL_DIR/touch-at-start" && "$waited" -lt 100 ]]; do sleep 0.1; waited=$((waited + 1)); done
+        signal_gpg=$(ls -t "$FAKE_GPG_CALL_DIR"/*.stdin | head -n 1)
+        signal_gpg=${signal_gpg##*/}
+    else
+        while ! grep -q '^start ' "$FAKE_DIALOG_LOG" && [[ "$waited" -lt 100 ]]; do sleep 0.1; waited=$((waited + 1)); done
+    fi
+    sleep 0.3
+    signal_sent=$SECONDS
+    kill -s TERM "$signal_pid"
+    signal_status=0
+    wait "$signal_pid" || signal_status=$?
+    [[ "$signal_status" -eq 143 && $((SECONDS - signal_sent)) -lt 5 && "$waited" -lt 100 ]] ||
+        fail "SIGTERM, $no_ps_case: status $signal_status after $((SECONDS - signal_sent))s"
+    if [[ "$no_ps_case" == denied-ps ]]; then
+        ! kill -0 "${signal_gpg%%.*}" 2>/dev/null || fail 'SIGTERM with ps denied: GPG still runs'
+        grep -qxF 'SCD KILLSCD /bye' "$FAKE_GPG_CALL_DIR/connect-agent-calls" || fail 'SIGTERM with ps denied left the signature pending at the card'
+    else
+        kill -0 "$inherited_pid" 2>/dev/null || fail 'SIGTERM stopped an inherited GPG_PID'
+        ! grep -q KILLSCD "$FAKE_GPG_CALL_DIR/connect-agent-calls" || fail 'SIGTERM with an inherited GPG_PID stopped scdaemon'
+        kill "$inherited_pid"
+        wait "$inherited_pid" 2>/dev/null || true
+    fi
+done
+export FAKE_CARD_UIF=%00+ FAKE_DIALOG_DECISION=sign-no-touch
+# scdaemon answers GETATTR UIF-1 from the card data it read first (here
+# FAKE_SCD_CACHE), so a policy changed since would read as the old one. The
+# wrapper asks the card itself: a key turned from on to off asks for Sign on
+# the next request.
+export FAKE_SCD_CACHE="$TMP/scd-cache" FAKE_DIALOG_DECISION=sign FAKE_DIALOG_DELAY=1 FAKE_CARD_UIF=%01+
+rm -f "$FAKE_SCD_CACHE"
+gate_case --status-fd=2 -bsau TEST
+[[ "$pin_status" -eq 0 && $(touch_at_start) == after ]] || fail "touch on, before it changes: $pin_status, GPG $(touch_at_start)"
+export FAKE_CARD_UIF=%00+
+gate_case --status-fd=2 -bsau TEST
+stale_gate=$(latest_capture)
+stale_gate=$(head -n 1 "${stale_gate%.summary}.gate")
+[[ "$pin_status" -eq 0 && $(touch_at_start) == before && "$stale_gate" == require-sign ]] ||
+    fail "touch turned off since scdaemon read the card: $pin_status, GPG $(touch_at_start), preview asked: $stale_gate"
+unset FAKE_SCD_CACHE
+export FAKE_DIALOG_DELAY=0
+# A slow PIN and touch within SIGN_GPG_SECONDS sign, and the real allowance
+# leaves a person time to type a PIN, find the key and touch it.
+[[ $(sed -n 's/^SIGN_GPG_SECONDS=//p' "$ROOT/git-gpg-preview") -eq 90 ]] || fail 'SIGN_GPG_SECONDS is not the 90s decided for a PIN and a touch'
+sed 's/^SIGN_GPG_SECONDS=.*/SIGN_GPG_SECONDS=3/' "$ROOT/git-gpg-preview" > "$TMP/slow-pin-wrapper"
+chmod 700 "$TMP/slow-pin-wrapper"
+export FAKE_DIALOG_DECISION=sign FAKE_GPG_SLOW=1.5
+GATE_WRAPPER="$TMP/slow-pin-wrapper" gate_case --status-fd=2 -bsau TEST
+unset FAKE_GPG_SLOW
+[[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "touch off, a slow PIN within SIGN_GPG_SECONDS: $pin_status"
+# The gate follows the policy, never the notice text: an empty one still gates.
+sed 's/^UNKNOWN_TOUCH_NOTICE=.*/UNKNOWN_TOUCH_NOTICE=""/' "$ROOT/git-gpg-preview" > "$TMP/no-notice-wrapper"
+chmod 700 "$TMP/no-notice-wrapper"
+! cmp -s "$ROOT/git-gpg-preview" "$TMP/no-notice-wrapper" || fail 'could not empty the unknown notice'
+export FAKE_CARD_UIF=%05+ FAKE_DIALOG_DELAY=1
+GATE_WRAPPER="$TMP/no-notice-wrapper" gate_case --status-fd=2 -bsau TEST
+empty_gate=$(latest_capture)
+empty_gate=$(cat "${empty_gate%.summary}.gate")
+[[ "$pin_status" -eq 0 && $(touch_at_start) == before && "$empty_gate" == require-sign ]] ||
+    fail "touch unknown, an empty notice: $pin_status, GPG $(touch_at_start), preview asked: $empty_gate"
+export FAKE_CARD_UIF=%00+ FAKE_DIALOG_DELAY=0
+pass 'touch off: a Sign inside the deadline counts and a later one does not; a key that never confirms after Sign is stopped, a slow one signs; the gate needs no notice'
+
+
+# A wrong PIN repeats the preview: the notice stays, and the policy is read once.
 use_real_gpg "$TMP/gnupg-bin/gpg"
 reset_pin_state
-rm -f "$TOUCH_OFFERS" "$FAKE_GPG_CALL_DIR/connect-agent-calls"
-export FAKE_CARD_UIF=%01+ FAKE_PIN_RETRIES=3 FAKE_GPG_PIN=123456
+rm -f "$FAKE_GPG_CALL_DIR/connect-agent-calls"
+export FAKE_CARD_UIF=%00+ FAKE_PIN_RETRIES=3 FAKE_GPG_PIN=123456
 export FAKE_PIN_ENTRIES=654321,123456 FAKE_PIN_ERROR_DECISION=retry
 run_pin_case --status-fd=2 -bsau TEST
-[[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "touch offer with a PIN retry ($pin_status)"
-grep -l '^PIN attempt 2: ' "$TMP/captures"/*.summary >/dev/null || fail 'the retry preview was not shown'
-[[ $(touch_dialogs) == 'touch-offer on 3' ]] || fail "the retry repeated the offer: $(touch_dialogs)"
+[[ "$pin_status" -eq 0 && "$pin_output" == 'signature-touch-policy' ]] || fail "touch notice with a PIN retry ($pin_status)"
+retry_summary=$(grep -l '^PIN attempt 2: ' "$TMP/captures"/*.summary) || fail 'the retry preview was not shown'
+[[ $(sed -n 3,4p "$retry_summary") == "$TOUCH_OFF" ]] || fail 'the retry preview lost the touch notice'
+facts_lines=$(awk '/^Message:$/ { print NR - 2; exit }' "$retry_summary")
+max_facts=$(sed -n 's/^const FACTS_MAX_LINES = \([0-9][0-9]*\);$/\1/p' "$ROOT/dialog.jxa")
+[[ "$facts_lines" -eq 10 && "$facts_lines" -le "$max_facts" ]] ||
+    fail "the retry preview has $facts_lines fact lines, and the facts pane shows $max_facts"
 [[ $(connect_agent_calls) -eq 1 ]] || fail 'touch policy was read again for the retry'
-unset FAKE_CARD_UIF FAKE_CARD_SIG_KEY FAKE_PIN_RETRIES FAKE_GPG_PIN FAKE_PIN_ENTRIES FAKE_PIN_ERROR_DECISION FAKE_SECRET_KEYS
-rm -f "$TOUCH_OFFERS"
+unset FAKE_PIN_RETRIES FAKE_GPG_PIN FAKE_PIN_ENTRIES FAKE_PIN_ERROR_DECISION FAKE_SECRET_KEYS
+default_card
 cp "$TMP/config.saved" "$XDG_CONFIG_HOME/git-gpg-preview/config"
-pass 'a PIN retry does not repeat the offer or read the policy again'
+pass 'a PIN retry keeps the touch notice without reading the policy again'
 
 # dialog.jxa splits the preview at the first Message: line, so no fact may hold
 # a line break, and the message itself gets a long allowance.
@@ -928,6 +1534,48 @@ grep -qxF 'Signing key: TEST  Message: FORGED selector' <<< "$facts" || fail 'a 
 [[ $(sed -n 7p "$summary") == 'Message:' && $(sed -n 8p "$summary") == 'Message split subject' ]] || fail 'facts do not end at the first Message: line'
 ! grep -qF 'FORGED fact' <<< "$facts" || fail 'the message reached the facts'
 grep -qF 'FORGED fact in the body' "$summary" || fail 'the message lost its own text'
+# Nor a character at which the facts pane would start a new line or reorder the
+# text, though none of their bytes is an ASCII control: U+0085, U+2028, U+2029
+# and the bidirectional controls in a branch name each become '?'. So do all the
+# C1 controls, U+009B (the 8-bit CSI) among them. Other text stays, U+00A0 too.
+# In a fact that is not valid UTF-8 every byte from 0x80 up becomes '?', so a lone
+# 0x85 or 0x9B cannot become a C1 control when the dialog falls back to Latin-1
+# and nothing is deleted: 'ma\xffin' must not read as 'main'. iconv says nothing.
+unsafe_branch=$(printf 'facts\302\205a\342\200\250b\342\200\251c\330\234d\342\200\216e\342\200\217f\342\200\252g')
+unsafe_branch=$unsafe_branch$(printf '\342\200\253h\342\200\254i\342\200\255j\342\200\256k\342\201\246l\342\201\247m\342\201\250n\342\201\251o\303\251')
+git -C "$FIXTURE" checkout -q -b "$unsafe_branch"
+reset_pin_state
+"$ROOT/git-gpg-preview" --status-fd=2 -bsau TEST < "$TMP/forged-message.payload" > /dev/null 2>&1 || fail 'signing on a branch with line separators'
+git -C "$FIXTURE" checkout -q -
+git -C "$FIXTURE" branch -q -D "$unsafe_branch"
+grep -qxF "Branch: facts?a?b?c?d?e?f?g?h?i?j?k?l?m?n?o$(printf '\303\251')" "$(latest_capture)" ||
+    fail "a branch name drew past its fact line: $(grep '^Branch: ' "$(latest_capture)" | od -c | head -3)"
+c1_branch=c1$(printf '\302\233')
+for ((code = 128; code < 160; code++)); do
+    c1_branch=$c1_branch$(printf "\\302\\$(printf '%o' "$code")")
+done
+c1_branch=$c1_branch$(printf '\302\240\303\251')
+git -C "$FIXTURE" checkout -q -b "$c1_branch"
+reset_pin_state
+"$ROOT/git-gpg-preview" --status-fd=2 -bsau TEST < "$TMP/forged-message.payload" > /dev/null 2>&1 || fail 'signing on a branch with C1 controls'
+git -C "$FIXTURE" checkout -q -
+git -C "$FIXTURE" branch -q -D "$c1_branch"
+grep -qxF "Branch: c1$(printf '?%.0s' {1..33})$(printf '\302\240\303\251')" "$(latest_capture)" ||
+    fail "a C1 control reached the facts: $(grep '^Branch: ' "$(latest_capture)" | od -c | head -3)"
+# Through HEAD alone, which needs no file of that name for a filesystem to refuse.
+fixture_head=$(git -C "$FIXTURE" symbolic-ref HEAD)
+for lone in "ma$(printf '\377')in:ma?in" "x$(printf '\205')y:x?y" "x$(printf '\233')y:x?y" \
+    "x$(printf '\205')$(printf '\303\251'):x???" "trail$(printf '\302'):trail?"; do
+    git -C "$FIXTURE" symbolic-ref HEAD "refs/heads/${lone%%:*}"
+    reset_pin_state
+    "$ROOT/git-gpg-preview" --status-fd=2 -bsau TEST < "$TMP/forged-message.payload" > /dev/null 2> "$TMP/lone.stderr" || fail "signing on a branch with lone bytes: $(cat "$TMP/lone.stderr")"
+    git -C "$FIXTURE" symbolic-ref HEAD "$fixture_head"
+    summary=$(latest_capture)
+    grep -qxF "Branch: ${lone#*:}" "$summary" || fail "a lone byte reached the facts: $(grep '^Branch: ' "$summary" | od -c | head -3)"
+    grep -qxF "Branch: ${lone#*:}" "$(details_of "$summary")" || fail "a lone byte reached the details: $(grep '^Branch: ' "$(details_of "$summary")" | od -c | head -3)"
+    /usr/bin/iconv -f UTF-8 -t UTF-8 < "$summary" > /dev/null 2>&1 || fail 'a summary with lone bytes in its facts is not valid UTF-8'
+    ! grep -q iconv "$TMP/lone.stderr" || fail "iconv reached stderr: $(cat "$TMP/lone.stderr")"
+done
 git -C "$FIXTURE" commit -q --allow-empty -F - >/dev/null <<< "$(printf 'A long message\n\n'; printf 'body line of a long commit message\n%.0s' {1..100})"
 git -C "$FIXTURE" cat-file commit HEAD > "$TMP/long-message.payload"
 "$ROOT/git-gpg-preview" --status-fd=2 -bsau TEST < "$TMP/long-message.payload" > /dev/null 2>&1 || fail 'signing a long message'

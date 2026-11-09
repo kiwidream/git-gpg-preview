@@ -4,13 +4,21 @@ ObjC.import('Cocoa');
 
 var responses = [];
 var expectedSpam = false;
+var expectedSign = false;
 var modalCount = 0;
-function modalResponse(alert) {
+// The preview has Sign, last, only when the signer requires it; the details
+// window never has it.
+function modalResponse(alert, preview) {
     const buttons = alert.buttons;
     const count = Number(buttons.count);
-    if (count !== (expectedSpam ? 3 : 2)) throw new Error('Unexpected button count: ' + count);
+    const sign = !!preview && expectedSign;
+    if (count !== (expectedSpam ? 3 : 2) + (sign ? 1 : 0)) throw new Error('Unexpected button count: ' + count);
     if (ObjC.unwrap(buttons.objectAtIndex(1).title) !== 'Cancel') throw new Error('Cancel moved');
     if (expectedSpam && ObjC.unwrap(buttons.objectAtIndex(2).title) !== 'Mark as Spam') throw new Error('Spam button missing');
+    for (let i = 0; i < count; i++) {
+        const isSign = ObjC.unwrap(buttons.objectAtIndex(i).title) === 'Sign';
+        if (isSign !== (sign && i === count - 1)) throw new Error('Sign button where it does not belong, or missing');
+    }
     if (ObjC.unwrap(alert.informativeText).indexOf('Spam') >= 0) throw new Error('Spam text in the preview: ' + ObjC.unwrap(alert.informativeText));
     if (!responses.length) throw new Error('Unexpected extra modal');
     modalCount++;
@@ -29,19 +37,17 @@ function previewModalResponse(alert) {
         messageOnTop: message.frame.origin.y > facts.frame.origin.y,
         messageLarger: message.frame.size.height > facts.frame.size.height,
         messageWraps: !!message.documentView.textContainer.widthTracksTextView && !message.hasHorizontalScroller,
-        factsUnwrapped: !facts.documentView.textContainer.widthTracksTextView
+        factsUnwrapped: !facts.documentView.textContainer.widthTracksTextView,
+        info: ObjC.unwrap(alert.informativeText)
     });
-    return modalResponse(alert);
+    return modalResponse(alert, true);
 }
 
-var touchResponses = [];
-var touchSeen = [];
-function touchModalResponse(alert) {
-    const titles = [];
-    for (let i = 0; i < Number(alert.buttons.count); i++) titles.push(ObjC.unwrap(alert.buttons.objectAtIndex(i).title));
-    touchSeen.push({buttons: titles.join('|'), title: ObjC.unwrap(alert.messageText), info: ObjC.unwrap(alert.informativeText)});
-    if (!touchResponses.length) throw new Error('Unexpected extra touch policy window');
-    return touchResponses.shift();
+// The details window: record the text it shows, then answer.
+var detailsSeen = [];
+function detailModalResponse(alert) {
+    detailsSeen.push(ObjC.unwrap(alert.accessoryView.documentView.string));
+    return modalResponse(alert);
 }
 
 var pinResponses = [];
@@ -57,6 +63,18 @@ function pinModalResponse(alert) {
 }
 var lastPinText = '';
 
+// The window after Sign: record what it says and which buttons it has.
+var waitingSeen = [];
+function waitingModalResponse(alert) {
+    const buttons = alert.buttons;
+    const titles = [];
+    for (let i = 0; i < Number(buttons.count); i++) titles.push(ObjC.unwrap(buttons.objectAtIndex(i).title));
+    const keys = [];
+    for (let i = 0; i < Number(buttons.count); i++) keys.push(ObjC.unwrap(buttons.objectAtIndex(i).keyEquivalent));
+    waitingSeen.push({buttons: titles.join('|'), keys: keys.join('|'), message: ObjC.unwrap(alert.messageText), info: ObjC.unwrap(alert.informativeText)});
+    return 1000;
+}
+
 // PIN window: record what the user would see, type the scripted PIN, answer.
 var pinEntryScript = [];
 var pinEntrySeen = [];
@@ -67,6 +85,7 @@ function pinEntryModalResponse(alert) {
     if (!pinEntryScript.length) throw new Error('Unexpected extra PIN window');
     pinEntrySeen.push({
         initial: ObjC.unwrap(field.stringValue),
+        info: ObjC.unwrap(alert.informativeText),
         label: ObjC.unwrap(label.stringValue),
         red: !!label.textColor.isEqual($.NSColor.systemRedColor),
         bold: (Number(label.font.fontDescriptor.symbolicTraits) & 2) !== 0,
@@ -83,15 +102,13 @@ function run(argv) {
         ['function run(argv)', 'function runPreview(argv)'],
         ['app.activateIgnoringOtherApps(true);', ''],
         ['Number(alert.runModal)', 'previewModalResponse(alert)'],
-        ['Number(detailAlert.runModal)', 'modalResponse(detailAlert)'],
+        ['Number(detailAlert.runModal)', 'detailModalResponse(detailAlert)'],
         ['pinApp.activateIgnoringOtherApps(true);', ''],
         ['Number(pinAlert.runModal)', 'pinModalResponse(pinAlert)'],
         ['pinEntryApp.activateIgnoringOtherApps(true);', ''],
         ['Number(pinEntryAlert.runModal)', 'pinEntryModalResponse(pinEntryAlert)'],
-        ['offerApp.activateIgnoringOtherApps(true);', ''],
-        ['Number(offerAlert.runModal)', 'touchModalResponse(offerAlert)'],
-        ['unchangedApp.activateIgnoringOtherApps(true);', ''],
-        ['Number(unchangedAlert.runModal)', 'touchModalResponse(unchangedAlert)']
+        ['waitingApp.activateIgnoringOtherApps(true);', ''],
+        ['Number(waitingAlert.runModal)', 'waitingModalResponse(waitingAlert)']
     ];
     let instrumented = source;
     substitutions.forEach(function(pair) {
@@ -132,45 +149,207 @@ function run(argv) {
         if (!seen.messageOnTop || !seen.messageLarger) throw new Error('The message pane is not first and largest');
         if (!seen.messageWraps || !seen.factsUnwrapped) throw new Error('Wrong pane wrapping');
     });
+    // A touch policy notice is a fact: the facts pane shows it above the request,
+    // unwrapped, and the message pane does not. Without one (above), the facts
+    // pane starts with the request.
+    const notice = 'Touch policy is off: this key signs with no touch.\nTo require one, run: ykman openpgp keys set-touch sig on';
+    $.NSString.stringWithString(notice + '\n\nRequest type: commit\n\nMessage:\nNoisy subject').writeToFileAtomicallyEncodingError(summary, true, $.NSUTF8StringEncoding, null);
+    $.NSData.data.writeToFileAtomically(decision, true);
+    expectedSpam = false;
+    responses = [1001];
+    panesSeen = [];
+    runPreview([summary, details, decision, ready]);
+    if (panesSeen.length !== 1 || panesSeen[0].facts !== notice + '\n\nRequest type: commit' ||
+        panesSeen[0].message !== 'Noisy subject' || !panesSeen[0].factsUnwrapped) throw new Error('Wrong panes with a touch notice: ' + JSON.stringify(panesSeen));
+    // The facts pane has room for every line up to twelve, at about 13 points a
+    // line for the 11-point font, so the longest preview the signers make (a PIN
+    // retry with a touch notice: ten lines) shows its last fact, the SHA-256.
+    // Past that it scrolls, and the message pane stays on top and larger.
+    const factLine = 13;
+    [1, 5, 8, 9, 10, 12, 32].forEach(function(count) {
+        const lines = [];
+        for (let i = 0; i < count; i++) lines.push('Fact ' + i);
+        const panes = previewPanes(lines.join('\n') + '\n\nMessage:\nSubject').subviews;
+        const message = panes.objectAtIndex(0);
+        const facts = panes.objectAtIndex(1);
+        const room = Number(facts.contentSize.height);
+        if (room < Math.min(count, 12) * factLine) throw new Error(count + ' fact lines do not fit: ' + room);
+        if (count > 12 && room >= count * factLine) throw new Error('The facts pane grew past its maximum');
+        if (message.frame.origin.y < facts.frame.size.height || message.frame.size.height <= facts.frame.size.height) throw new Error('The message pane is not on top and larger');
+        if (facts.documentView.textContainer.widthTracksTextView) throw new Error('The facts pane wraps');
+    });
+    // A fact wider than the pane (560 points hold about 83 columns of the font)
+    // scrolls sideways, still on one line; a legacy scroll bar, 15 points tall,
+    // must not cover the last fact. Wide characters count double: 50 of them
+    // take about 100 columns.
+    const scrollBar = 15;
+    const wideFacts = ['Signing key: ' + 'A'.repeat(200), 'Branch: ' + '漢'.repeat(50)];
+    [].concat(...wideFacts.map(function(wide) { return [8, 12, 32].map(function(count) { return [wide].concat(new Array(count - 1).fill('Fact')); }); }))
+        .forEach(function(lines) {
+            const facts = previewPanes(lines.join('\n') + '\n\nMessage:\nSubject').subviews.objectAtIndex(1);
+            const room = Number(facts.contentSize.height);
+            if (room < Math.min(lines.length, 12) * factLine + scrollBar) throw new Error('A wide fact leaves no room for the scroll bar: ' + room);
+            if (facts.documentView.textContainer.widthTracksTextView) throw new Error('A wide fact wraps');
+        });
+    // Past twelve lines a vertical scroll bar narrows the pane: an 80-column fact
+    // then scrolls sideways too, and its scroll bar needs room.
+    const manyFacts = function(count, fact) {
+        const lines = [fact];
+        for (let i = 1; i < count; i++) lines.push('Fact ' + i);
+        return previewPanes(lines.join('\n') + '\n\nMessage:\nSubject').subviews.objectAtIndex(1);
+    };
+    if (Number(manyFacts(13, 'x'.repeat(80)).contentSize.height) < 12 * factLine + scrollBar) throw new Error('No room for the scroll bar beside a vertical one');
+    if (Number(manyFacts(12, 'x'.repeat(80)).frame.size.height) !== Number(manyFacts(12, 'Fact').frame.size.height)) throw new Error('Room for a scroll bar that 12 lines do not need');
+    // The scroll bar room starts at 81 columns: 80 fit across the pane.
+    const factsHeight = function(fact) {
+        return Number(previewPanes(fact + '\n\nMessage:\nSubject').subviews.objectAtIndex(1).frame.size.height);
+    };
+    if (factsHeight('x'.repeat(80)) !== factsHeight('Fact') || factsHeight('x'.repeat(81)) < factsHeight('Fact') + scrollBar) {
+        throw new Error('Scroll bar room for 80, 81 and narrow facts: ' + [80, 81].map(function(n) { return factsHeight('x'.repeat(n)); }) + ', ' + factsHeight('Fact'));
+    }
     // The first marker ends the facts, whatever the message says.
     [
         {summary: 'Request type: commit\n\nMessage:\nSubject', facts: 'Request type: commit', message: 'Subject'},
         {summary: 'Request type: commit\n\nMessage:\nSubject\n\nMessage:\nForged', facts: 'Request type: commit', message: 'Subject\n\nMessage:\nForged'},
         {summary: 'PIN attempt 2: wrong\n\nRequest type: commit\n\nMessage:\n', facts: 'PIN attempt 2: wrong\n\nRequest type: commit', message: ''},
+        {summary: 'Touch policy is off\nTo require one\n\nRequest type: commit\n\nMessage:\nSubject', facts: 'Touch policy is off\nTo require one\n\nRequest type: commit', message: 'Subject'},
         {summary: 'Request type: commit\nMessage:\nNo blank line', facts: '', message: 'Request type: commit\nMessage:\nNo blank line'}
     ].forEach(function(test) {
         const parts = splitSummary(test.summary);
         if (parts.facts !== test.facts || parts.message !== test.message) throw new Error('Wrong split of: ' + test.summary);
     });
-    // Touch policy windows: 'apply' only from Use Cached, and the countdown is honest.
+    // With touch policy off the signer adds require-sign and the notice: Sign
+    // comes last, so Return never signs, and only Sign writes 'sign'. The notice
+    // shows even when the summary lacks it, as when it could not be written.
+    $.NSString.stringWithString('Request type: commit\n\nMessage:\nNoisy subject').writeToFileAtomicallyEncodingError(summary, true, $.NSUTF8StringEncoding, null);
     [
-        {policy: 'on', left: '3', response: 1000, result: 'apply', title: 'Let one touch cover 15 seconds?', text: '2 more times at most'},
-        {policy: 'on', left: '3', response: 1001, result: 'dismiss', title: 'Let one touch cover 15 seconds?', text: 'covers every signature in the next 15 seconds'},
-        {policy: 'off', left: '2', response: 1001, result: 'dismiss', title: 'This key signs without a touch', text: 'one more time at most'},
-        {policy: 'off', left: '1', response: 1000, result: 'apply', title: 'This key signs without a touch', text: 'Not Now stops asking about this key'}
+        {spam: false, responses: [1002], decision: 'sign'},
+        {spam: true, responses: [1003], decision: 'sign'},
+        {spam: false, responses: [1000, 1000, 1002], decision: 'sign'},
+        {spam: false, responses: [1001], decision: 'cancel'},
+        {spam: true, responses: [1002], decision: 'spam'}
     ].forEach(function(test) {
         $.NSData.data.writeToFileAtomically(decision, true);
-        touchResponses = [test.response];
-        touchSeen = [];
-        runPreview(['--touch-offer', decision, test.policy, test.left]);
-        const seen = touchSeen[0];
-        if (readText(decision) !== test.result) throw new Error('Wrong touch offer result for ' + test.policy + ' ' + test.left);
-        if (seen.buttons !== 'Use Cached|Not Now' || seen.title !== test.title) throw new Error('Wrong touch offer: ' + JSON.stringify(seen));
-        if (seen.info.indexOf(test.text) < 0) throw new Error('Touch offer text missing "' + test.text + '": ' + seen.info);
-        if (seen.info.indexOf('Admin PIN') < 0) throw new Error('Touch offer does not mention the Admin PIN');
+        $.NSFileManager.defaultManager.removeItemAtPathError(decision + '.deciding', null);
+        expectedSpam = test.spam;
+        expectedSign = true;
+        responses = test.responses.slice();
+        modalCount = 0;
+        panesSeen = [];
+        runPreview([summary, details, decision, ready, test.spam ? 'mark-spam' : '', 'require-sign', notice]);
+        expectedSign = false;
+        if (readText(decision) !== test.decision) throw new Error('Wrong decision with Sign required: ' + readText(decision));
+        if (responses.length || modalCount !== test.responses.length) throw new Error('Wrong modal sequence with Sign required');
+        if (panesSeen[0].info.indexOf(notice) !== 0 || panesSeen[0].info.indexOf('until you click Sign') < 0) throw new Error('Sign required without the notice: ' + panesSeen[0].info);
+        // Sign is no rejection: it writes no marker, which signers would read as one.
+        const marked = !!$.NSFileManager.defaultManager.fileExistsAtPath(decision + '.deciding');
+        if (marked !== (test.decision !== 'sign')) throw new Error('Wrong rejection marker for ' + test.decision);
     });
+    // A summary that is not valid UTF-8 is read as Latin-1, where a raw 0x85
+    // byte is NEL, at which the facts pane would start a new line: it becomes
+    // '?', as do the C1 controls a valid character's bytes become alongside
+    // an invalid byte elsewhere (U+514D is E5 85 8D).
     [
-        {reason: 'Bad PIN <SCD>', text: 'gpg-agent reported: Bad PIN <SCD>.'},
-        {reason: '', text: 'The key did not confirm the change.'}
+        {bytes: 'UmVxdWVzdCB0eXBlOiBjb21taXQKQnJhbmNoOiBmYWN0c4VTSEEtMjU2PTAwMDAtRk9SR0VECgpNZXNzYWdlOgpTdWJqZWN0',
+         facts: 'Request type: commit\nBranch: facts?SHA-256=0000-FORGED'},
+        {bytes: 'UmVxdWVzdCB0eXBlOiBjb21taXQKQnJhbmNoOiB45YWNeQoKTWVzc2FnZToKU3ViamVjdCD/',
+         facts: 'Request type: commit\nBranch: x\u00e5??y'}
     ].forEach(function(test) {
-        touchResponses = [1000];
-        touchSeen = [];
-        runPreview(['--touch-unchanged', test.reason]);
-        const seen = touchSeen[0];
-        if (seen.buttons !== 'OK') throw new Error('Wrong buttons on the unchanged window: ' + seen.buttons);
-        if (seen.info.indexOf(test.text) < 0) throw new Error('Unchanged window missing "' + test.text + '": ' + seen.info);
-        if (seen.info.indexOf('ykman openpgp keys set-touch sig cached') < 0) throw new Error('Unchanged window lost the ykman command');
+        $.NSData.alloc.initWithBase64EncodedStringOptions(test.bytes, 0).writeToFileAtomically(summary, true);
+        $.NSData.data.writeToFileAtomically(decision, true);
+        expectedSpam = false;
+        responses = [1001];
+        panesSeen = [];
+        runPreview([summary, details, decision, ready]);
+        if (panesSeen.length !== 1 || panesSeen[0].facts !== test.facts) throw new Error('A fact drew a line of its own: ' + JSON.stringify(panesSeen));
     });
+    // View Details is cleaned the same way, so nothing in it can draw a line that
+    // poses as a fact: raw 0x85 and 0x9B bytes that Latin-1 decoding makes C1
+    // controls of, and the same characters in valid UTF-8. U+00A0 and U+00E9 stay.
+    $.NSString.stringWithString('Request type: commit\n\nMessage:\nNoisy subject').writeToFileAtomicallyEncodingError(summary, true, $.NSUTF8StringEncoding, null);
+    [
+        {bytes: 'QnJhbmNoOiBhhVNIQS0yNTY9Rk9SR0VEm2I=',
+         text: 'Branch: a?SHA-256=FORGED?b'},
+        {bytes: 'QnJhbmNoOiBhwoViwptjwoBkwp9l4oCoZuKAqWfYnGjigI5p4oCuauKBpmvCoMOp',
+         text: 'Branch: a?b?c?d?e?f?g?h?i?j?k\u00a0\u00e9'}
+    ].forEach(function(test) {
+        $.NSData.alloc.initWithBase64EncodedStringOptions(test.bytes, 0).writeToFileAtomically(details, true);
+        $.NSData.data.writeToFileAtomically(decision, true);
+        expectedSpam = false;
+        responses = [1000, 1001];
+        detailsSeen = [];
+        runPreview([summary, details, decision, ready]);
+        if (detailsSeen.length !== 1 || detailsSeen[0] !== test.text) throw new Error('The details drew a line of their own: ' + JSON.stringify(detailsSeen));
+    });
+    $.NSString.stringWithString('Exact payload and details').writeToFileAtomicallyEncodingError(details, true, $.NSUTF8StringEncoding, null);
+    // The notice is shown once: when the facts already hold it, the Sign text
+    // does not repeat it. A message that quotes it does not count.
+    // Nor does a fact that merely contains it, such as a crafted branch name.
+    const unknownNotice = 'Touch policy unknown: Sign to continue';
+    [
+        {summary: notice + '\n\nRequest type: commit\n\nMessage:\nSubject', notice: notice, repeated: false},
+        {summary: 'PIN attempt 2: wrong\n\n' + notice + '\n\nRequest type: commit\n\nMessage:\nSubject', notice: notice, repeated: false},
+        {summary: 'Request type: commit\n\nMessage:\n' + notice, notice: notice, repeated: true},
+        {summary: 'Request type: commit\n\nMessage:\nSubject\n\n' + notice + '\n\nBody', notice: notice, repeated: true},
+        {summary: 'Request type: commit\nBranch: x ' + unknownNotice + '\n\nMessage:\nSubject', notice: unknownNotice, repeated: true},
+        {summary: 'Request type: commit\nBranch: ' + unknownNotice + '\n\nMessage:\nSubject', notice: unknownNotice, repeated: true}
+    ].forEach(function(test) {
+        $.NSString.stringWithString(test.summary).writeToFileAtomicallyEncodingError(summary, true, $.NSUTF8StringEncoding, null);
+        $.NSData.data.writeToFileAtomically(decision, true);
+        expectedSpam = false;
+        expectedSign = true;
+        responses = [1002];
+        panesSeen = [];
+        runPreview([summary, details, decision, ready, '', 'require-sign', test.notice]);
+        expectedSign = false;
+        const info = panesSeen[0].info;
+        if ((info.indexOf(test.notice) >= 0) !== test.repeated || info.indexOf('until you click Sign') < 0) throw new Error('Notice shown twice or not at all: ' + info);
+    });
+    // The signer decides that Sign is required; an empty notice changes only the text.
+    $.NSString.stringWithString('Request type: commit\n\nMessage:\nSubject').writeToFileAtomicallyEncodingError(summary, true, $.NSUTF8StringEncoding, null);
+    $.NSData.data.writeToFileAtomically(decision, true);
+    expectedSign = true;
+    responses = [1002];
+    panesSeen = [];
+    runPreview([summary, details, decision, ready, '', 'require-sign', '']);
+    expectedSign = false;
+    if (readText(decision) !== 'sign' || panesSeen[0].info.indexOf('Your key may sign') !== 0) throw new Error('An empty notice: ' + JSON.stringify(panesSeen[0].info));
+    $.NSString.stringWithString('Request type: commit\n\nMessage:\nNoisy subject').writeToFileAtomicallyEncodingError(summary, true, $.NSUTF8StringEncoding, null);
+    // Only the exact argument require-sign asks for Sign.
+    ['require-sign ', 'Require-Sign', 'yes'].forEach(function(flag) {
+        $.NSData.data.writeToFileAtomically(decision, true);
+        expectedSpam = false;
+        responses = [1001];
+        modalCount = 0;
+        runPreview([summary, details, decision, ready, '', flag, notice]);
+        if (readText(decision) !== 'cancel' || modalCount !== 1) throw new Error('Sign required by ' + JSON.stringify(flag));
+    });
+    // A signing service from before the touch policy offer was removed asks for
+    // it with --touch-offer: no window, no answer, and a message that says why.
+    $.NSData.data.writeToFileAtomically(decision, true);
+    modalCount = 0;
+    let refused = '';
+    try {
+        runPreview(['--touch-offer', decision, 'on', '3']);
+    } catch (error) {
+        refused = error.message;
+    }
+    if (refused.indexOf('The cached touch policy offer was removed.') !== 0 || modalCount !== 0 || readText(decision) !== '') throw new Error('The touch offer was answered: ' + refused);
+    // After Sign the preview has closed: a window says the key may still want a
+    // touch or the PIN, reports that it is up, and has only Cancel, whose
+    // answer is a rejection like the preview's.
+    $.NSData.data.writeToFileAtomically(decision, true);
+    $.NSFileManager.defaultManager.removeItemAtPathError(ready, null);
+    $.NSFileManager.defaultManager.removeItemAtPathError(decision + '.deciding', null);
+    waitingSeen = [];
+    runPreview(['--waiting', decision, ready]);
+    // Escape is Cancel's only key: a stray Return must not stop a signature
+    // the operator has just approved.
+    if (waitingSeen.length !== 1 || waitingSeen[0].buttons !== 'Cancel' || waitingSeen[0].keys !== '\u001b' ||
+        waitingSeen[0].message !== 'Finishing the signature (touch the key if it blinks)' ||
+        waitingSeen[0].info.indexOf('Cancel stops the signature') < 0) throw new Error('Wrong window after Sign: ' + JSON.stringify(waitingSeen));
+    if (readText(decision) !== 'cancel' || !$.NSFileManager.defaultManager.fileExistsAtPath(decision + '.deciding') ||
+        !$.NSFileManager.defaultManager.fileExistsAtPath(ready)) throw new Error('Cancel after Sign was not a marked rejection, or the window never reported');
     // Wrong-PIN dialog: Try Again only while attempts remain and the signer allows it.
     [
         {args: ['2', 'retry'], buttons: ['Try Again', 'Cancel'], response: 1000, decision: 'retry', text: '2 attempts remaining'},
@@ -219,7 +398,10 @@ function run(argv) {
             if (seen.red !== expected[1].red || seen.bold !== expected[1].bold) throw new Error(where + 'label style');
             if (seen.initial !== '') throw new Error(where + 'PIN field was not empty');
             if (!seen.secure) throw new Error(where + 'PIN field is not secure');
+            // After Sign the preview has closed, and a key with touch off never
+            // blinks: the text names neither as certain.
+            if (seen.info.indexOf('review window') >= 0 || seen.info.indexOf('touch the key if it blinks') < 0) throw new Error(where + 'text: ' + seen.info);
         });
     });
-    return 'Dialog actions passed (29 cases)';
+    return 'Dialog actions passed (63 cases)';
 }
