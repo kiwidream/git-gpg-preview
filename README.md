@@ -156,7 +156,7 @@ A hardware key that is waiting for a touch gives no indication beyond its own LE
 ```sh
 /usr/bin/osascript -l JavaScript \
   "$(sed -n 's/^touch_helper=//p' ~/.config/git-gpg-preview/config)" \
-  /path/to/context.txt /path/to/decision /path/to/ready &
+  /path/to/context.txt /path/to/decision /path/to/ready /path/to/headline.txt &
 ```
 
 The contract matches the signing preview's:
@@ -164,6 +164,7 @@ The contract matches the signing preview's:
 - `context.txt` — mode-0600 text shown verbatim in a selectable, scrollable field. Sanitize it; the helper renders whatever it is given.
 - `decision` — the helper writes `deny` if the user presses **Deny**. Nothing is written when the window is terminated instead.
 - `ready` — created as the window is about to appear. Wait for it before engaging the hardware, so the prompt is up before the key starts blinking.
+- `headline.txt` — optional; an absolute path, written mode-0600 like the others. Its first line (lines end where Python's `str.splitlines()` ends them) is shown above the context in large bold type, in at most two lines; what does not fit is cut at its end, so keep the headline short, with what must not be lost first. Leading and trailing blanks are trimmed. Control, format, private-use, unassigned and default-ignorable characters (joiners and variation selectors included, even inside emoji) and blank-looking spaces become `?`. A file that is not UTF-8, not a regular file (after following a symbolic link), or larger than 64 KiB is ignored, as is a missing one or a relative path; the window then looks as it did before this argument existed, so put the same fact in the context too. With a headline, the context pane grows with its lines, up to 220 points. Use the headline for the one fact the operator must not miss, such as the host an SSH login goes to. Helpers older than this argument ignore it.
 
 There is no approve button, for the same reason the signing preview has none: the touch itself is the approval. The caller terminates the helper once the signature (or a failure) comes back, which dismisses the window.
 

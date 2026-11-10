@@ -1,0 +1,135 @@
+// Exercise the touch prompt's window contents and its Deny decision without
+// presenting a window or touching a hardware key. Only the modal run is faked.
+ObjC.import('Cocoa');
+
+var shown = [];
+var readyPathForTest = '';
+function touchModalResponse(alert) {
+    const titles = [];
+    for (let i = 0; i < Number(alert.buttons.count); i++) titles.push(ObjC.unwrap(alert.buttons.objectAtIndex(i).title));
+    const view = alert.accessoryView;
+    const withHeadline = !view.isKindOfClass($.NSScrollView);
+    const headline = withHeadline ? view.subviews.objectAtIndex(0) : null;
+    const scroll = withHeadline ? view.subviews.objectAtIndex(1) : view;
+    shown.push({
+        buttons: titles.join('|'),
+        title: ObjC.unwrap(alert.messageText),
+        context: ObjC.unwrap(scroll.documentView.string),
+        contextHeight: Number(scroll.frame.size.height),
+        readyBeforeModal: !!$.NSFileManager.defaultManager.fileExistsAtPath(readyPathForTest),
+        headline: headline ? ObjC.unwrap(headline.stringValue) : null,
+        headlineAbove: headline ? headline.frame.origin.y >= scroll.frame.origin.y + scroll.frame.size.height : null,
+        // At most two lines, cut at the end, in a frame AppKit sized for them.
+        headlineTwoLines: headline ? Number(headline.maximumNumberOfLines) === 2 && !!headline.cell.truncatesLastVisibleLine
+            && Number(headline.frame.size.height) === Math.ceil(Number(headline.fittingSize.height)) : null,
+        headlineBold: headline ? (Number(headline.font.fontDescriptor.symbolicTraits) & 2) !== 0 : null,
+        headlineLarger: headline ? Number(headline.font.pointSize) > Number(scroll.documentView.font.pointSize) : null,
+        headlineSelectable: headline ? !!headline.selectable : null
+    });
+}
+
+function run(argv) {
+    const source = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null));
+    const substitutions = [
+        ['function run(argv)', 'function runPrompt(argv)'],
+        ['app.activateIgnoringOtherApps(true);', ''],
+        ['alert.runModal;', 'touchModalResponse(alert);']
+    ];
+    let instrumented = source;
+    substitutions.forEach(function(pair) {
+        if (instrumented.split(pair[0]).length !== 2) throw new Error('Touch prompt test seam changed: ' + pair[0]);
+        instrumented = instrumented.replace(pair[0], pair[1]);
+    });
+    eval(instrumented);
+    function file(name, text) {
+        const path = argv[1] + '/' + name;
+        $.NSString.stringWithString(text).writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, null);
+        return path;
+    }
+    const context = file('touch-context', 'Origin:  devbox1 (forwarded ssh-agent)' + '\n' + 'Key:     SHA256:abc');
+    const decision = argv[1] + '/touch-decision';
+    const ready = argv[1] + '/touch-ready';
+    readyPathForTest = ready;
+    const contextLines = function(count) {
+        return file('touch-context-' + count, Array.from({length: count}, function(_, i) { return 'line ' + i; }).join('\n'));
+    };
+    const long = 'SSH login to ' + 'x'.repeat(200) + ' (not confirmed)';
+    // Run the window once, as a caller would, and check what every window must do.
+    function show(where, contextPath, extra) {
+        $.NSData.data.writeToFileAtomically(decision, true);
+        $.NSFileManager.defaultManager.removeItemAtPathError(ready, null);
+        shown = [];
+        runPrompt([contextPath, decision, ready].concat(extra));
+        if (shown.length !== 1) throw new Error(where + 'the window was not shown once');
+        const seen = shown[0];
+        if (readText(decision) !== 'deny') throw new Error(where + 'Deny was not recorded');
+        if (!seen.readyBeforeModal) throw new Error(where + 'readiness was not reported before the window ran');
+        if (seen.buttons !== 'Deny' || seen.title !== 'Touch your security key') throw new Error(where + 'wrong window: ' + JSON.stringify(seen));
+        return seen;
+    }
+    const cases = [
+        {headline: null},
+        {text: 'SSH login to union-mainnet' + '\n', headline: 'SSH login to union-mainnet'},
+        {text: 'First line' + '\r\n' + 'second line', headline: 'First line'},
+        {text: 'First line\rsecond', headline: 'First line'},
+        {text: 'First\u2028second', headline: 'First'},
+        {text: 'First\u0085second', headline: 'First'},
+        {text: 'First\u000bsecond', headline: 'First'},
+        {text: 'First\u001csecond', headline: 'First'},
+        {text: '\t\ufeff  padded \u3000\t', headline: 'padded'},
+        {text: 'a\u202eb\u0007c\u200bd\u061ce\u206af\u00adg\u{E0041}h\u3164i\ufe0fj\u{E0100}k\u3000l\ue000m\u034fn\u17b4o\u180bp',
+         headline: 'a?b?c?d?e?f?g?h?i?j?k?l?m?n?o?p'},
+        {text: long, headline: long},
+        {text: '\u0f40\u0f41\u0f42', headline: '\u0f40\u0f41\u0f42'},
+        {text: '\n', headline: null},
+        {path: argv[1] + '/touch-headline-missing', headline: null},
+        {path: argv[1], headline: null},
+        {path: 'touch-headline-relative', headline: null},
+        {path: file('touch-headline-at-limit', 'h' + '\n'.repeat(65535)), headline: 'h'},
+        {path: file('touch-headline-over-limit', 'h' + '\n'.repeat(65536)), headline: null},
+        {path: latin1Headline(argv[1]), headline: null},
+        {path: symlinkTo(argv[1], 'touch-headline-link', file('touch-headline-target', 'SSH login to linked')), headline: 'SSH login to linked'},
+        {path: symlinkTo(argv[1], 'touch-headline-dir-link', argv[1]), headline: null},
+        {text: 'SSH login to a-host', headline: 'SSH login to a-host', context: contextLines(12), contextHeight: 12 * 16 + 6},
+        {text: 'SSH login to b-host', headline: 'SSH login to b-host', context: contextLines(40), contextHeight: 220},
+        {path: '', headline: null}
+    ];
+    cases.forEach(function(test, index) {
+        const where = 'Touch prompt case ' + (index + 1) + ': ';
+        const extra = test.text !== undefined ? [file('touch-headline-' + index, test.text)]
+            : (test.path !== undefined ? [test.path] : []);
+        const seen = show(where, test.context || context, extra);
+        if (!test.context && seen.context !== 'Origin:  devbox1 (forwarded ssh-agent)' + '\n' + 'Key:     SHA256:abc') throw new Error(where + 'wrong context');
+        if (seen.headline !== test.headline) throw new Error(where + 'headline was ' + JSON.stringify(seen.headline));
+        if (seen.headline === null) {
+            if (seen.contextHeight !== 130) throw new Error(where + 'a window without a headline changed its size');
+            return;
+        }
+        if (!(seen.headlineAbove && seen.headlineBold && seen.headlineLarger)) {
+            throw new Error(where + 'the headline is not above the context in larger bold type: ' + JSON.stringify(seen));
+        }
+        if (!seen.headlineTwoLines) throw new Error(where + 'the headline is not limited to two lines in its own size: ' + JSON.stringify(seen));
+        if (seen.headlineSelectable) throw new Error(where + 'the headline can take the focus');
+        if (seen.contextHeight !== (test.contextHeight || 130)) throw new Error(where + 'context height ' + seen.contextHeight);
+    });
+    // A headline that cannot be laid out leaves the window as it was.
+    const realLabel = headlineLabel;
+    headlineLabel = function() { throw new Error('no layout'); };
+    const seen = show('A broken headline: ', context, [file('touch-headline-broken', 'SSH login to anywhere')]);
+    headlineLabel = realLabel;
+    if (seen.headline !== null || seen.contextHeight !== 130) throw new Error('A broken headline changed the window: ' + JSON.stringify(seen));
+    return 'Touch prompt passed (' + (cases.length + 1) + ' cases)';
+}
+
+function latin1Headline(directory) {
+    const path = directory + '/touch-headline-latin1';
+    $.NSString.stringWithString('SSH login to \u00c5node').writeToFileAtomicallyEncodingError(path, true, $.NSISOLatin1StringEncoding, null);
+    return path;
+}
+
+function symlinkTo(directory, name, target) {
+    const link = directory + '/' + name;
+    $.NSFileManager.defaultManager.removeItemAtPathError(link, null);
+    $.NSFileManager.defaultManager.createSymbolicLinkAtPathWithDestinationPathError(link, target, null);
+    return link;
+}

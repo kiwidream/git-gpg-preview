@@ -8,7 +8,12 @@ ObjC.import('Cocoa');
 // request, and terminates this process once the signature (or a failure)
 // comes back. A "Deny" press writes a decision the caller reads to abort.
 //
-// Arguments: <context-file> <decision-file> [ready-file]
+// Arguments: <context-file> <decision-file> [ready-file] [headline-file]
+//
+// The optional headline is the one fact nobody may miss, such as the host an
+// SSH login goes to. Its first line is shown above the context in large type,
+// in at most two lines: keep it short, since what does not fit is cut at its
+// end.
 //
 // It is deliberately self-contained rather than sharing code with dialog.jxa,
 // so a change to one prompt cannot alter the other.
@@ -44,6 +49,44 @@ function writeDecision(path, decision) {
     handle.closeFile;
 }
 
+// A headline file larger than this, or not a regular file, is ignored.
+const HEADLINE_MAX_BYTES = 65536;
+// The line breaks Python's str.splitlines() knows, so callers agree on what the
+// first line is.
+const LINE_BREAK = /\r\n|[\n\v\f\r\x1c-\x1e\x85\u2028\u2029]/;
+// What draws as nothing or as blank space, or reorders or hides what follows:
+// controls, format characters, private and unassigned code points, Unicode's
+// default-ignorable code points (fillers, joiners, variation selectors), the
+// blank braille pattern, and every space but the plain one. Joiners inside
+// emoji or Persian words become '?' too: a headline names hosts, and there a
+// hidden character is the one thing that must show.
+const INVISIBLE = /[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Cs}\p{Default_Ignorable_Code_Point}\u2800]|(?! )\p{Zs}/gu;
+
+// The headline's first line, trimmed as JavaScript trims, with each invisible
+// character shown as '?', or '' when there is none. One that is not an
+// absolute path, cannot be read, is not UTF-8, or is too large leaves the
+// window as it was: the context still says everything, and the window must
+// still open.
+function readHeadline(path) {
+    if (!path || String(path).charAt(0) !== '/') return '';
+    try {
+        // Through any symbolic link, so the check sees the file read.
+        path = unwrap($.NSString.stringWithString(path).stringByResolvingSymlinksInPath);
+        const attributes = $.NSFileManager.defaultManager.attributesOfItemAtPathError(path, null);
+        if (!attributes
+            || unwrap(attributes.objectForKey($.NSFileType)) !== unwrap($.NSFileTypeRegular)
+            || Number(unwrap(attributes.objectForKey($.NSFileSize))) > HEADLINE_MAX_BYTES) {
+            return '';
+        }
+        const data = $.NSData.dataWithContentsOfFile(path);
+        const text = data ? $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding) : null;
+        if (!text) return '';
+        return unwrap(text).split(LINE_BREAK, 1)[0].trim().replace(INVISIBLE, '?');
+    } catch (error) {
+        return '';
+    }
+}
+
 function markReady(path) {
     if (!path) return;
     $.NSData.data.writeToFileAtomically(path, true);
@@ -75,6 +118,53 @@ function scrollableText(text, width, height) {
     return scroll;
 }
 
+const CONTEXT_WIDTH = 460;
+const CONTEXT_HEIGHT = 130;
+// With a headline, the context grows with its lines, up to this.
+const CONTEXT_MAX_HEIGHT = 220;
+const CONTEXT_LINE_HEIGHT = 16;
+const HEADLINE_GAP = 8;
+// Not selectable: a selectable label could take the window's focus, and its
+// field editor ignores the two-line limit.
+function headlineLabel(text) {
+    const label = $.NSTextField.wrappingLabelWithString(text);
+    label.font = $.NSFont.boldSystemFontOfSize(17);
+    label.selectable = false;
+    label.maximumNumberOfLines = 2;
+    label.cell.truncatesLastVisibleLine = true;
+    label.preferredMaxLayoutWidth = CONTEXT_WIDTH;
+    return label;
+}
+
+function headlineView(context, headline) {
+    const lines = context.split('\n').length;
+    const contextHeight = Math.min(CONTEXT_MAX_HEIGHT, Math.max(CONTEXT_HEIGHT, lines * CONTEXT_LINE_HEIGHT + 6));
+    const scroll = scrollableText(context, CONTEXT_WIDTH, contextHeight);
+    const label = headlineLabel(headline);
+    // AppKit's own size for the label: its fitting size honours the line limit.
+    const height = Math.ceil(Number(label.fittingSize.height));
+    const view = $.NSView.alloc.initWithFrame(
+        $.NSMakeRect(0, 0, CONTEXT_WIDTH, height + HEADLINE_GAP + contextHeight));
+    label.frame = $.NSMakeRect(0, contextHeight + HEADLINE_GAP, CONTEXT_WIDTH, height);
+    view.addSubview(label);
+    view.addSubview(scroll);
+    return view;
+}
+
+// The context alone, as it always was, or the headline above it. The
+// headline is the one optional part: if it cannot be laid out, the window
+// opens without it.
+function accessoryView(context, headline) {
+    if (headline) {
+        try {
+            return headlineView(context, headline);
+        } catch (error) {
+            // Fall through to the window without the headline.
+        }
+    }
+    return scrollableText(context, CONTEXT_WIDTH, CONTEXT_HEIGHT);
+}
+
 function run(argv) {
     if (argv.length < 2) {
         throw new Error('Expected context and decision paths.');
@@ -82,6 +172,7 @@ function run(argv) {
     const context = readText(argv[0]);
     const decisionPath = argv[1];
     const readyPath = argv.length > 2 ? argv[2] : '';
+    const headline = readHeadline(argv[3]);
 
     const app = $.NSApplication.sharedApplication;
     app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
@@ -95,7 +186,7 @@ function run(argv) {
     alert.informativeText = 'A signature was requested from your security key. '
         + 'Touch it to approve; this window closes by itself once the signature completes. '
         + 'Deny refuses the request.';
-    alert.accessoryView = scrollableText(context, 460, 130);
+    alert.accessoryView = accessoryView(context, headline);
     alert.addButtonWithTitle('Deny');
 
     // Report readiness as the window is about to show, so the caller only
