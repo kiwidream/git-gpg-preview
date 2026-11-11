@@ -1745,6 +1745,8 @@ pass 'spam persistence failure cancels signing and reports that the rule was not
 
 /usr/bin/osascript -l JavaScript "$ROOT/tests/dialog.jxa" "$ROOT/dialog.jxa" "$TMP"
 pass 'AppKit main and detail dialogs dispatch spam/cancel, wrong-PIN retry, and preserve legacy callers'
+/usr/bin/osascript -l JavaScript "$ROOT/tests/touch-prompt.jxa" "$ROOT/touch-prompt.jxa" "$TMP"
+pass 'the touch prompt shows its headline above the context, and Deny is recorded'
 
 INSTALL_TEST="$TMP/install-home"
 mkdir -p "$INSTALL_TEST"
